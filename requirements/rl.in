@@ -1,0 +1,20 @@
+# Wheel-installable core of the Stage-2 RL environment.
+#
+# Miles, SGLang, the reference `nla` package and this project are NOT here: all
+# four are installed editable from patched git checkouts by
+# scripts/setup_rl_stack.sh. This file pins the parts pip can resolve, so the env
+# is reproducible from a manifest instead of from whatever resolved that day.
+#
+# torch is deliberately unpinned here and installed FIRST from the cu124 index by
+# the setup script. Pinning it in this file would fight that.
+sglang[all]>=0.5.6
+transformers
+accelerate
+ray
+pyarrow
+numpy
+safetensors
+httpx
+orjson
+pyyaml
+tqdm

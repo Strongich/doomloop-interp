@@ -17,6 +17,7 @@ explanations — training on half a thought is worse than training on less data.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 import pyarrow as pa
@@ -75,10 +76,47 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--chunk-size", type=int, default=512, help="rows per API batch")
     parser.add_argument("--limit", type=int, default=None, help="only process the first N rows")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help="in-flight requests (hosted API measured at 7.38 calls/s at 128 vs 2.08 at 32)",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="OpenAI-compatible server to label against, e.g. http://127.0.0.1:8000/v1 "
+        "for `vllm serve`. Omit to use the hosted API.",
+    )
+    parser.add_argument("--model", default=None, help="override the explainer model id")
+    parser.add_argument(
+        "--api-kind",
+        default=None,
+        choices=["responses", "chat"],
+        help="'chat' for local servers (vLLM/SGLang serve /v1/chat/completions and have "
+        "no reasoning-effort parameter); defaults to 'chat' when --base-url is given",
+    )
     args = parser.parse_args()
 
     load_project_env()
-    config = ExplainerConfig()
+    overrides: dict[str, object] = {}
+    if args.base_url:
+        # A local server speaks chat-completions and has no reasoning knob, so
+        # default api_kind accordingly rather than making the caller remember.
+        overrides["base_url"] = args.base_url
+        overrides["api_kind"] = args.api_kind or "chat"
+    elif args.api_kind:
+        overrides["api_kind"] = args.api_kind
+    if args.model:
+        overrides["model"] = args.model
+    if args.concurrency:
+        overrides["concurrency"] = args.concurrency
+    config = replace(ExplainerConfig(), **overrides)  # type: ignore[arg-type]
+    print(
+        f"explainer: {config.model} via "
+        f"{config.base_url or 'hosted API'} ({config.api_kind}), "
+        f"concurrency {config.concurrency}"
+    )
     in_meta = read_sidecar(args.input)
     provider = OpenAIProvider(config)
 

@@ -76,8 +76,17 @@ class OpenAIProvider(CompletionProvider):
 
     def __init__(self, config: ExplainerConfig | None = None) -> None:
         self.config = config or ExplainerConfig()
-        load_api_key(self.config.env_file)
-        self.client = openai.AsyncOpenAI(max_retries=self.config.max_retries)
+        # A local server needs no real key, but the SDK insists on one.
+        if self.config.base_url:
+            key = os.environ.get("OPENAI_API_KEY") or "local"
+        else:
+            key = load_api_key(self.config.env_file)
+        self.client = openai.AsyncOpenAI(
+            api_key=key,
+            base_url=self.config.base_url,
+            max_retries=self.config.max_retries,
+        )
+        self.api_kind = self.config.api_kind
         # Surfaced as plain attributes so the sidecar can record them.
         self.model = self.config.model
         # Typed so mypy can match the Responses `reasoning=` overload; the SDK
@@ -87,7 +96,27 @@ class OpenAIProvider(CompletionProvider):
         self.max_output_tokens = self.config.max_output_tokens
         self.concurrency = self.config.concurrency
 
+    async def _one_chat(self, prompt: str) -> str | None:
+        """Plain /v1/chat/completions — what vLLM and SGLang expose.
+
+        No `reasoning` parameter: local servers reject unknown fields, and the
+        effort knob does not exist there. A response cut off by the token cap is
+        dropped for the same reason as the hosted path — no closing tag is coming.
+        """
+        resp = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=self.max_output_tokens,
+        )
+        choice = resp.choices[0]
+        if choice.finish_reason == "length":
+            return None
+        return (choice.message.content or "").strip() or None
+
     async def _one(self, sem: asyncio.Semaphore, prompt: str) -> str | None:
+        if self.api_kind == "chat":
+            async with sem:
+                return await self._one_chat(prompt)
         async with sem:
             resp = await self.client.responses.create(
                 model=self.model,

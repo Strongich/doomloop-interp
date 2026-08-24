@@ -20,7 +20,9 @@ Two modes:
 Usage:
     uv run python scripts/dump_explanations.py --from-base out/halves/av_half.parquet --limit 20
     uv run python scripts/dump_explanations.py --from-parquet out/av_explained.parquet
-    uv run python scripts/dump_explanations.py --from-base out/base.parquet --limit 8 --out /tmp/labels
+    uv run python scripts/dump_explanations.py --from-base out/base.parquet --limit 8
+    uv run python scripts/dump_explanations.py --from-parquet a.parquet \\
+        --compare-parquet b.parquet --out /tmp/compare
 """
 
 from __future__ import annotations
@@ -109,8 +111,19 @@ def summarize(records: list[dict[str, Any]], norms: list[float] | None) -> dict[
     return stats
 
 
-def write_markdown(path: Path, records: list[dict[str, Any]], stats: dict[str, Any]) -> None:
-    """Readable side-by-side dump, shortest context first."""
+def write_markdown(
+    path: Path,
+    records: list[dict[str, Any]],
+    stats: dict[str, Any],
+    context_chars: int = 1200,
+) -> None:
+    """Readable dump, shortest context first.
+
+    `context_chars` trims the *head* of the context, keeping the tail: the
+    prompt asks the labeler to describe what comes next, and the final feature
+    must describe the very end of the sequence — so the last characters are the
+    ones you check a label against. Pass 0 to keep the whole context.
+    """
     lines = [
         "# Labeling-model explanations",
         "",
@@ -127,7 +140,9 @@ def write_markdown(path: Path, records: list[dict[str, Any]], stats: dict[str, A
         lines.append("")
         lines.append("**Context (tail):**")
         lines.append("")
-        lines.append("> " + rec["context"][-600:].replace("\n", " ").strip())
+        tail = rec["context"] if context_chars <= 0 else rec["context"][-context_chars:]
+        prefix = "" if len(tail) == len(rec["context"]) else "…"
+        lines.append("> " + prefix + tail.replace("\n", " ").strip())
         lines.append("")
         if rec["summary"]:
             lines.append("**Summary:**")
@@ -145,6 +160,58 @@ def write_markdown(path: Path, records: list[dict[str, Any]], stats: dict[str, A
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_comparison(
+    path: Path,
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+    left_name: str,
+    right_name: str,
+    context_chars: int,
+) -> int:
+    """Render two labelers' summaries under a shared context. Returns rows matched.
+
+    Joined on the context text rather than row order: the two parquets may have
+    dropped different rows (a refusal or a missing tag drops one side only), so
+    positional pairing would silently compare a summary against the wrong text.
+    """
+    by_context = {r["context"]: r for r in right}
+    lines = [
+        f"# Label comparison: {left_name} vs {right_name}",
+        "",
+        "Same context, both labelers. Judge whether each feature is *specific to "
+        "this passage* or generic filler that would fit any text.",
+        "",
+    ]
+    matched = 0
+    for i, lrec in enumerate(sorted(left, key=lambda r: len(r["context"]))):
+        rrec = by_context.get(lrec["context"])
+        if rrec is None:
+            continue
+        matched += 1
+        ctx = lrec["context"]
+        tail = ctx if context_chars <= 0 else ctx[-context_chars:]
+        prefix = "" if len(tail) == len(ctx) else "…"
+        lines += [
+            f"## {i}",
+            "",
+            "**Context (tail):**",
+            "",
+            "> " + prefix + tail.replace("\n", " ").strip(),
+            "",
+        ]
+        for name, rec in ((left_name, lrec), (right_name, rrec)):
+            lines.append(
+                f"**{name}** — {rec.get('n_features', 0)} features, "
+                f"{len((rec.get('summary') or '').split())} words"
+            )
+            lines.append("")
+            for feature in (rec.get("summary") or "(none)").split("\n\n"):
+                lines.append(f"- {feature}")
+            lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return matched
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
@@ -153,6 +220,19 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=20, help="rows to dump")
     parser.add_argument("--offset", type=int, default=0, help="row offset")
     parser.add_argument("--out", default="explanations", help="output path stem")
+    parser.add_argument(
+        "--compare-parquet",
+        default=None,
+        help="a second explained parquet; renders both labelers' summaries under "
+        "the same context so they can be judged side by side",
+    )
+    parser.add_argument(
+        "--context-chars",
+        type=int,
+        default=1200,
+        help="characters of context tail to show in the .md (0 = the whole context; "
+        "the .jsonl always carries it untruncated)",
+    )
     parser.add_argument("--base-url", default=None, help="OpenAI-compatible server URL")
     parser.add_argument("--model", default=None, help="override the explainer model id")
     parser.add_argument("--effort", default=None, help="reasoning effort (hosted API only)")
@@ -206,12 +286,40 @@ def main() -> None:
     stem = Path(args.out)
     stem.parent.mkdir(parents=True, exist_ok=True)
 
+    if args.compare_parquet:
+        other = pq.read_table(args.compare_parquet).slice(args.offset, args.limit)
+        assert "summary" in other.column_names, f"{args.compare_parquet} has no `summary` column"
+        right = [
+            {
+                "context": c,
+                "summary": sm,
+                "n_features": count_features(sm),
+                "status": "ok",
+            }
+            for c, sm in zip(
+                other.column("context_text").to_pylist(),
+                other.column("summary").to_pylist(),
+                strict=True,
+            )
+        ]
+        cmp_path = Path(f"{stem}-comparison.md")
+        n = write_comparison(
+            cmp_path,
+            records,
+            right,
+            Path(path).stem,
+            Path(args.compare_parquet).stem,
+            args.context_chars,
+        )
+        console.print(f"compared [bold]{n}[/bold] rows present in both -> {cmp_path}")
+    stem.parent.mkdir(parents=True, exist_ok=True)
+
     jsonl_path = stem.with_suffix(".jsonl")
     with jsonl_path.open("w", encoding="utf-8") as fh:
         for rec in records:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     md_path = stem.with_suffix(".md")
-    write_markdown(md_path, records, stats)
+    write_markdown(md_path, records, stats, args.context_chars)
     stats_path = Path(f"{stem}.stats.json")
     stats_path.write_text(json.dumps(stats, indent=2) + "\n", encoding="utf-8")
 

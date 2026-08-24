@@ -19,6 +19,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from reasoning_attention.config import load_project_env
 from reasoning_attention.datagen.sidecar import (
     DatasetMeta,
     ExtractionMeta,
@@ -35,6 +36,7 @@ def main() -> None:
     parser.add_argument("--no-shuffle", action="store_true")
     args = parser.parse_args()
 
+    load_project_env()
     tables = [pq.read_table(path) for path in args.inputs]
     schemas = {tuple(t.schema.names) for t in tables}
     assert len(schemas) == 1, (

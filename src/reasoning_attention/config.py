@@ -7,7 +7,27 @@ the rest of the tuned defaults.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+
+from dotenv import load_dotenv
+
+# Path of the dotenv file holding credentials (OPENAI_API_KEY, HF_TOKEN).
+# Gitignored, and on the cluster it lives on the PVC so it survives pod restarts.
+ENV_FILE = ".env"
+
+
+def load_project_env(env_file: str = ENV_FILE) -> None:
+    """Load `.env` into the process environment, without overriding real exports.
+
+    Called by every CLI entry point rather than left to the shell: a login shell
+    sources `.zshrc`, but `ssh host 'cmd'`, tmux send-keys, and cron do not, so a
+    token exported only in `.zshrc` is invisible exactly when a long job needs it.
+    `override=False` keeps an explicit `HF_TOKEN=... cmd` winning over the file.
+    """
+    if os.path.exists(env_file):
+        load_dotenv(env_file, override=False)
+
 
 # Hub repo id for the target model.
 MODEL_ID = "Qwen/Qwen3-1.7B"

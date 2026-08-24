@@ -24,7 +24,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-from reasoning_attention.config import ExplainerConfig, load_project_env
+from reasoning_attention.config import CHAT_MAX_OUTPUT_TOKENS, ExplainerConfig, load_project_env
 from reasoning_attention.datagen.prompts import (
     EXPLAIN_INSTRUCTION,
     MIN_FEATURES,
@@ -90,6 +90,13 @@ def main() -> None:
     )
     parser.add_argument("--model", default=None, help="override the explainer model id")
     parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=None,
+        help=f"output cap. Defaults to {CHAT_MAX_OUTPUT_TOKENS} for local chat servers "
+        f"(no reasoning tokens to budget for) and to the hosted value otherwise.",
+    )
+    parser.add_argument(
         "--api-kind",
         default=None,
         choices=["responses", "chat"],
@@ -105,6 +112,12 @@ def main() -> None:
         # default api_kind accordingly rather than making the caller remember.
         overrides["base_url"] = args.base_url
         overrides["api_kind"] = args.api_kind or "chat"
+    if overrides.get("api_kind") == "chat" and args.max_output_tokens is None:
+        # The hosted default reserves room for reasoning tokens a local model
+        # never emits, and that reservation can overflow the context window.
+        overrides["max_output_tokens"] = CHAT_MAX_OUTPUT_TOKENS
+    if args.max_output_tokens is not None:
+        overrides["max_output_tokens"] = args.max_output_tokens
     elif args.api_kind:
         overrides["api_kind"] = args.api_kind
     if args.model:

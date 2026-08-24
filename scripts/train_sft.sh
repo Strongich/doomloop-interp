@@ -40,7 +40,9 @@ MAX_LENGTH="${MAX_LENGTH:-1024}"
 LORA_R="${LORA_R:-16}"
 LOG_EVERY="${LOG_EVERY:-10}"
 LIMIT="${LIMIT:-}"                  # empty = all rows
-EXTRA_ARGS="${EXTRA_ARGS:-}"        # e.g. --full-finetune --gradient-checkpointing
+EXTRA_ARGS="${EXTRA_ARGS:-}"        # e.g. --lora --gradient-checkpointing
+# Full fine-tuning is the default and needs ~21 GB of optimizer state, which fits
+# an A100-80GB but not a 16 GB card. On a small GPU: EXTRA_ARGS=--lora
 
 STAGES=("${@:-av ar}")
 read -r -a STAGES <<< "${STAGES[*]}"

@@ -146,9 +146,12 @@ These were deliberate and are recorded with rationale in `implementation-notes.m
   so training matches `NLA.verbalize()` at inference.
 - **FVE uses a fixed dataset-level denominator** (`data.baseline_variance`), never
   a per-batch variance — otherwise the metric is not comparable across steps.
-- **LoRA is the training default**: full fine-tuning Qwen3-1.7B with AdamW needs
-  ~20.7 GB against this box's 16 GB. `--full-finetune` will OOM here. The AR's
-  affine map is always trained in full, in fp32.
+- **Full fine-tuning is the training default**, matching the reference (their
+  actor SFT is the full 28-layer model under FSDP). It needs ~21 GB of optimizer
+  state: fine on the A100-80GB training box, impossible on the 16 GB local card,
+  where `--lora` is the fallback. Prefer full FT for the AR especially — it is the
+  Stage-2 reward model, and a rank-limited reward model is one the AV can game.
+  The AR's affine map is always trained in full, in fp32.
 - **Python is pinned to 3.11** (`.python-version`, `uv.lock`, mypy,
   `requires-python`). Keep all four in sync.
 - **torch is intentionally unpinned** — vLLM drives it, because the box is a

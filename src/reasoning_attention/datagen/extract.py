@@ -41,7 +41,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from reasoning_attention.config import D_MODEL, NLAConfig, WarmStartDataConfig
+from reasoning_attention.config import D_MODEL, NLAConfig, WarmStartDataConfig, load_project_env
 from reasoning_attention.datagen.sidecar import DatasetMeta, ExtractionMeta, write_sidecar
 
 
@@ -228,6 +228,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    load_project_env()
     data_cfg = WarmStartDataConfig()
     nla_cfg = NLAConfig()
     corpus = args.corpus or data_cfg.corpus

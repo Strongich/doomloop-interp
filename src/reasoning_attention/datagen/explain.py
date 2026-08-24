@@ -23,7 +23,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-from reasoning_attention.config import ExplainerConfig
+from reasoning_attention.config import ExplainerConfig, load_project_env
 from reasoning_attention.datagen.prompts import (
     EXPLAIN_INSTRUCTION,
     MIN_FEATURES,
@@ -77,6 +77,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="only process the first N rows")
     args = parser.parse_args()
 
+    load_project_env()
     config = ExplainerConfig()
     in_meta = read_sidecar(args.input)
     provider = OpenAIProvider(config)

@@ -28,7 +28,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from reasoning_attention.config import WarmStartDataConfig
+from reasoning_attention.config import WarmStartDataConfig, load_project_env
 from reasoning_attention.datagen.sidecar import (
     DatasetMeta,
     ExtractionMeta,
@@ -64,6 +64,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
+    load_project_env()
     data_cfg = WarmStartDataConfig()
     av_fraction = data_cfg.av_fraction if args.av_fraction is None else args.av_fraction
     seed = data_cfg.seed if args.seed is None else args.seed

@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -65,9 +66,7 @@ def label_rows(texts: list[str], config: ExplainerConfig) -> list[dict[str, Any]
             continue
         cleaned = extract_and_clean(raw)
         if cleaned is None:
-            records.append(
-                {"context": text, "summary": None, "status": "no_tags", "raw": raw}
-            )
+            records.append({"context": text, "summary": None, "status": "no_tags", "raw": raw})
             continue
         n_features = count_features(cleaned)
         records.append(
@@ -115,14 +114,16 @@ def write_markdown(path: Path, records: list[dict[str, Any]], stats: dict[str, A
     lines = [
         "# Labeling-model explanations",
         "",
-        f"`{stats['n_usable']}/{stats['n_rows']}` usable "
-        f"(needs >= {MIN_FEATURES} features).",
+        f"`{stats['n_usable']}/{stats['n_rows']}` usable (needs >= {MIN_FEATURES} features).",
         "",
     ]
     ordered = sorted(records, key=lambda r: len(r["context"]))
     for i, rec in enumerate(ordered):
         status = rec["status"]
-        lines.append(f"## {i}. {status}" + (f" — {rec.get('n_features')} features" if rec.get("n_features") else ""))
+        lines.append(
+            f"## {i}. {status}"
+            + (f" — {rec.get('n_features')} features" if rec.get("n_features") else "")
+        )
         lines.append("")
         lines.append("**Context (tail):**")
         lines.append("")
@@ -152,6 +153,9 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=20, help="rows to dump")
     parser.add_argument("--offset", type=int, default=0, help="row offset")
     parser.add_argument("--out", default="explanations", help="output path stem")
+    parser.add_argument("--base-url", default=None, help="OpenAI-compatible server URL")
+    parser.add_argument("--model", default=None, help="override the explainer model id")
+    parser.add_argument("--effort", default=None, help="reasoning effort (hosted API only)")
     args = parser.parse_args()
 
     path = args.from_parquet or args.from_base
@@ -179,7 +183,15 @@ def main() -> None:
             for c, s in zip(contexts, table.column("summary").to_pylist(), strict=True)
         ]
     else:
-        config = ExplainerConfig()
+        overrides: dict[str, object] = {}
+        if args.base_url:
+            overrides["base_url"] = args.base_url
+            overrides["api_kind"] = "chat"
+        if args.model:
+            overrides["model"] = args.model
+        if args.effort:
+            overrides["reasoning_effort"] = args.effort
+        config = replace(ExplainerConfig(), **overrides)  # type: ignore[arg-type]
         console.print(
             f"[dim]labeling {len(contexts)} rows with {config.model} "
             f"(effort={config.reasoning_effort})...[/dim]"

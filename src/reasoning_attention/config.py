@@ -100,6 +100,21 @@ class ExplainerConfig:
 
     model: str = EXPLAINER_MODEL_ID
     reasoning_effort: str = "high"
+    # Point at any OpenAI-compatible server to label with a *local* model instead
+    # of the hosted API — e.g. "http://127.0.0.1:8000/v1" for `vllm serve`. The
+    # hosted API costs $0.39-0.87 per 1k rows; a local server costs GPU time only,
+    # which is the whole reason this knob exists.
+    base_url: str | None = None
+    # "responses" is the hosted reasoning API (sends reasoning={"effort": ...}).
+    # "chat" is plain /v1/chat/completions, which is what vLLM and SGLang serve —
+    # they have no reasoning-effort parameter, so it must not be sent.
+    api_kind: str = "responses"
+
+    @property
+    def is_local(self) -> bool:
+        """True when pointed at a self-hosted server rather than the hosted API."""
+        return self.base_url is not None
+
     max_output_tokens: int = 4096
     # Bounded in-flight requests. Measured on this account: 32 -> 2.08 calls/s
     # (200k rows in ~27 h), 128 -> 7.38 calls/s (~7.5 h), with 100% of responses

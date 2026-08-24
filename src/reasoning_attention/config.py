@@ -45,6 +45,10 @@ CORPUS_CONFIG = "default"
 CORPUS_SPLIT = "en"
 CORPUS_TEXT_COLUMN = "content"
 
+# Output cap for a local chat model: the explanation is ~80-100 words, so this is
+# generous. See ExplainerConfig for why it differs from the hosted default.
+CHAT_MAX_OUTPUT_TOKENS = 512
+
 # Second corpus, used only for the Stage-2 RL prompt set: real chat traffic, so
 # the AV sees activations from conversational text and not just web prose.
 CHAT_CORPUS_ID = "allenai/WildChat-1M"
@@ -96,6 +100,13 @@ class ExplainerConfig:
     room for reasoning tokens *plus* the visible answer, so it is set well above
     the ~100-word explanation budget; a response truncated before its closing
     tag fails extraction and the row is dropped.
+
+    That large cap is wrong for a local chat model, which emits no hidden
+    reasoning tokens: the answer alone is ~150-250 tokens, and reserving 4096 both
+    wastes scheduling capacity and overflows the context window (a 4096-token
+    context + instructions + 4096 reserved output exceeds an 8192 window, which
+    the server rejects with a 400). `CHAT_MAX_OUTPUT_TOKENS` is used instead
+    whenever `api_kind == "chat"` and no explicit override is given.
     """
 
     model: str = EXPLAINER_MODEL_ID

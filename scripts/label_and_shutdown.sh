@@ -60,10 +60,13 @@ fi
 # --- 3. serve -------------------------------------------------------------
 # Both GPUs are free only now that extract is done, which is why the server
 # starts here and not at the top of the script.
+# Window sizing: contexts run to 4096 tokens (WarmStartDataConfig.max_context_tokens),
+# plus ~400 tokens of instruction, plus the reserved output cap. 8192 was too tight —
+# the server 400s when context + reserved output crosses the window — so leave slack.
 log "serve: $MODEL on $TP GPU(s), port $PORT"
 uv run vllm serve "$MODEL" \
     --port "$PORT" --tensor-parallel-size "$TP" \
-    --gpu-memory-utilization 0.90 --max-model-len 8192 \
+    --gpu-memory-utilization 0.90 --max-model-len "${MAX_MODEL_LEN:-16384}" \
     > "$D/vllm.log" 2>&1 &
 VLLM_PID=$!
 # Always take the server down, including on failure — otherwise a crashed run

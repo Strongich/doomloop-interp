@@ -101,8 +101,12 @@ class ExplainerConfig:
     model: str = EXPLAINER_MODEL_ID
     reasoning_effort: str = "high"
     max_output_tokens: int = 4096
-    # Bounded in-flight requests. Raise once the account's rate limit is known.
-    concurrency: int = 32
+    # Bounded in-flight requests. Measured on this account: 32 -> 2.08 calls/s
+    # (200k rows in ~27 h), 128 -> 7.38 calls/s (~7.5 h), with 100% of responses
+    # usable at both. Throughput scales nearly linearly, so the old default of 32
+    # was leaving ~3.5x on the table. Raise further only after re-measuring — the
+    # ceiling is the account's rate limit, and past it you buy 429s, not speed.
+    concurrency: int = 128
     # SDK-level transport retries (429/5xx, exponential backoff with jitter).
     max_retries: int = 10
     # Path to the dotenv file holding OPENAI_API_KEY. None -> rely on the

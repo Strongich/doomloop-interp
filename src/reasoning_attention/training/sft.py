@@ -16,12 +16,15 @@ roughly 0.3-0.4 before RL.
 Defaults are deliberately untuned placeholders (see `--help`); the point is a
 loop that runs and reports honestly, not a tuned recipe.
 
-**LoRA is the default because full fine-tuning does not fit.** Qwen3-1.7B in bf16
-with AdamW needs ~3.4 GB of weights + 3.4 GB of grads + 13.8 GB of fp32 moments
-~= 20.7 GB, against 16 GB on this box. LoRA trains ~1% of that and leaves room
-for activations. `--full-finetune` is available for a larger GPU; it will OOM
-here. The AR's affine map is always trained in full — it is newly initialized and
-has no pretrained weights to adapt.
+**Full fine-tuning is the default**, matching the reference repo (their actor SFT
+is the full 28-layer model under FSDP, no adapters). Qwen3-1.7B in bf16 with AdamW
+needs ~3.5 GB weights + 3.5 GB grads + 14 GB of fp32 moments ~= 21 GB before
+activations: comfortable on an A100-80GB, impossible on a 16 GB card. Pass
+`--lora` on a small GPU — it trains ~1% of the parameters and fits, at the cost of
+deviating from the method. Prefer full fine-tuning for the AR in particular: it is
+the Stage-2 reward model, and a rank-limited reward model is one the AV can game.
+The AR's affine map is always trained in full regardless — it is newly initialized
+and has no pretrained weights to adapt.
 """
 
 from __future__ import annotations
@@ -70,6 +73,8 @@ REFERENCE_INJECTION_SCALE = 150.0  # their --nla-injection-scale for Qwen2.5-7B
 REFERENCE_SAVE_INTERVAL = 500
 
 DEFAULTS = {
+    # Full fine-tuning is the default (matching the reference), so the reference
+    # LR applies directly. --lora needs a much hotter LR; see LORA_LEARNING_RATE.
     "learning_rate": REFERENCE_LR,
     "min_lr": REFERENCE_MIN_LR,
     "batch_size": 4,  # ours - theirs was 256, deliberately not copied
@@ -88,6 +93,9 @@ DEFAULTS = {
 }
 
 # Attention/MLP projections — the standard LoRA target set for Llama-family.
+# LoRA convention, only used when --lora is passed.
+LORA_LEARNING_RATE = 1e-4
+
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
@@ -209,7 +217,7 @@ def build_av(args: argparse.Namespace, config: NLAConfig) -> tuple[Any, Any]:
     model.config.use_cache = False
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
-    if not args.full_finetune:
+    if args.lora:
         model = _apply_lora(model, args)
     return model, tokenizer
 
@@ -223,7 +231,7 @@ def build_ar(args: argparse.Namespace, config: NLAConfig) -> tuple[ARModel, Any]
     backbone.config.use_cache = False
     if args.gradient_checkpointing:
         backbone.gradient_checkpointing_enable()
-    if not args.full_finetune:
+    if args.lora:
         backbone = _apply_lora(backbone, args)
     model = ARModel(backbone, d_model=d_model, bias=config.ar_affine_bias)
     # The affine map is new — always trained in full, whatever the backbone does.
@@ -257,7 +265,13 @@ def main() -> None:
     parser.add_argument("--data", required=True, help="stage-3 parquet for this half")
     parser.add_argument("--output-dir", default="checkpoints")
     parser.add_argument("--limit", type=int, default=None, help="use only the first N rows")
-    parser.add_argument("--full-finetune", action="store_true", help="no LoRA (OOMs on 16 GB)")
+    parser.add_argument(
+        "--lora",
+        action="store_true",
+        help="train LoRA adapters instead of full fine-tuning. Only needed when the "
+        "GPU cannot hold ~21 GB of optimizer state (e.g. a 16 GB card); on A100-80GB "
+        "full fine-tuning fits and is what the reference repo does.",
+    )
     parser.add_argument(
         "--gradient-checkpointing",
         action="store_true",
@@ -325,15 +339,20 @@ def main() -> None:
     total_steps = max(1, steps_per_epoch * args.epochs)
 
     effective_batch = args.batch_size * args.grad_accum
-    if args.full_finetune and args.learning_rate == DEFAULTS["learning_rate"]:
-        # The LoRA default is far too hot for full fine-tuning; re-derive from
-        # the reference setting instead of silently using 1e-4.
+    if not args.lora and args.learning_rate == DEFAULTS["learning_rate"]:
+        # Re-derive from the reference setting rather than assuming their batch.
         args.learning_rate = REFERENCE_LR * math.sqrt(effective_batch / REFERENCE_BATCH)
         print(
             f"full-finetune: LR re-derived to {args.learning_rate:.2e} "
             f"(reference {REFERENCE_LR:.0e} @ batch {REFERENCE_BATCH}, sqrt-scaled to "
             f"batch {effective_batch})"
         )
+
+    if args.lora and args.learning_rate == DEFAULTS["learning_rate"]:
+        # The reference LR is tuned for full fine-tuning and is ~5x too cold for
+        # adapters, which see far fewer parameters per step.
+        args.learning_rate = LORA_LEARNING_RATE
+        print(f"lora: LR raised to {args.learning_rate:.2e} (full-finetune default is too cold)")
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -348,7 +367,7 @@ def main() -> None:
     print(
         f"stage={args.stage} rows={len(dataset)} (train {n_train} / eval {n_eval}) "
         f"steps={total_steps} trainable={n_trainable / 1e6:.1f}M "
-        f"lora={'off' if args.full_finetune else f'r{args.lora_r}'} "
+        f"lora={f'r{args.lora_r}' if args.lora else 'off (full finetune)'} "
         f"lr={args.learning_rate:.2e} eff_batch={effective_batch} "
         f"injection_scale={dataset.scale}"
         + (f" fve_baseline={baseline:.4f}" if args.stage == "ar" else "")

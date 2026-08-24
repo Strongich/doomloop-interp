@@ -252,3 +252,6 @@ runs/
 # Secrets and cluster credentials.
 .env
 kubeconfig.yaml
+
+# Cluster pod spec: node names, PVC, ssh key — kept local.
+pod.yaml

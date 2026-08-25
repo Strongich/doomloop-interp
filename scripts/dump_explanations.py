@@ -243,7 +243,7 @@ def main() -> None:
         help="local thinking model effort (Qwen3 defaults to xhigh, ~5.4k tokens/row)",
     )
     parser.add_argument(
-        "--no-thinking", action="store_true", help="local: disable thinking entirely"
+        "--no-thinking", action="store_true", help="local: disable thinking (already the default)"
     )
     args = parser.parse_args()
 
@@ -284,7 +284,9 @@ def main() -> None:
         if args.effort:
             overrides["reasoning_effort"] = args.effort
         if args.reasoning_effort:
+            # Effort is meaningless with thinking off, so asking for one turns it on.
             overrides["chat_reasoning_effort"] = args.reasoning_effort
+            overrides["chat_enable_thinking"] = True
         if args.no_thinking:
             overrides["chat_enable_thinking"] = False
         config = replace(ExplainerConfig(), **overrides)  # type: ignore[arg-type]

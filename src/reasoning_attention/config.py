@@ -131,7 +131,21 @@ class ExplainerConfig:
     # for a task that is closer to formatting than to reasoning. None leaves the
     # server default alone; `chat_enable_thinking=False` turns thinking off outright.
     chat_reasoning_effort: str | None = None
-    chat_enable_thinking: bool | None = None
+    # Thinking is OFF by default: the reference labels with claude-sonnet-4-6 and
+    # no extended thinking (its response handler asserts a single text block, which
+    # a thinking response would break), so non-thinking is the faithful setting as
+    # well as ~3x faster. `--reasoning-effort` turns it back on.
+    chat_enable_thinking: bool = False
+    # Qwen3's published sampling recipe for non-thinking / Instruct mode. Only the
+    # local chat path uses these: the hosted reasoning API rejects temperature and
+    # top_p outright. `top_k`, `min_p` and `repetition_penalty` are vLLM extensions
+    # and travel in extra_body rather than as standard OpenAI fields.
+    chat_temperature: float = 0.7
+    chat_top_p: float = 0.80
+    chat_top_k: int = 20
+    chat_min_p: float = 0.0
+    chat_presence_penalty: float = 1.5
+    chat_repetition_penalty: float = 1.0
 
     @property
     def is_local(self) -> bool:

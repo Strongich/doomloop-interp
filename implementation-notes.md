@@ -690,3 +690,40 @@ resumable `.incomplete` blobs, and a preflight in `label_and_shutdown.sh` that
 parses every cached shard header (cheap, offline) and exits with the re-download
 command. Verified it fires on a deliberately truncated shard and passes on a
 healthy model — a guard that never fires is worthless.
+
+### D28 — Local labeling runs in non-thinking mode with Qwen3's sampling recipe
+
+Settled after measuring all four modes on 192 real rows against the served 27B:
+
+| mode | rows/s | usable | 200k ETA |
+|---|---|---|---|
+| thinking off | 5.55 | 88.5% | 10 h |
+| effort low | 1.79 | 99.5% | 31 h |
+| effort medium | — | — | ~38 h (extrapolated) |
+| effort xhigh (Qwen3 default) | — | — | ~147 h (extrapolated) |
+
+**Non-thinking is the faithful choice, not merely the cheap one.** The reference
+labels with `claude-sonnet-4-6` through the Anthropic Messages API at
+`max_tokens=300, temperature=1.0, concurrency=32` and passes **no `thinking`
+parameter** (`nla/datagen/providers.py:67`). That is deliberate rather than an
+omission: its response handler asserts `len(resp.content) == 1 and
+resp.content[0].type == "text"`, which an extended-thinking response — a
+`thinking` block plus a `text` block — would fail immediately. The reference also
+tolerates `stop_reason == "max_tokens"` and lets truncated responses fail the
+`</analysis>` regex, so **it drops rows too**; our ~11.5% drop rate at
+`enable_thinking=False` is the same trade, not a regression.
+
+Sampling follows Qwen3's published Instruct-mode recipe: `temperature=0.7`,
+`top_p=0.80`, `top_k=20`, `min_p=0.0`, `presence_penalty=1.5`,
+`repetition_penalty=1.0`. Note the split — `temperature`, `top_p` and
+`presence_penalty` are standard OpenAI chat fields, while `top_k`, `min_p` and
+`repetition_penalty` are vLLM extensions that must travel in `extra_body`
+alongside `chat_template_kwargs.enable_thinking`. All of it applies to the local
+chat path only; the hosted reasoning API rejects `temperature`/`top_p` outright.
+
+`chat_enable_thinking` therefore defaults to **False**, and `--reasoning-effort`
+flips it back on (an effort level is meaningless with thinking disabled).
+
+Quality at 20 rows, thinking off vs effort low: 19/20 vs 20/20 usable, 15 vs 19
+summaries with exactly 3 features, mean 54 vs 74 words against a prompt asking
+for ~80-100. The gap is detail, not format.

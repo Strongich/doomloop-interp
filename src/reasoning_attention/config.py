@@ -144,7 +144,13 @@ class ExplainerConfig:
     chat_top_p: float = 0.80
     chat_top_k: int = 20
     chat_min_p: float = 0.0
-    chat_presence_penalty: float = 1.5
+    # Qwen's recipe says 1.5, but that is tuned for open-ended chat where
+    # discouraging repetition helps. Here the format IS the product: the prompt
+    # asks for three parallel feature lines, and penalising already-used tokens
+    # suppresses exactly that structure. Measured over 192 rows, 1.5 vs 0.0 gives
+    # 70.3% vs 90.1% usable — and every failure is "<2 features", never a missing
+    # <analysis> tag, which is the signature of the penalty flattening the list.
+    chat_presence_penalty: float = 0.0
     chat_repetition_penalty: float = 1.0
 
     @property

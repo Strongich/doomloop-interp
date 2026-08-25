@@ -108,6 +108,18 @@ def main() -> None:
         "<analysis> tag appears. The hosted default applies otherwise.",
     )
     parser.add_argument(
+        "--reasoning-effort",
+        default=None,
+        choices=["low", "medium", "xhigh"],
+        help="local thinking models only. Qwen3 defaults to 'xhigh' (~5.4k tokens/row); "
+        "'low' is ~840 and the explanations stay well-formed.",
+    )
+    parser.add_argument(
+        "--no-thinking",
+        action="store_true",
+        help="local only: turn the model's thinking off entirely via chat_template_kwargs.",
+    )
+    parser.add_argument(
         "--api-kind",
         default=None,
         choices=["responses", "chat"],
@@ -131,6 +143,10 @@ def main() -> None:
         overrides["max_output_tokens"] = args.max_output_tokens
     elif args.api_kind:
         overrides["api_kind"] = args.api_kind
+    if args.reasoning_effort:
+        overrides["chat_reasoning_effort"] = args.reasoning_effort
+    if args.no_thinking:
+        overrides["chat_enable_thinking"] = False
     if args.model:
         overrides["model"] = args.model
     if args.concurrency:

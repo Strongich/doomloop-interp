@@ -41,11 +41,17 @@ from reasoning_attention.datagen.sidecar import (
     write_sidecar,
 )
 
+# How many unusable raw responses to keep for the error message when a chunk fails.
+_MAX_SAMPLE_FAILURES = 3
 
-def explain_chunk(chunk: pa.Table, provider: CompletionProvider) -> tuple[pa.Table, int]:
+
+def explain_chunk(chunk: pa.Table, provider: CompletionProvider) -> tuple[pa.Table, int, list[str]]:
     """Add a `summary` column to one chunk, dropping unusable rows.
 
-    Returns `(chunk_with_summaries, n_dropped)`.
+    Returns `(chunk_with_summaries, n_dropped, sample_failures)`. The raw text of
+    the first few unusable responses comes back so a caller can show *why* rows
+    were dropped — otherwise diagnosing a bad run means re-serving the model just
+    to see one response.
     """
     texts = chunk.column("context_text").to_pylist()
     completions = provider.complete([build_explain_prompt(t) for t in texts])
@@ -56,10 +62,13 @@ def explain_chunk(chunk: pa.Table, provider: CompletionProvider) -> tuple[pa.Tab
 
     keep: list[bool] = []
     summaries: list[str] = []
+    failures: list[str] = []
     for raw in completions:
         cleaned = extract_and_clean(raw) if raw is not None else None
         if cleaned is None or count_features(cleaned) < MIN_FEATURES:
             keep.append(False)
+            if len(failures) < _MAX_SAMPLE_FAILURES:
+                failures.append("<no response: the request itself failed>" if raw is None else raw)
             continue
         keep.append(True)
         summaries.append(cleaned)
@@ -67,7 +76,8 @@ def explain_chunk(chunk: pa.Table, provider: CompletionProvider) -> tuple[pa.Tab
     n_dropped = keep.count(False)
     if n_dropped:
         chunk = chunk.filter(pa.array(keep, type=pa.bool_()))
-    return chunk.append_column("summary", pa.array(summaries, type=pa.string())), n_dropped
+    table = chunk.append_column("summary", pa.array(summaries, type=pa.string()))
+    return table, n_dropped, failures
 
 
 def main() -> None:
@@ -93,8 +103,9 @@ def main() -> None:
         "--max-output-tokens",
         type=int,
         default=None,
-        help=f"output cap. Defaults to {CHAT_MAX_OUTPUT_TOKENS} for local chat servers "
-        f"(no reasoning tokens to budget for) and to the hosted value otherwise.",
+        help="output cap. Local chat servers default to uncapped, because Qwen3 thinks "
+        "before answering and a cap truncates the chain of thought before any "
+        "<analysis> tag appears. The hosted default applies otherwise.",
     )
     parser.add_argument(
         "--api-kind",
@@ -149,8 +160,21 @@ def main() -> None:
         if chunk_path.exists():
             n_resumed += 1
             continue
-        out_chunk, dropped = explain_chunk(table.slice(start, args.chunk_size), provider)
+        out_chunk, dropped, failures = explain_chunk(table.slice(start, args.chunk_size), provider)
         n_dropped += dropped
+        # A chunk that kept nothing must NOT be written. A cached zero-row chunk
+        # is indistinguishable from a completed one, so every later run would
+        # "resume" past it and merge nothing, forever — the failure would look
+        # like a parsing bug long after the real cause (a dead server, a bad
+        # output cap) had scrolled away. Stop on the first one instead.
+        if out_chunk.num_rows == 0:
+            sample = "\n\n--- next sample ---\n".join(f[:1000] for f in failures)
+            raise SystemExit(
+                f"chunk {start}: all {dropped} rows dropped — refusing to cache an empty chunk.\n"
+                f"Raw response sample(s) below. No <analysis>...</analysis> pair means the "
+                f"response was truncated (raise --max-output-tokens) or off-format; "
+                f"'<no response>' means the request failed.\n\n{sample}"
+            )
         # tmp + rename so a kill mid-write can't leave a half-written chunk that
         # a later run would mistake for complete.
         tmp = chunk_path.with_suffix(".tmp")

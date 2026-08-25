@@ -27,6 +27,11 @@ TP="${TP:-2}"
 CONC="${CONC:-64}"
 LIMIT="${LIMIT:-}"
 N_DOCS="${N_DOCS:-40000}"
+# Python block-buffers stdout when it is redirected to a file, so per-chunk
+# progress would sit in an 8KB buffer for tens of minutes and the run would look
+# hung. The shell's own `log` lines are unaffected, which makes it look worse:
+# you see the stage banners and then nothing.
+export PYTHONUNBUFFERED=1
 export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/workspace/.cache/uv}"
 mkdir -p "$D"

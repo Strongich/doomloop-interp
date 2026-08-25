@@ -714,8 +714,21 @@ tolerates `stop_reason == "max_tokens"` and lets truncated responses fail the
 `enable_thinking=False` is the same trade, not a regression.
 
 Sampling follows Qwen3's published Instruct-mode recipe: `temperature=0.7`,
-`top_p=0.80`, `top_k=20`, `min_p=0.0`, `presence_penalty=1.5`,
-`repetition_penalty=1.0`. Note the split — `temperature`, `top_p` and
+`top_p=0.80`, `top_k=20`, `min_p=0.0`, `repetition_penalty=1.0` — but with
+**`presence_penalty=0.0` instead of the recommended 1.5**. Measured over 192 rows:
+
+| presence_penalty | usable | no `<analysis>` tag | `<2 features` |
+|---|---|---|---|
+| 1.5 (recipe) | 70.3% | 0 | 57 |
+| 0.0 | 90.1% | 0 | 19 |
+
+The recipe is tuned for open-ended chat, where discouraging repetition improves
+output. Here the repetition *is* the deliverable: the prompt asks for three
+parallel feature lines inside one `<analysis>` block. The failure signature makes
+the mechanism unambiguous — the tag is emitted in 100% of responses under both
+settings, and every extra failure is `<2 features`, i.e. the penalty flattening
+the list rather than breaking the format. Throughput is unaffected (5.9 vs 6.1
+rows/s), so this is ~20 points of yield for free. Note the split — `temperature`, `top_p` and
 `presence_penalty` are standard OpenAI chat fields, while `top_k`, `min_p` and
 `repetition_penalty` are vLLM extensions that must travel in `extra_body`
 alongside `chat_template_kwargs.enable_thinking`. All of it applies to the local

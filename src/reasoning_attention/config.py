@@ -45,9 +45,13 @@ CORPUS_CONFIG = "default"
 CORPUS_SPLIT = "en"
 CORPUS_TEXT_COLUMN = "content"
 
-# Output cap for a local chat model: the explanation is ~80-100 words, so this is
-# generous. See ExplainerConfig for why it differs from the hosted default.
-CHAT_MAX_OUTPUT_TOKENS = 512
+# No output cap for a local chat model. Qwen3 serves in *thinking* mode, so the
+# response is a <think> block followed by the answer, and the chain of thought can
+# run to thousands of tokens. Any cap risks cutting the response off inside the
+# reasoning, before a single <analysis> tag is emitted — which drops the row and
+# looks exactly like a parsing bug. The prompt already bounds the answer to
+# ~80-100 words; the thinking is what must not be truncated. None = uncapped.
+CHAT_MAX_OUTPUT_TOKENS: int | None = None
 
 # Second corpus, used only for the Stage-2 RL prompt set: real chat traffic, so
 # the AV sees activations from conversational text and not just web prose.
@@ -101,12 +105,13 @@ class ExplainerConfig:
     the ~100-word explanation budget; a response truncated before its closing
     tag fails extraction and the row is dropped.
 
-    That large cap is wrong for a local chat model, which emits no hidden
-    reasoning tokens: the answer alone is ~150-250 tokens, and reserving 4096 both
-    wastes scheduling capacity and overflows the context window (a 4096-token
-    context + instructions + 4096 reserved output exceeds an 8192 window, which
-    the server rejects with a 400). `CHAT_MAX_OUTPUT_TOKENS` is used instead
-    whenever `api_kind == "chat"` and no explicit override is given.
+    A local chat model is capped differently — not at all. Qwen3 serves in
+    thinking mode, emitting a <think> block before the answer, so a cap truncates
+    the chain of thought and no <analysis> tag ever appears. It also has to fit
+    the context window: context + instructions + reserved output must stay under
+    `--max-model-len`, and a large reservation there is what produced a 400.
+    `CHAT_MAX_OUTPUT_TOKENS` (None) is used whenever `api_kind == "chat"` and no
+    explicit override is given.
     """
 
     model: str = EXPLAINER_MODEL_ID
@@ -126,7 +131,7 @@ class ExplainerConfig:
         """True when pointed at a self-hosted server rather than the hosted API."""
         return self.base_url is not None
 
-    max_output_tokens: int = 4096
+    max_output_tokens: int | None = 4096
     # Bounded in-flight requests. Measured on this account: 32 -> 2.08 calls/s
     # (200k rows in ~27 h), 128 -> 7.38 calls/s (~7.5 h), with 100% of responses
     # usable at both. Throughput scales nearly linearly, so the old default of 32

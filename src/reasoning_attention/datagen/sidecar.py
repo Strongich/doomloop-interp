@@ -46,7 +46,7 @@ class ExplainerMeta:
 
     model: str
     reasoning_effort: str
-    max_output_tokens: int
+    max_output_tokens: int | None
     instruction_prompt: str
 
 

@@ -27,6 +27,13 @@ ANALYSIS_RE = re.compile(
 # model ignored the format.
 MIN_FEATURES = 2
 
+# A thinking model (Qwen3 in its default mode) emits its chain of thought first,
+# then the answer. Only the text after the closing tag is the explanation: the
+# reasoning is scratch work, and it routinely quotes the <analysis> format while
+# planning, so searching the whole response would extract a draft rather than the
+# final answer.
+THINK_CLOSE = "</think>"
+
 EXPLAIN_INSTRUCTION = """A language model needs to predict what text comes next after a snippet which will be presented to you shortly. Identify the 2-3 most important features it would use for this prediction.
 Focus on what the language model must be "thinking about" at the point where the provided text ends. You should not need to reference the fact that the text is truncated/incomplete/a prefix: the language model is causal, so only sees the prefix to what it predicts and this is implicit.
 Order features by what is most important for predicting the next tokens. Each feature should consist of a concise ~10-20 word description. Feel free to include specific textual examples inline.
@@ -75,9 +82,13 @@ def build_explain_prompt(text: str) -> str:
 def extract_and_clean(raw: str) -> str | None:
     """Pull the content inside `<analysis>` tags and strip list formatting.
 
-    Returns paragraphs joined by blank lines, or None when the tags are absent
-    (truncated or off-format response) — the caller drops those rows.
+    Any chain of thought is discarded first: only the text after the final
+    `</think>` is considered. Returns paragraphs joined by blank lines, or None
+    when the tags are absent (truncated or off-format) — the caller drops those.
     """
+    if THINK_CLOSE in raw:
+        raw = raw.rsplit(THINK_CLOSE, 1)[1]
+
     match = ANALYSIS_RE.search(raw)
     if match is None:
         return None

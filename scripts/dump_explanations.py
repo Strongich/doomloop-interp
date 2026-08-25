@@ -40,7 +40,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from reasoning_attention.config import ExplainerConfig
+from reasoning_attention.config import CHAT_MAX_OUTPUT_TOKENS, ExplainerConfig
 from reasoning_attention.datagen.prompts import (
     MIN_FEATURES,
     build_explain_prompt,
@@ -236,6 +236,15 @@ def main() -> None:
     parser.add_argument("--base-url", default=None, help="OpenAI-compatible server URL")
     parser.add_argument("--model", default=None, help="override the explainer model id")
     parser.add_argument("--effort", default=None, help="reasoning effort (hosted API only)")
+    parser.add_argument(
+        "--reasoning-effort",
+        default=None,
+        choices=["low", "medium", "xhigh"],
+        help="local thinking model effort (Qwen3 defaults to xhigh, ~5.4k tokens/row)",
+    )
+    parser.add_argument(
+        "--no-thinking", action="store_true", help="local: disable thinking entirely"
+    )
     args = parser.parse_args()
 
     path = args.from_parquet or args.from_base
@@ -267,15 +276,24 @@ def main() -> None:
         if args.base_url:
             overrides["base_url"] = args.base_url
             overrides["api_kind"] = "chat"
+            # Same reasoning as the explain stage: a local thinking model must not
+            # have its chain of thought truncated, or no <analysis> tag is emitted.
+            overrides["max_output_tokens"] = CHAT_MAX_OUTPUT_TOKENS
         if args.model:
             overrides["model"] = args.model
         if args.effort:
             overrides["reasoning_effort"] = args.effort
+        if args.reasoning_effort:
+            overrides["chat_reasoning_effort"] = args.reasoning_effort
+        if args.no_thinking:
+            overrides["chat_enable_thinking"] = False
         config = replace(ExplainerConfig(), **overrides)  # type: ignore[arg-type]
-        console.print(
-            f"[dim]labeling {len(contexts)} rows with {config.model} "
-            f"(effort={config.reasoning_effort})...[/dim]"
+        mode = (
+            "thinking off"
+            if args.no_thinking
+            else f"effort={config.chat_reasoning_effort or config.reasoning_effort}"
         )
+        console.print(f"[dim]labeling {len(contexts)} rows with {config.model} ({mode})...[/dim]")
         records = label_rows(contexts, config)
 
     if norms:

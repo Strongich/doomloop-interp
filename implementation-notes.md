@@ -628,3 +628,65 @@ bootstraps uv (and `pod.yaml` installs it at boot). `pod.yaml` also adds
 `build-essential` for the flash-attn source build and exports `CUDA_HOME` plus
 `$HOME/.local/bin` on PATH in `.zshrc`. `make rl-setup` / `rl-check` wrap the
 script.
+
+### D26 — Labeling with a *thinking* model: uncapped output, strip the CoT
+
+Labeling 200 rows against a locally served `Qwen/Qwen3.8-27B` dropped every row
+with `AssertionError: every row was dropped`. Three independent bugs, all worth
+recording because each one masked the next.
+
+**1. The output cap truncated the chain of thought.** `CHAT_MAX_OUTPUT_TOKENS`
+was set to 512 on the reasoning that a local chat model "emits no hidden
+reasoning tokens, so the answer alone is ~150-250 tokens". That is false for
+Qwen3, which serves in thinking mode by default: a measured response is **1511
+completion tokens, ~695 words of which are thinking**. The cap cut the response
+off mid-reasoning, so no `<analysis>` tag was ever emitted and every row failed
+extraction. The cap is now `None` (uncapped) for `api_kind == "chat"`. The prompt
+already bounds the *answer* to ~80-100 words; it is the thinking that must not be
+truncated.
+
+**2. Extraction matched a draft inside the reasoning.** vLLM here runs with no
+reasoning parser (`reasoning_parser=''`), so the CoT is inline in `content`
+rather than split into `reasoning_content` — and the chat template pre-fills the
+opening `<think>`, so the response *begins* in reasoning and only the closing
+`</think>` appears. The model routinely writes a trial `<analysis>` block while
+planning, and `ANALYSIS_RE` matched that first, yielding 7 features of scratch
+work ("Need produce final with..."). `extract_and_clean` now discards everything
+through the final `</think>` before searching. This also makes the code correct
+if a reasoning parser is ever enabled: `content` is then already answer-only and
+the split is a no-op.
+
+**3. An all-dropped chunk poisoned the resume cache.** `explain.py` wrote the
+zero-row chunk to `.chunks/` anyway, and the resume check is
+`if chunk_path.exists()`. A zero-row chunk is indistinguishable from a completed
+one, so every later run "resumed" past it and merged nothing — the failure
+resurfaced as a parsing assertion long after the real cause (the 400, then the
+cap) had scrolled off. The stage now **refuses to cache a chunk that kept no
+rows** and aborts on the first one, printing the raw text of up to 3 unusable
+responses. Losing the raw responses was itself the reason diagnosis required
+re-serving a 27B model just to see one completion.
+
+**Throughput consequence.** `reasoning_effort` defaults to `xhigh` on this model.
+Measured on one row: xhigh 5417 tok / 111 s, medium 1398, low 838, and thinking
+disabled 85 tok/row. All produce well-formed 3-feature explanations; the
+difference is grounding detail, not format. `chat_reasoning_effort` and
+`chat_enable_thinking` are now plumbed through `ExplainerConfig` ->
+`OpenAIProvider._one_chat` (via `extra_body.chat_template_kwargs`), exposed as
+`--reasoning-effort` / `--no-thinking`. Defaults leave the server alone, so the
+choice is explicit at the call site.
+
+### D27 — Verify model shards before serving (`scripts/verify_weights.py`)
+
+An interrupted **Xet** download reconstructs shards in place under their final
+names instead of staging `blobs/*.incomplete`, so a killed transfer leaves
+truncated files that the HF cache reports as present. All 18 shards of the 27B
+were short — 14 GB on disk against 51.7 GiB upstream — and an earlier
+"18 shards, 0 partials" check passed because it counted *files*. The only symptom
+was `SafetensorError: incomplete metadata, file not fully covered`, five minutes
+into engine startup, behind a `RuntimeError: Engine core initialization failed`.
+
+Two fixes: re-download with `HF_HUB_DISABLE_XET=1` so partials stage as
+resumable `.incomplete` blobs, and a preflight in `label_and_shutdown.sh` that
+parses every cached shard header (cheap, offline) and exits with the re-download
+command. Verified it fires on a deliberately truncated shard and passes on a
+healthy model — a guard that never fires is worthless.

@@ -276,11 +276,22 @@ class NLAConfig:
     # --- How it's normalized before injection ---
     # The activation is rescaled to a target L2-norm before it overwrites the
     # placeholder's embedding (reference repo's `normalize_activation`):
-    #   "sqrt_d_model"        -> sqrt(d_model), the "ambient residual-stream scale"
-    #                            (default; matches the repo's resolve_target_scale)
+    #   "sqrt_d_model"        -> sqrt(d_model), the repo's *fallback* default
     #   None / "raw" / "none" -> inject raw, magnitude preserved
     #   float                 -> scale to exactly that L2-norm
-    injection_scale: float | str | None = "sqrt_d_model"
+    #
+    # 1000, not sqrt(2048)=45.3. The reference's actual rule is empirical, not a
+    # function of d_model: "injection_scale is picked as a round number a bit
+    # above the mean norm of the dataset's vectors" (docs/inference.md). Their
+    # own values follow it and nothing else — Qwen2.5-7B uses 150 against a mean
+    # norm of ~125, Gemma-3-12B uses 80000 (its scaled embedding layer multiplies
+    # by sqrt(d) in the forward pass, inflating residual norms ~500x), and
+    # Llama-3.3-70B uses 30, which is *below* sqrt(8192)=90.5.
+    #
+    # Our measured h_l norms at layer 20 are 782-1004, mean ~900, so 1000 is the
+    # round number just above. sqrt_d_model would have injected at ~20x below the
+    # distribution the AV has to read.
+    injection_scale: float | str | None = 1000.0
 
     # --- Placeholder token (task 1) ---
     # We do NOT add a new token to the vocabulary. The "special token" is only a

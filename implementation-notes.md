@@ -740,3 +740,36 @@ flips it back on (an effort level is meaningless with thinking disabled).
 Quality at 20 rows, thinking off vs effort low: 19/20 vs 20/20 usable, 15 vs 19
 summaries with exactly 3 features, mean 54 vs 74 words against a prompt asking
 for ~80-100. The gap is detail, not format.
+
+### D29 — `injection_scale` = 1000, from the reference's stated rule (not sqrt(d))
+
+Reverses the earlier default of `sqrt_d_model` (≈45.3 at d_model 2048), which
+was chosen by reading `resolve_target_scale` and taking its fallback for the
+recipe. It is not the recipe. `docs/inference.md` states the rule outright:
+
+> `injection_scale` is picked as a round number a bit above the mean norm of
+> the dataset's vectors.
+
+Their published values follow that and nothing else — no relation to `d_model`:
+
+| model | d_model | layer | injection_scale | sqrt(d_model) | mean ‖h‖ |
+|---|---|---|---|---|---|
+| Qwen2.5-7B | 3584 | 20 | 150 | 59.9 | ~125 |
+| Gemma-3-12B | 3840 | 32 | 80000 | 62.0 | ~74k |
+| Llama-3.3-70B | 8192 | 53 | 30 | 90.5 | — |
+
+Gemma is ~500x Qwen because `Gemma3TextScaledWordEmbedding.forward()` multiplies
+by sqrt(hidden_size), inflating residual-stream norms; Llama-70B is *below*
+sqrt(d). Any "scale = f(d_model)" reading is contradicted in both directions.
+
+Our extracted `h_l` at layer 20 measures 782-1004, mean ≈ 900 (consistent with
+the 774-994 seen at extraction), so the round number just above is **1000**.
+`sqrt_d_model` would have injected at ~20x below the distribution the AV must
+read — the same class of error as injecting raw, in the opposite direction.
+
+No sweep was run (no spare compute); 1000 is the rule's value, not a tuned one.
+`--injection-scale` still accepts a float, `sqrt_d_model`, or `raw`, so a sweep
+later needs no code change. Note `mse_scale` is a **separate** knob in the
+reference (`docs/design.md`): ours is the same `injection_scale` value used for
+the direction-only AR loss, where the constant cancels through the mean and only
+`None` vs not-None actually changes the objective.

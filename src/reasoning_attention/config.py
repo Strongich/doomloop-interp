@@ -125,6 +125,13 @@ class ExplainerConfig:
     # "chat" is plain /v1/chat/completions, which is what vLLM and SGLang serve —
     # they have no reasoning-effort parameter, so it must not be sent.
     api_kind: str = "responses"
+    # Knobs that exist only on the local chat path. Qwen3 serves in thinking mode
+    # and defaults to reasoning_effort="xhigh", which spends ~5.4k tokens per row
+    # against ~840 at "low" — a 6.5x difference in wall-clock over a 200k-row run,
+    # for a task that is closer to formatting than to reasoning. None leaves the
+    # server default alone; `chat_enable_thinking=False` turns thinking off outright.
+    chat_reasoning_effort: str | None = None
+    chat_enable_thinking: bool | None = None
 
     @property
     def is_local(self) -> bool:

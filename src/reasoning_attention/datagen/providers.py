@@ -16,9 +16,11 @@ from __future__ import annotations
 import asyncio
 import os
 from abc import ABC, abstractmethod
+from typing import Any
 
 import openai
 from dotenv import load_dotenv
+from openai import omit
 from openai.types.shared_params import Reasoning
 
 from reasoning_attention.config import ExplainerConfig
@@ -95,6 +97,9 @@ class OpenAIProvider(CompletionProvider):
         self.reasoning_effort = self.config.reasoning_effort
         self.max_output_tokens = self.config.max_output_tokens
         self.concurrency = self.config.concurrency
+        # Local-only generation knobs; see ExplainerConfig for why they matter.
+        self.chat_reasoning_effort = self.config.chat_reasoning_effort
+        self.chat_enable_thinking = self.config.chat_enable_thinking
 
     async def _one_chat(self, prompt: str) -> str | None:
         """Plain /v1/chat/completions — what vLLM and SGLang expose.
@@ -103,10 +108,18 @@ class OpenAIProvider(CompletionProvider):
         effort knob does not exist there. A response cut off by the token cap is
         dropped for the same reason as the hosted path — no closing tag is coming.
         """
+        # `omit` (not None) is how the SDK leaves a parameter out of the payload —
+        # sending an explicit null makes vLLM reject the request.
+        effort: Any = self.chat_reasoning_effort if self.chat_reasoning_effort else omit
+        extra_body: dict[str, object] | None = None
+        if self.chat_enable_thinking is not None:
+            extra_body = {"chat_template_kwargs": {"enable_thinking": self.chat_enable_thinking}}
         resp = await self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=self.max_output_tokens,
+            reasoning_effort=effort,
+            extra_body=extra_body,
         )
         choice = resp.choices[0]
         if choice.finish_reason == "length":

@@ -80,6 +80,30 @@ def explain_chunk(chunk: pa.Table, provider: CompletionProvider) -> tuple[pa.Tab
     return table, n_dropped, failures
 
 
+def _explainer_meta(config: ExplainerConfig) -> ExplainerMeta:
+    """Record how the labels were actually produced.
+
+    The local chat path and the hosted reasoning path have disjoint knobs, so only
+    the ones that were really in effect are written — recording a reasoning effort
+    for a non-thinking local run would misdescribe the data.
+    """
+    local = config.api_kind == "chat"
+    return ExplainerMeta(
+        model=config.model,
+        reasoning_effort=config.chat_reasoning_effort or "" if local else config.reasoning_effort,
+        max_output_tokens=config.max_output_tokens,
+        instruction_prompt=EXPLAIN_INSTRUCTION,
+        api_kind=config.api_kind,
+        enable_thinking=config.chat_enable_thinking if local else None,
+        temperature=config.chat_temperature if local else None,
+        top_p=config.chat_top_p if local else None,
+        top_k=config.chat_top_k if local else None,
+        min_p=config.chat_min_p if local else None,
+        presence_penalty=config.chat_presence_penalty if local else None,
+        repetition_penalty=config.chat_repetition_penalty if local else None,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="av_half.parquet or ar_half.parquet")
@@ -222,12 +246,7 @@ def main() -> None:
         n_documents=in_meta["n_documents"],
         extraction=ExtractionMeta(**in_meta["extraction"]),
         created_by="reasoning_attention.datagen.explain",
-        explainer=ExplainerMeta(
-            model=config.model,
-            reasoning_effort=config.reasoning_effort,
-            max_output_tokens=config.max_output_tokens,
-            instruction_prompt=EXPLAIN_INSTRUCTION,
-        ),
+        explainer=_explainer_meta(config),
         parent_datasets=[in_meta["dataset_id"]],
     )
     print(f"wrote {row_count} rows -> {args.output}")

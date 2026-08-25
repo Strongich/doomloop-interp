@@ -42,12 +42,26 @@ class ExtractionMeta:
 
 @dataclass
 class ExplainerMeta:
-    """Which model wrote the explanations, and with what prompt."""
+    """Which model wrote the explanations, with what prompt, and how it sampled.
+
+    The sampling fields matter for reproducibility: a local run's labels depend on
+    them as much as on the model id, and `reasoning_effort` is meaningless when the
+    explanations came from a non-thinking local model. Optional so sidecars written
+    before these were recorded still load.
+    """
 
     model: str
     reasoning_effort: str
     max_output_tokens: int | None
     instruction_prompt: str
+    api_kind: str = "responses"
+    enable_thinking: bool | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
 
 
 @dataclass

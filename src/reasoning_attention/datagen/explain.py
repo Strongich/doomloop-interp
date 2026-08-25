@@ -117,7 +117,7 @@ def main() -> None:
     parser.add_argument(
         "--no-thinking",
         action="store_true",
-        help="local only: turn the model's thinking off entirely via chat_template_kwargs.",
+        help="local only: disable thinking via chat_template_kwargs (already the default).",
     )
     parser.add_argument(
         "--api-kind",
@@ -144,7 +144,9 @@ def main() -> None:
     elif args.api_kind:
         overrides["api_kind"] = args.api_kind
     if args.reasoning_effort:
+        # Effort is meaningless with thinking off, so asking for one turns it on.
         overrides["chat_reasoning_effort"] = args.reasoning_effort
+        overrides["chat_enable_thinking"] = True
     if args.no_thinking:
         overrides["chat_enable_thinking"] = False
     if args.model:

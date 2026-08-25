@@ -111,15 +111,21 @@ class OpenAIProvider(CompletionProvider):
         # `omit` (not None) is how the SDK leaves a parameter out of the payload —
         # sending an explicit null makes vLLM reject the request.
         effort: Any = self.chat_reasoning_effort if self.chat_reasoning_effort else omit
-        extra_body: dict[str, object] | None = None
-        if self.chat_enable_thinking is not None:
-            extra_body = {"chat_template_kwargs": {"enable_thinking": self.chat_enable_thinking}}
+        cfg = self.config
         resp = await self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=self.max_output_tokens,
+            temperature=cfg.chat_temperature,
+            top_p=cfg.chat_top_p,
+            presence_penalty=cfg.chat_presence_penalty,
             reasoning_effort=effort,
-            extra_body=extra_body,
+            extra_body={
+                "top_k": cfg.chat_top_k,
+                "min_p": cfg.chat_min_p,
+                "repetition_penalty": cfg.chat_repetition_penalty,
+                "chat_template_kwargs": {"enable_thinking": self.chat_enable_thinking},
+            },
         )
         choice = resp.choices[0]
         if choice.finish_reason == "length":

@@ -63,6 +63,12 @@ fi
 # Window sizing: contexts run to 4096 tokens (WarmStartDataConfig.max_context_tokens),
 # plus ~400 tokens of instruction, plus the reserved output cap. 8192 was too tight —
 # the server 400s when context + reserved output crosses the window — so leave slack.
+# An interrupted Xet download leaves shards truncated under their final names, so
+# the cache looks complete and the failure only surfaces minutes later inside the
+# engine. Parse the headers first — cheap, and it fails with an actionable message.
+log "verify: checking cached shards of $MODEL"
+uv run python scripts/verify_weights.py "$MODEL" "$HF_HOME" || exit 1
+
 log "serve: $MODEL on $TP GPU(s), port $PORT"
 uv run vllm serve "$MODEL" \
     --port "$PORT" --tensor-parallel-size "$TP" \

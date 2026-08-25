@@ -116,9 +116,13 @@ These were deliberate and are recorded with rationale in `implementation-notes.m
   model never emits — `<|image_pad|>` (id **151655**) — because embedding-level
   injection makes the token's lexical identity irrelevant. Never resize the
   embedding matrix for this.
-- **Injection scale** = `sqrt_d_model` (≈45.3) by default, matching the reference
-  repo's `resolve_target_scale`. Raw `h_l` norms are ~800–960, so injecting
-  unscaled is a bug, not a variant.
+- **Injection scale** = **1000** by default. The reference's rule is empirical,
+  not a function of `d_model`: *"picked as a round number a bit above the mean
+  norm of the dataset's vectors"* (`docs/inference.md`). Their own values follow
+  only that — 150 for Qwen2.5-7B (mean ~125), 80000 for Gemma-3-12B (its scaled
+  embedding inflates norms ~500x), 30 for Llama-3.3-70B (below `sqrt(8192)`).
+  Our `h_l` norms are 782-1004, mean ~900. `sqrt_d_model` (≈45.3) is the repo's
+  *fallback* default, not its recipe, and would inject ~20x below distribution.
 - **AR truncation happens in the config, before `from_pretrained`** — set
   `num_hidden_layers` and slice the per-layer arrays (`layer_types`, …). Never
   slice the `nn.ModuleList` post-hoc. The transformers "unexpected weights"

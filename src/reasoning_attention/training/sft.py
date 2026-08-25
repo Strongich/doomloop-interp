@@ -287,9 +287,11 @@ def main() -> None:
     parser.add_argument(
         "--injection-scale",
         default=None,
-        help=f"override NLAConfig.injection_scale. The reference used "
-        f"{REFERENCE_INJECTION_SCALE} for Qwen2.5-7B (d_model 3584); ours defaults to "
-        f"sqrt_d_model (45.3 at d_model 2048). Accepts a float, 'sqrt_d_model', or 'raw'.",
+        help=f"override NLAConfig.injection_scale. The reference picks a round number "
+        f"just above the dataset's mean activation norm — {REFERENCE_INJECTION_SCALE} for "
+        f"Qwen2.5-7B (mean ~125), 80000 for Gemma-3-12B, 30 for Llama-3.3-70B. Our h_l "
+        f"norms average ~900, so we default to 1000. Accepts a float, 'sqrt_d_model', "
+        f"or 'raw'.",
     )
     parser.add_argument("--seed", type=int, default=42)
     for key, value in DEFAULTS.items():

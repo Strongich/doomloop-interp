@@ -6,7 +6,9 @@ vectors in one contiguous float32 array rather than as per-row Python lists: at
 that is already a matrix on disk.
 
 **Normalization happens here, not in datagen.** Vectors are stored raw; both
-sides scale them to `NLAConfig.injection_scale` (sqrt(d_model) ~ 45.3). The AV
+sides scale them: the AV to `NLAConfig.injection_scale` (1000, matching the
+activation distribution), the AR to `NLAConfig.mse_scale` (sqrt(d_model) ~ 45.3,
+keeping the loss O(1)). The AV
 injects the scaled vector, and the AR regresses onto the *same* scaled vector, so
 the two models agree on what "the activation" means. Regressing onto raw
 ~900-norm vectors instead would put the MSE on a wildly different scale from
@@ -136,7 +138,10 @@ class ARDataset(Dataset[dict[str, Any]]):
         self.max_length = max_length
         table, self.activations = load_activations(path, limit)
         self.prompts = table.column("prompt").to_pylist()
-        self.scale = self.config.resolve_injection_scale(self.activations.shape[1])
+        # mse_scale, NOT injection_scale: the AR never injects, it *predicts* the
+        # vector. This scale only sets the units of the loss, and sqrt(d) is what
+        # keeps it O(1) and comparable to the reference's 0.938 baseline.
+        self.scale = self.config.resolve_mse_scale(self.activations.shape[1])
 
     def __len__(self) -> int:
         return len(self.prompts)

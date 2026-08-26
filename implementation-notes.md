@@ -773,3 +773,38 @@ later needs no code change. Note `mse_scale` is a **separate** knob in the
 reference (`docs/design.md`): ours is the same `injection_scale` value used for
 the direction-only AR loss, where the constant cancels through the mean and only
 `None` vs not-None actually changes the objective.
+
+### D30 — `mse_scale` is a separate knob from `injection_scale`
+
+Found by the first SFT smoke run after D29. `ARDataset` and `ar_loss` were both
+using `resolve_injection_scale()`, so raising `injection_scale` to 1000 also
+raised the AR loss's normalization target — and those are different things.
+
+The AR loss normalizes both sides, so the MSE carries a factor `s^2/d`; it is
+exactly 1 only when `s = sqrt(d)` ("s cancels via mean", `nla/loss.py:77`). At
+`s=1000, d=2048` the factor is ~488, which showed up as:
+
+| | injection_scale reused | mse_scale = sqrt(d) | reference |
+|---|---|---|---|
+| fve_baseline | 345.87 | 0.7213 | 0.938 |
+| step-1 loss | 600.39 | 1.2558 | 1.61 (step 0) |
+| grad_norm | **10671** | 42.3 | — |
+
+FVE survived (it is a ratio) but the gradients did not: `grad_norm ~1e4` against
+`max_grad_norm=1.0` means every step is clipped ~10,000x and the effective LR is
+whatever survives clipping. It also made the loss incomparable to their published
+0.938 / 0.586 numbers, removing the main external check we have.
+
+`docs/design.md` states these are independent, and their values differ in
+practice (`injection_scale=150`, `mse_scale` defaulting to `sqrt_d_model`).
+`NLAConfig` now has both, sharing one `_resolve_scale` so they accept the same
+forms. `AVDataset` uses `injection_scale` (it injects); `ARDataset` and `ar_loss`
+use `mse_scale` (the AR never injects — it predicts the vector).
+
+Post-fix step-0 FVE is **-0.741** against their **-0.716** (= 1 - 1.61/0.938),
+which is a useful independent-implementation check on the identity init.
+
+**Still to watch**: `grad_norm` is 42 at step 1 and 7.9 at step 2 against
+`max_grad_norm=1.0`, so early steps are clipped hard. Expected from identity init
+(the affine map starts at exactly the wrong scale for the target), but if it does
+not settle below ~1 within the warmup the clip is doing the LR's job.

@@ -98,13 +98,17 @@ curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null || { log "ERROR: server n
 # --- 4. label -------------------------------------------------------------
 LIMIT_ARG=()
 [[ -n "$LIMIT" ]] && LIMIT_ARG=(--limit "$LIMIT")
+# Backstop for the prompt's no-quote rule (D31). The prompt is what actually
+# prevents the leak — measured 0/256 — but 0% on a sample is not 0% on 200k.
+REJECT_ARG=()
+[[ -n "${REJECT_VERBATIM:-1}" ]] && REJECT_ARG=(--reject-verbatim)
 for half in av ar; do
   log "label: $half half"
   uv run python -m reasoning_attention.datagen.explain \
       --input "$D/halves/${half}_half.parquet" \
       --output "$D/${half}_explained.parquet" \
       --base-url "http://127.0.0.1:$PORT/v1" --model "$MODEL" \
-      --concurrency "$CONC" "${LIMIT_ARG[@]}"
+      --concurrency "$CONC" "${REJECT_ARG[@]}" "${LIMIT_ARG[@]}"
 done
 
 # --- 5. build -------------------------------------------------------------

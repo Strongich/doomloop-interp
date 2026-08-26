@@ -293,6 +293,20 @@ class NLAConfig:
     # distribution the AV has to read.
     injection_scale: float | str | None = 1000.0
 
+    # --- How it's normalized inside the AR loss ---
+    # SEPARATE knob from injection_scale, and the reference is explicit that they
+    # are independent (`docs/design.md`): injection_scale matches the activation
+    # distribution the AV must read, mse_scale only sets the units of the loss.
+    #
+    # Keep this at sqrt(d_model). The AR loss normalizes BOTH sides, so the MSE
+    # carries a factor s^2/d — exactly 1 when s = sqrt(d) ("(s^2/d)|p-g|^2 =
+    # |p-g|^2, s cancels via mean", nla/loss.py). Reusing injection_scale=1000
+    # here instead inflates the loss ~488x (1000^2/2048), which pushes grad_norm
+    # to ~1e4 against max_grad_norm=1.0 — every step clipped, effective LR
+    # destroyed — and makes the loss incomparable to their published 0.938
+    # baseline / 0.586 final. FVE is a ratio so it survives; the gradients do not.
+    mse_scale: float | str | None = "sqrt_d_model"
+
     # --- Placeholder token (task 1) ---
     # We do NOT add a new token to the vocabulary. The "special token" is only a
     # structural slot in the prompt whose embedding we overwrite with the scaled
@@ -312,12 +326,20 @@ class NLAConfig:
     # map as "A @ x + b", so this is exposed as a knob.
     ar_affine_bias: bool = False
 
+    def resolve_mse_scale(self, d_model: int = D_MODEL) -> float | None:
+        """Target L2-norm for BOTH sides of the AR loss (or None = raw MSE)."""
+        return self._resolve_scale(self.mse_scale, d_model)
+
     def resolve_injection_scale(self, d_model: int = D_MODEL) -> float | None:
         """Turn `injection_scale` into a concrete target L2-norm (or None=raw).
 
         Mirrors the reference repo's `resolve_target_scale`.
         """
-        raw = self.injection_scale
+        return self._resolve_scale(self.injection_scale, d_model)
+
+    @staticmethod
+    def _resolve_scale(raw: float | str | None, d_model: int) -> float | None:
+        """Shared resolver so injection_scale and mse_scale accept the same forms."""
         if raw is None or raw in ("raw", "none"):
             return None
         if raw == "sqrt_d_model":

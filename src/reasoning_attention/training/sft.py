@@ -456,7 +456,7 @@ def main() -> None:
         f"steps={total_steps} trainable={n_trainable / 1e6:.1f}M "
         f"lora={f'r{args.lora_r}' if args.lora else 'off (full finetune)'} "
         f"lr={args.learning_rate:.2e} eff_batch={effective_batch} "
-        f"injection_scale={dataset.scale}"
+        f"{'injection_scale' if args.stage == 'av' else 'mse_scale'}={dataset.scale}"
         + (f" fve_baseline={baseline:.4f}" if args.stage == "ar" else "")
     )
 

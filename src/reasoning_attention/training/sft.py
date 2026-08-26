@@ -67,7 +67,20 @@ from reasoning_attention.training.data import (
 # optimal. We did not sweep batch size, learning rate, or GRPO group size."
 REFERENCE_LR = 2e-5  # both AV and AR ("matched to actor - worked well")
 REFERENCE_MIN_LR = 2e-6  # cosine floor, = LR/10
-REFERENCE_BATCH = 256  # for the sqrt-scaling rule below, not used as our batch
+REFERENCE_BATCH = 256  # their --global-batch-size, and the anchor for the sqrt LR rule
+# Their per-stage micro-batch (--micro-batch-size), which we reproduce as
+# batch_size x grad_accum on one GPU. The two halves differ because the AV runs
+# the full 28 layers plus a 152k-vocab lm_head while the AR stops at layer 20 and
+# ends in a d x d head: at m32+ the AV OOMed on their 80GB cards, the AR did not.
+# Keeping their *effective* batch at 256 is what matters here — it is the batch
+# their LR was tuned at, so the sqrt rule below resolves to exactly 2e-5.
+REFERENCE_MICRO_BATCH = {"av": 16, "ar": 64}
+# Their --attn-implementation per stage. FA2 is their measured best for the AV
+# (36% faster than sdpa+checkpointing at m16) but needs the flash-attn package;
+# resolve_attn falls back to sdpa when it is missing rather than crashing.
+REFERENCE_ATTN = {"av": "flash_attention_2", "ar": "sdpa"}
+# They ran with NO gradient checkpointing on either half — the AV fits at m16
+# without it, and recompute cost exceeded the FSDP gather it saved.
 REFERENCE_WARMUP_RATIO = 0.05  # 50 warmup iters / 1000 rollouts
 REFERENCE_INJECTION_SCALE = 150.0  # their --nla-injection-scale for Qwen2.5-7B
 REFERENCE_SAVE_INTERVAL = 500
@@ -77,13 +90,18 @@ DEFAULTS = {
     # LR applies directly. --lora needs a much hotter LR; see LORA_LEARNING_RATE.
     "learning_rate": REFERENCE_LR,
     "min_lr": REFERENCE_MIN_LR,
-    "batch_size": 4,  # ours - theirs was 256, deliberately not copied
-    "grad_accum": 4,
+    # Resolved per stage from REFERENCE_MICRO_BATCH once --stage is known; these
+    # are only the fallbacks if that lookup is bypassed.
+    "batch_size": 16,
+    "grad_accum": 16,
     "epochs": 1,
     "warmup_ratio": REFERENCE_WARMUP_RATIO,
     "weight_decay": 0.0,
     "max_grad_norm": 1.0,
-    "max_length": 1024,
+    # Measured on the built parquets: AV totals mean 186 / p99 233 / max 276,
+    # AR 94 / 149 / 223. 384 clears the longest observed row with headroom, and
+    # 1024 just padded to 4x the needed width. See resolve_max_length.
+    "max_length": 384,
     "lora_r": 16,
     "lora_alpha": 32,
     "lora_dropout": 0.05,
@@ -257,6 +275,59 @@ def save_checkpoint(model: Any, tokenizer: Any, stage: str, out_dir: Path) -> No
     tokenizer.save_pretrained(str(out_dir))
 
 
+def resolve_attn(requested: str | None, stage: str) -> str | None:
+    """Their per-stage attention choice, degraded to sdpa if FA2 is unavailable.
+
+    flash_attention_2 is a separate package and a source build; asking for it on
+    a box without it raises inside `from_pretrained`, which is a poor way to lose
+    a training run. sdpa is always present and is what they used for the AR anyway.
+    """
+    if requested is not None:
+        return requested
+    choice = REFERENCE_ATTN.get(stage)
+    if choice == "flash_attention_2":
+        try:
+            import flash_attn  # noqa: F401
+        except ImportError:
+            print(
+                "attn: flash_attention_2 unavailable (flash-attn not installed) -> sdpa. "
+                "Their AV run measured FA2 at m16 as 36% faster; `uv pip install flash-attn "
+                "--no-build-isolation` to match it."
+            )
+            return "sdpa"
+    return choice
+
+
+def init_wandb(args: argparse.Namespace, total_steps: int, effective_batch: int) -> Any:
+    """Start a wandb run, or return None when disabled/unavailable.
+
+    Off unless --wandb is passed: a training run must not fail because a metrics
+    service is unreachable, and offline smoke runs should stay silent.
+    """
+    if not args.wandb:
+        return None
+    try:
+        import wandb
+    except ImportError:
+        print("wandb: not installed — skipping (uv add wandb)")
+        return None
+    run = wandb.init(
+        project=args.wandb_project,
+        name=args.wandb_name or f"sft-{args.stage}",
+        config={
+            **{k: getattr(args, k) for k in DEFAULTS},
+            "stage": args.stage,
+            "lora": args.lora,
+            "effective_batch": effective_batch,
+            "total_steps": total_steps,
+            "attn_implementation": args.attn_implementation,
+            "model_id": NLAConfig().model_id,
+        },
+    )
+    print(f"wandb: logging to {run.url}")
+    return run
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -294,11 +365,23 @@ def main() -> None:
         f"or 'raw'.",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--wandb", action="store_true", help="log metrics to wandb (off by default)"
+    )
+    parser.add_argument("--wandb-project", default="doomloop-nla-sft")
+    parser.add_argument("--wandb-name", default=None, help="run name; defaults to sft-<stage>")
     for key, value in DEFAULTS.items():
         parser.add_argument(
             f"--{key.replace('_', '-')}", type=type(value), default=value, help=f"default {value}"
         )
     args = parser.parse_args()
+    # Their micro-batch differs per half; reproduce it as batch x accum on one GPU
+    # while holding the effective batch at their 256 so the LR rule stays valid.
+    if args.batch_size == DEFAULTS["batch_size"] and args.grad_accum == DEFAULTS["grad_accum"]:
+        micro = REFERENCE_MICRO_BATCH[args.stage]
+        args.batch_size = micro
+        args.grad_accum = max(1, REFERENCE_BATCH // micro)
+    args.attn_implementation = resolve_attn(args.attn_implementation, args.stage)
 
     torch.manual_seed(args.seed)
     config = NLAConfig()
@@ -355,6 +438,8 @@ def main() -> None:
         # adapters, which see far fewer parameters per step.
         args.learning_rate = LORA_LEARNING_RATE
         print(f"lora: LR raised to {args.learning_rate:.2e} (full-finetune default is too cold)")
+
+    wandb_run = init_wandb(args, total_steps, effective_batch)
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -419,6 +504,15 @@ def main() -> None:
                         **extra,
                     )
                     logs.append(entry)
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                f"train/{k}": v
+                                for k, v in asdict(entry).items()
+                                if k != "step" and v is not None
+                            },
+                            step=entry.step,
+                        )
                     metric = (
                         f"ppl {entry.perplexity:.2f}"
                         if entry.perplexity is not None
@@ -456,6 +550,14 @@ def main() -> None:
             eval_summary["fve"] = fraction_variance_explained(eval_summary["loss"], baseline)
             eval_summary["pred_norm"] = float(torch.cat(preds).norm(dim=-1).mean())
         print(f"eval: {json.dumps({k: round(v, 4) for k, v in eval_summary.items()})}")
+        if wandb_run is not None:
+            wandb_run.summary.update({f"eval/{k}": v for k, v in eval_summary.items()})
+
+    if wandb_run is not None:
+        # The dataset-level FVE denominator, so a run is interpretable on its own.
+        wandb_run.summary["fve_baseline"] = baseline
+        wandb_run.summary["injection_scale"] = dataset.scale
+        wandb_run.finish()
 
     save_checkpoint(model, tokenizer, args.stage, out_dir)
 

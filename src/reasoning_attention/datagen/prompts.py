@@ -69,10 +69,13 @@ Text to analyze:
 # change is that naming the text's own tokens is forbidden, so the AR has to
 # reconstruct h_l from the described *role* of the ending rather than its identity.
 EXPLAIN_INSTRUCTION = """A language model needs to predict what text comes next after a snippet which will be presented to you shortly. Identify the 2-3 most important features it would use for this prediction.
-Focus on what the language model must be "thinking about" at the point where the provided text ends. You should not need to reference the fact that the text is truncated/incomplete/a prefix: the language model is causal, so only sees the prefix to what it predicts and this is implicit.
+Focus on what the language model must be attending to at the point where the provided text ends. You should not need to reference the fact that the text is truncated/incomplete/a prefix: the language model is causal, so only sees the prefix to what it predicts and this is implicit.
 Order features by what is most important for predicting the next tokens. Each feature should consist of a concise ~10-20 word description.
 
-CRITICAL — describe, do not quote. Do NOT reproduce any word, phrase, name, number, or punctuation mark that appears in the text, and do not use quotation marks at all. Refer to elements by their role or category (the subject noun, the opening clause, a proper name of an institution, a numeric quantity), never by their literal wording. An explanation that repeats the text's own words is worthless for this task.
+CRITICAL RULE — never write out the token you are describing. You must NOT reproduce any word, phrase, name, number, or punctuation mark that appears in the text, and must not use quotation marks at all. This binds most strictly to the element a feature is about: identify it by its role, never by its spelling.
+  WRONG: stating that the final word is, and then copying, the text's own word.
+  RIGHT: stating the part of speech that element is, the grammatical function it serves, and the construction it sits inside.
+Refer to every element by role or category (the subject noun, the opening clause, a proper name of an institution, a numeric quantity), never by its literal wording. An explanation that repeats the text's own words is worthless for this task and will be discarded.
 
 Feature types to consider (as inspiration, not a rigid checklist):
 - Syntactic/structural constraints: an unclosed bracket demanding its match
@@ -82,13 +85,13 @@ Feature types to consider (as inspiration, not a rigid checklist):
 - Domain/genre signals: a medical case history following a standard reporting format
 - Repetition/continuation patterns: a phrase structure recurring with variation
 
-The final feature must characterise the very end of the sequence — the grammatical role that element plays, the construction it belongs to, and what kind of continuation it demands — again WITHOUT naming or quoting it.
+The final feature must characterise the very end of the sequence — the grammatical role that element plays, the construction it belongs to, and what kind of continuation it demands. Describe that element; never spell it out. This is the feature most likely to tempt you into quoting, and quoting it is the single worst thing you can do here.
 
 Format — IMPORTANT: keep to ~80-100 words total and ALWAYS close the tag:
 <analysis>
 [first feature]
 [second feature]
-[final feature: the role of the ending, its construction, what must follow]
+[final feature: the role of the ending, its construction, what must follow — never its wording]
 </analysis>
 
 Text to analyze:

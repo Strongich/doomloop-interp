@@ -61,6 +61,25 @@ class ARBatch:
     last_index: torch.Tensor  # [B], position of each row's final real token
 
 
+def shuffled_activations(activations: np.ndarray, seed: int) -> np.ndarray:
+    """Break the text<->activation pairing — the reference's random control.
+
+    Every explanation keeps its text but is paired with some other row's vector,
+    so any score above chance must come from something generic (the prior over
+    explanation-shaped text, the mean activation direction) rather than from
+    actually reading the vector. The reference runs this as `critic_rand` and
+    measured 0.922 against a 0.938 baseline, i.e. FVE ~= 0, and as the AV's
+    "random baseline" where the real run sat ~0.21 lower in loss.
+
+    The permutation reuses the same multiset of vectors, so `predict_mean_baseline`
+    is bit-identical between the real and control runs and the two FVEs are
+    directly comparable. That is the whole point of the control: only the pairing
+    changes.
+    """
+    rng = np.random.default_rng(seed)
+    return activations[rng.permutation(len(activations))]
+
+
 class AVDataset(Dataset[dict[str, Any]]):
     """`h -> s`: prompt (with the placeholder) + response, activation attached.
 
@@ -85,12 +104,15 @@ class AVDataset(Dataset[dict[str, Any]]):
         max_length: int = 1024,
         limit: int | None = None,
         enable_thinking: bool = False,
+        shuffle_seed: int | None = None,
     ) -> None:
         self.config = config or NLAConfig()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.enable_thinking = enable_thinking
         table, self.activations = load_activations(path, limit)
+        if shuffle_seed is not None:
+            self.activations = shuffled_activations(self.activations, shuffle_seed)
         self.prompts = [
             p.replace("<INJECT>", self.config.placeholder_token)
             for p in table.column("prompt").to_pylist()
@@ -132,11 +154,14 @@ class ARDataset(Dataset[dict[str, Any]]):
         config: NLAConfig | None = None,
         max_length: int = 1024,
         limit: int | None = None,
+        shuffle_seed: int | None = None,
     ) -> None:
         self.config = config or NLAConfig()
         self.tokenizer = tokenizer
         self.max_length = max_length
         table, self.activations = load_activations(path, limit)
+        if shuffle_seed is not None:
+            self.activations = shuffled_activations(self.activations, shuffle_seed)
         self.prompts = table.column("prompt").to_pylist()
         # mse_scale, NOT injection_scale: the AR never injects, it *predicts* the
         # vector. This scale only sets the units of the loss, and sqrt(d) is what

@@ -320,11 +320,12 @@ def init_wandb(args: argparse.Namespace, total_steps: int, effective_batch: int)
         return None
     run = wandb.init(
         project=args.wandb_project,
-        name=args.wandb_name or f"sft-{args.stage}",
+        name=args.wandb_name or f"sft-{args.stage}{'-rand' if args.shuffle_activations else ''}",
         config={
             **{k: getattr(args, k) for k in DEFAULTS},
             "stage": args.stage,
             "lora": args.lora,
+            "shuffle_activations": args.shuffle_activations,
             "effective_batch": effective_batch,
             "total_steps": total_steps,
             "attn_implementation": args.attn_implementation,
@@ -373,6 +374,13 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--shuffle-activations",
+        action="store_true",
+        help="RANDOM CONTROL: pair each explanation with another row's activation. "
+        "Any score above chance is then generic prior, not vector-reading. The "
+        "FVE baseline is unchanged, so real-vs-control FVE compares directly.",
+    )
+    parser.add_argument(
         "--wandb", action="store_true", help="log metrics to wandb (off by default)"
     )
     parser.add_argument("--wandb-project", default="doomloop-nla-sft")
@@ -400,16 +408,33 @@ def main() -> None:
         config = replace(config, injection_scale=override)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Same seed for both halves so the control is reproducible; None = real pairing.
+    shuffle_seed = args.seed if args.shuffle_activations else None
+    if shuffle_seed is not None:
+        print(
+            f"RANDOM CONTROL: activations shuffled (seed {shuffle_seed}) — text no longer "
+            f"matches its vector. Expect FVE ~= 0 / a visibly worse loss than the real run."
+        )
     if args.stage == "av":
         model, tokenizer = build_av(args, config)
         dataset: Any = AVDataset(
-            args.data, tokenizer, config, max_length=args.max_length, limit=args.limit
+            args.data,
+            tokenizer,
+            config,
+            max_length=args.max_length,
+            limit=args.limit,
+            shuffle_seed=shuffle_seed,
         )
         collate: Any = AVCollator(tokenizer.pad_token_id or 0, dataset.scale)
     else:
         model, tokenizer = build_ar(args, config)
         dataset = ARDataset(
-            args.data, tokenizer, config, max_length=args.max_length, limit=args.limit
+            args.data,
+            tokenizer,
+            config,
+            max_length=args.max_length,
+            limit=args.limit,
+            shuffle_seed=shuffle_seed,
         )
         collate = ARCollator(tokenizer.pad_token_id or 0, dataset.scale)
 

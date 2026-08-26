@@ -17,6 +17,7 @@ everything else and make the loss unreadable across runs.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,6 +60,56 @@ class ARBatch:
     attention_mask: torch.Tensor  # [B, T]
     targets: torch.Tensor  # [B, d_model], already scaled
     last_index: torch.Tensor  # [B], position of each row's final real token
+
+
+# Ablation: strip the surface-form hints an explanation carries about the final
+# token. The prompt *requires* a feature describing "the very end of the presented
+# sequence", so explanations routinely name the last word outright ("The final word
+# \"artists\" acts as the head noun"). Since h_l is read AT that final token and the
+# AR is the same base model truncated, being told the token's identity is a strong
+# shortcut that a high FVE cannot be distinguished from real semantic content.
+#
+# The paper names this exact failure - "the AV could achieve good reconstruction by
+# reproducing the input context verbatim" - lists it as an open limitation, and
+# ships no control for it. The shuffled control does not catch it: there the
+# explanation still describes *some* real snippet, so both arms lose the hint
+# equally.
+#
+# Only double quotes are stripped. Apostrophes are left alone or every possessive
+# ("the curator's question") would be mangled into a mask.
+_AR_TEXT_RE = re.compile(r"(<text>)(.*?)(</text>)", re.DOTALL)
+_QUOTED_RE = re.compile(r"[\"\u201c\u201d]([^\"\u201c\u201d]{1,80}?)[\"\u201c\u201d]")
+MASK_TOKEN = "[MASKED]"
+
+
+def mask_explanation(explanation: str, mode: str) -> str:
+    """Remove surface-form hints from one explanation.
+
+    `quotes`       - replace quoted spans (the literal tokens) with [MASKED].
+    `last-feature` - drop the final paragraph, which the prompt reserves for the
+                     end-of-sequence description.
+    `both`         - both of the above.
+    """
+    if mode in ("quotes", "both"):
+        explanation = _QUOTED_RE.sub(MASK_TOKEN, explanation)
+    if mode in ("last-feature", "both"):
+        parts = [x for x in explanation.split("\n\n") if x.strip()]
+        if len(parts) > 1:
+            explanation = "\n\n".join(parts[:-1])
+    return explanation
+
+
+def mask_ar_prompt(prompt: str, mode: str) -> str:
+    """Apply `mask_explanation` inside the AR template's <text>...</text> span.
+
+    Masking the rendered prompt rather than the raw explanation keeps the fixed
+    `</text> <summary>` suffix byte-identical — the AR reads its activation at that
+    suffix's last token, so damaging it would move the read position and confound
+    the ablation with a broken anchor.
+    """
+    return _AR_TEXT_RE.sub(
+        lambda m: m.group(1) + mask_explanation(m.group(2), mode) + m.group(3), prompt
+    )
 
 
 def shuffled_activations(activations: np.ndarray, seed: int) -> np.ndarray:
@@ -155,6 +206,7 @@ class ARDataset(Dataset[dict[str, Any]]):
         max_length: int = 1024,
         limit: int | None = None,
         shuffle_seed: int | None = None,
+        mask_mode: str | None = None,
     ) -> None:
         self.config = config or NLAConfig()
         self.tokenizer = tokenizer
@@ -163,6 +215,8 @@ class ARDataset(Dataset[dict[str, Any]]):
         if shuffle_seed is not None:
             self.activations = shuffled_activations(self.activations, shuffle_seed)
         self.prompts = table.column("prompt").to_pylist()
+        if mask_mode:
+            self.prompts = [mask_ar_prompt(p, mask_mode) for p in self.prompts]
         # mse_scale, NOT injection_scale: the AR never injects, it *predicts* the
         # vector. This scale only sets the units of the loss, and sqrt(d) is what
         # keeps it O(1) and comparable to the reference's 0.938 baseline.

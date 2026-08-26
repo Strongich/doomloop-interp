@@ -35,7 +35,8 @@ AR_ATTN="${AR_ATTN:-sdpa}"
 INJECTION_SCALE="${INJECTION_SCALE:-}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"       # effective batch = BATCH_SIZE * GRAD_ACCUM
-EPOCHS="${EPOCHS:-1}"
+# 3 epochs ~= their 1000-step run length on our smaller halves; see DEFAULTS.
+EPOCHS="${EPOCHS:-3}"
 MAX_LENGTH="${MAX_LENGTH:-1024}"
 LORA_R="${LORA_R:-16}"
 LOG_EVERY="${LOG_EVERY:-10}"

@@ -94,7 +94,14 @@ DEFAULTS = {
     # are only the fallbacks if that lookup is bypassed.
     "batch_size": 16,
     "grad_accum": 16,
-    "epochs": 1,
+    # 3, not 1. Their run length is a *step* count — `--num-rollout 1000`, which
+    # at global batch 256 is ~250k samples, i.e. one pass over their half. Our
+    # halves are 88.5k, so one epoch is only ~340 steps and would stop a third of
+    # the way along the loss curve they published (their AR: 0.72 at step 380 vs
+    # 0.586 final). 3 epochs = ~1020 steps, matching their 1000 and putting warmup
+    # at ~51 iters against their 50. The cost is seeing 88.5k rows three times
+    # instead of 250k once — held-out FVE is what catches the overfitting that buys.
+    "epochs": 3,
     "warmup_ratio": REFERENCE_WARMUP_RATIO,
     "weight_decay": 0.0,
     "max_grad_norm": 1.0,
@@ -438,6 +445,18 @@ def main() -> None:
         # adapters, which see far fewer parameters per step.
         args.learning_rate = LORA_LEARNING_RATE
         print(f"lora: LR raised to {args.learning_rate:.2e} (full-finetune default is too cold)")
+
+    # Their 500 means "halfway + final" at their 1000 steps. Keep the literal
+    # value, but never let it silently never-fire on a shorter run: a save_interval
+    # past the end of training yields no intermediate checkpoint at all, which is
+    # only discovered when a run dies at step 900 and there is nothing to resume.
+    if args.save_interval and args.save_interval >= total_steps:
+        fallback = max(1, total_steps // 2)
+        print(
+            f"save_interval {args.save_interval} >= total_steps {total_steps} — would never "
+            f"fire; using {fallback} (halfway + final, their intent)"
+        )
+        args.save_interval = fallback
 
     wandb_run = init_wandb(args, total_steps, effective_batch)
 

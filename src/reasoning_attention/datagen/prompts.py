@@ -136,7 +136,34 @@ def extract_and_clean(raw: str) -> str | None:
         line = line.strip().strip("*_")
         if line:
             cleaned.append(line)
-    return "\n\n".join(cleaned)
+
+    joined = "\n\n".join(cleaned)
+    # Rescue the single-paragraph case before the caller drops the row.
+    if len(cleaned) < MIN_FEATURES:
+        sentences = split_into_features(joined)
+        if len(sentences) >= MIN_FEATURES:
+            return "\n\n".join(sentences)
+    return joined
+
+
+# Fallback split for a model that writes its 2-3 features as one paragraph instead
+# of one per line. The content is there and correct — only the line breaks are
+# missing — so dropping the row throws away a usable explanation over formatting.
+# Measured on the v1 labels this was the ONLY failure mode: every drop was
+# "<2 features", never a missing tag.
+#
+# The lookahead requires the next sentence to start with a capital or a bracket,
+# which keeps "e.g." / "i.e." / decimals from splitting mid-sentence.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z\[])")
+# Below this many characters a "sentence" is an abbreviation or stray fragment
+# rather than a feature description (the prompt asks for ~10-20 words each).
+_MIN_SENTENCE_CHARS = 20
+
+
+def split_into_features(text: str) -> list[str]:
+    """Split a one-paragraph explanation into sentence-level features."""
+    parts = [x.strip() for x in _SENTENCE_SPLIT_RE.split(text)]
+    return [x for x in parts if len(x) >= _MIN_SENTENCE_CHARS]
 
 
 def count_features(explanation: str) -> int:

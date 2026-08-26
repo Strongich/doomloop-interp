@@ -808,3 +808,56 @@ which is a useful independent-implementation check on the identity init.
 `max_grad_norm=1.0`, so early steps are clipped hard. Expected from identity init
 (the affine map starts at exactly the wrong scale for the target), but if it does
 not settle below ~1 within the warmup the clip is doing the LR's job.
+
+### D31 — Labeling prompt v2: describe, never quote (the surface-form leak)
+
+The AR warm-start reached **0.5848 held-out FVE**, well above the reference's
+0.375. The masked-explanation ablation shows most of that was a shortcut:
+
+| run | FVE @ step 130 |
+|---|---|
+| `sft-ar` (real) | 0.542 |
+| `sft-ar-masked-both` (quotes + final feature stripped) | **0.141** |
+
+**74% of the AR's FVE came from surface form, not semantics.** Measured over 4000
+labels from `av_explained.parquet`:
+
+| | |
+|---|---|
+| explanation contains a quoted span | 97.4% |
+| that quote appears verbatim in the context | 82.0% |
+| the quote lies in the context's **last 6 words** | 69.8% |
+
+`h_l` is read at the context's final token and the AR is the same base model
+truncated, so an explanation naming that token hands over the answer. Two lines
+of the reference prompt invite exactly this: *"Feel free to include specific
+textual examples inline"* and *"The final feature must describe the very end of
+the presented sequence"*.
+
+The paper names this failure — *"the AV could achieve good reconstruction by
+reproducing the input context verbatim"* — lists it under limitations, and ships
+no control for it. Their only guard is a Stage-2 KL penalty they call a partial
+mitigation. The shuffled control does **not** catch it: there the explanation
+still describes some real snippet, so both arms lose the hint equally.
+
+**This is a deliberate deviation from the "prompts are verbatim from the
+reference" invariant**, and the first place this project departs from their
+recipe on purpose. v1 is kept as `EXPLAIN_INSTRUCTION_V1` for provenance and
+reproduction. v2 keeps the task, the 2-3 feature structure, the `<analysis>`
+tags and the ~80-100 word budget; it forbids reproducing any word, phrase, name,
+number or punctuation from the text, and asks the final feature for the *role* of
+the ending rather than its identity.
+
+Instructions are not compliance, so `verbatim_overlap()` measures it: a quoted
+span occurring in the context, or any shared 5-word shingle. `explain.py` reports
+the count per chunk, and `--reject-verbatim` drops those rows.
+
+**Cost**: the existing 177k pairs were labeled with v1 and carry the leak, so
+acting on this means re-labeling (~10 h of GPU). The current SFT run and its
+controls are being left to finish first — their numbers are still the evidence
+for the size of the effect.
+
+**Expect FVE to fall.** The residual 0.141 is the honest semantic signal under
+v1; a good v2 should beat that but will not approach 0.58. A lower, leak-free
+number is the better result for the doom-loop study, where the question is what
+the model represents at a position, not which token sits there.

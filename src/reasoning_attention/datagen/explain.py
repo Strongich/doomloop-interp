@@ -31,6 +31,7 @@ from reasoning_attention.datagen.prompts import (
     build_explain_prompt,
     count_features,
     extract_and_clean,
+    verbatim_overlap,
 )
 from reasoning_attention.datagen.providers import CompletionProvider, OpenAIProvider
 from reasoning_attention.datagen.sidecar import (
@@ -45,10 +46,12 @@ from reasoning_attention.datagen.sidecar import (
 _MAX_SAMPLE_FAILURES = 3
 
 
-def explain_chunk(chunk: pa.Table, provider: CompletionProvider) -> tuple[pa.Table, int, list[str]]:
+def explain_chunk(
+    chunk: pa.Table, provider: CompletionProvider, reject_verbatim: bool = False
+) -> tuple[pa.Table, int, list[str], int]:
     """Add a `summary` column to one chunk, dropping unusable rows.
 
-    Returns `(chunk_with_summaries, n_dropped, sample_failures)`. The raw text of
+    Returns `(chunk_with_summaries, n_dropped, sample_failures, n_leaked)`. The raw text of
     the first few unusable responses comes back so a caller can show *why* rows
     were dropped — otherwise diagnosing a bad run means re-serving the model just
     to see one response.
@@ -63,13 +66,19 @@ def explain_chunk(chunk: pa.Table, provider: CompletionProvider) -> tuple[pa.Tab
     keep: list[bool] = []
     summaries: list[str] = []
     failures: list[str] = []
-    for raw in completions:
+    n_leaked = 0
+    for raw, context in zip(completions, texts, strict=True):
         cleaned = extract_and_clean(raw) if raw is not None else None
         if cleaned is None or count_features(cleaned) < MIN_FEATURES:
             keep.append(False)
             if len(failures) < _MAX_SAMPLE_FAILURES:
                 failures.append("<no response: the request itself failed>" if raw is None else raw)
             continue
+        if verbatim_overlap(context, cleaned):
+            n_leaked += 1
+            if reject_verbatim:
+                keep.append(False)
+                continue
         keep.append(True)
         summaries.append(cleaned)
 
@@ -77,7 +86,7 @@ def explain_chunk(chunk: pa.Table, provider: CompletionProvider) -> tuple[pa.Tab
     if n_dropped:
         chunk = chunk.filter(pa.array(keep, type=pa.bool_()))
     table = chunk.append_column("summary", pa.array(summaries, type=pa.string()))
-    return table, n_dropped, failures
+    return table, n_dropped, failures, n_leaked
 
 
 def _explainer_meta(config: ExplainerConfig) -> ExplainerMeta:
@@ -130,6 +139,12 @@ def main() -> None:
         help="output cap. Local chat servers default to uncapped, because Qwen3 thinks "
         "before answering and a cap truncates the chain of thought before any "
         "<analysis> tag appears. The hosted default applies otherwise.",
+    )
+    parser.add_argument(
+        "--reject-verbatim",
+        action="store_true",
+        help="drop explanations that reproduce the context (a quoted span present in it, "
+        "or any shared 5-word shingle). Without this the leak is only counted, not acted on.",
     )
     parser.add_argument(
         "--reasoning-effort",
@@ -198,11 +213,15 @@ def main() -> None:
     chunk_paths = [chunks_dir / f"chunk_{s:08d}.parquet" for s in starts]
     n_dropped = 0
     n_resumed = 0
+    n_leaked = 0
     for start, chunk_path in zip(starts, chunk_paths, strict=True):
         if chunk_path.exists():
             n_resumed += 1
             continue
-        out_chunk, dropped, failures = explain_chunk(table.slice(start, args.chunk_size), provider)
+        out_chunk, dropped, failures, leaked = explain_chunk(
+            table.slice(start, args.chunk_size), provider, args.reject_verbatim
+        )
+        n_leaked += leaked
         n_dropped += dropped
         # A chunk that kept nothing must NOT be written. A cached zero-row chunk
         # is indistinguishable from a completed one, so every later run would
@@ -222,7 +241,10 @@ def main() -> None:
         tmp = chunk_path.with_suffix(".tmp")
         pq.write_table(out_chunk, tmp)
         tmp.rename(chunk_path)
-        print(f"  chunk {start}: +{out_chunk.num_rows} rows, -{dropped} dropped")
+        print(
+            f"  chunk {start}: +{out_chunk.num_rows} rows, -{dropped} dropped, "
+            f"{leaked} reproduced context verbatim"
+        )
     if n_resumed:
         print(f"resumed: skipped {n_resumed}/{len(starts)} completed chunks")
 
@@ -252,6 +274,9 @@ def main() -> None:
     print(f"wrote {row_count} rows -> {args.output}")
     if n_dropped:
         print(f"  DROPPED {n_dropped} rows (no <analysis> tags or < {MIN_FEATURES} features)")
+    if n_leaked:
+        verb = "dropped" if args.reject_verbatim else "kept — rerun with --reject-verbatim"
+        print(f"  VERBATIM OVERLAP in {n_leaked} explanations ({verb})")
     print(f"sidecar -> {write_sidecar(args.output, meta)}")
 
 

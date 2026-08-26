@@ -320,12 +320,15 @@ def init_wandb(args: argparse.Namespace, total_steps: int, effective_batch: int)
         return None
     run = wandb.init(
         project=args.wandb_project,
-        name=args.wandb_name or f"sft-{args.stage}{'-rand' if args.shuffle_activations else ''}",
+        name=args.wandb_name
+        or f"sft-{args.stage}{'-rand' if args.shuffle_activations else ''}"
+        f"{'-masked-' + args.mask_explanation if args.mask_explanation else ''}",
         config={
             **{k: getattr(args, k) for k in DEFAULTS},
             "stage": args.stage,
             "lora": args.lora,
             "shuffle_activations": args.shuffle_activations,
+            "mask_explanation": args.mask_explanation,
             "effective_batch": effective_batch,
             "total_steps": total_steps,
             "attn_implementation": args.attn_implementation,
@@ -374,6 +377,16 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--mask-explanation",
+        default=None,
+        choices=["quotes", "last-feature", "both"],
+        help="AR ABLATION: strip surface-form hints (quoted literal tokens, and/or the "
+        "final feature the prompt reserves for describing the sequence end) before the "
+        "AR reads the explanation. Tests whether FVE comes from semantics or from being "
+        "told the last token's identity. AR only — for the AV the explanation is the "
+        "target, not the input.",
+    )
+    parser.add_argument(
         "--shuffle-activations",
         action="store_true",
         help="RANDOM CONTROL: pair each explanation with another row's activation. "
@@ -415,6 +428,12 @@ def main() -> None:
             f"RANDOM CONTROL: activations shuffled (seed {shuffle_seed}) — text no longer "
             f"matches its vector. Expect FVE ~= 0 / a visibly worse loss than the real run."
         )
+    if args.mask_explanation and args.stage == "av":
+        raise SystemExit(
+            "--mask-explanation applies to the AR only: for the AV the explanation is the "
+            "generation target, not the input, so masking it changes the task rather than "
+            "removing a shortcut."
+        )
     if args.stage == "av":
         model, tokenizer = build_av(args, config)
         dataset: Any = AVDataset(
@@ -435,6 +454,7 @@ def main() -> None:
             max_length=args.max_length,
             limit=args.limit,
             shuffle_seed=shuffle_seed,
+            mask_mode=args.mask_explanation,
         )
         collate = ARCollator(tokenizer.pad_token_id or 0, dataset.scale)
 

@@ -22,6 +22,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "tqdm>=4.66",
     "peft>=0.11",
+    "wandb>=0.28.2",
 ]
 
 [build-system]

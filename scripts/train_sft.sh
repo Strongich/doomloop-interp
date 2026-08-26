@@ -29,9 +29,9 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-500}"
 # package; unset falls back to whatever transformers picks.
 AV_ATTN="${AV_ATTN:-}"
 AR_ATTN="${AR_ATTN:-sdpa}"
-# Theirs was 150 for Qwen2.5-7B (d_model 3584). Ours is d_model 2048, where
-# sqrt_d_model = 45.3, so 150 is their absolute value, not their ratio (~2.5x
-# sqrt(d) would be ~113 here). Unset keeps NLAConfig's sqrt_d_model.
+# Theirs was 150 for Qwen2.5-7B, whose activations average ~125: the rule is "a
+# round number just above the dataset's mean norm", not any function of d_model.
+# Ours average ~900, so NLAConfig defaults to 1000. Unset keeps that.
 INJECTION_SCALE="${INJECTION_SCALE:-}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"       # effective batch = BATCH_SIZE * GRAD_ACCUM

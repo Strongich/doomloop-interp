@@ -1152,3 +1152,51 @@ substituted for the layer index (20). CLAUDE.md's rule — use
 — is necessary but not sufficient: here BOTH helpers exist and the wrong one was
 picked, because the reference's field NAME suggests a count. When exporting to
 their schema, the check is what their reader asserts, not what our field is called.
+
+## D39 — 2 GPUs forces `--colocate` and a 1 actor + 1 critic layout
+
+First GRPO launch hung. No error, no timeout: `train.py` alive at ~7% CPU with
+28s of CPU time over 7 minutes, Ray infra up, **zero worker actors, `nvidia-smi`
+completely empty**. That is what an unsatisfiable Ray placement group looks like.
+
+`miles/ray/placement_group.py:create_placement_groups` sizes ONE placement group
+for every role before anything starts, and picks the total by branch:
+
+| branch | GPUs requested | on 2 GPUs |
+|---|---|---|
+| default | actor + rollout + critic = 2+2+2 | **6 — hangs** |
+| `--colocate` | actor + critic = 2+0+2 | **4 — still hangs** |
+| `--colocate`, 1+1 | actor + critic = 1+0+1 | **2 — fits** |
+
+`--colocate` folds the sglang engines onto the actor's GPUs and ignores
+`--rollout-num-gpus`, but **the critic always gets its own devices** — there is no
+flag that colocates it (the one mention at `placement_group.py:187` is
+`colocate + debug_train_only` only). So on two devices the only viable layout is
+**1 actor (sharing with rollout) + 1 critic**.
+
+Our script's comment already said "colocation is not optional here" — but the flag
+was never passed. The comment was right and the code did not implement it.
+
+Consequences accepted:
+
+- `--colocate` forces `--offload`, so the actor is swapped to CPU while sglang
+  generates and back for the training pass, every step. That is the price of two
+  devices, and it will show up in step time.
+- `--num-gpus-per-node` must be set to 2. It defaults to 8, and miles' own help
+  says: *"If you are going to use less than 8 gpus per node under colocate mode,
+  you should set this number."*
+- The actor no longer shards across 2 GPUs. Fine at 1.7B: full-FT Adam state is
+  ~24 GB (bf16 weights + fp32 master + m/v) against 80 GB.
+- `grad_accum` becomes `512 / (16 x 1) = 32` — still an exact integer, which D36
+  flagged as load-bearing (their non-integer accum measured 479s/step vs ~9s).
+
+Added a **preflight guard in the launcher** that recomputes the same arithmetic
+and refuses to start when the layout exceeds visible GPUs, printing the per-role
+breakdown. A silent forever-hang is the worst failure mode of the three, because
+it looks exactly like slow startup — I reported this run as "launched and
+initializing" before checking `nvidia-smi`.
+
+Revised expectation for the 400-step probe: the ~47s/step figure from their notes
+was measured at `rollout_batch=64x8` on their hardware without offload swapping,
+so it is now a floor rather than an estimate. Real step time gets measured, not
+predicted.

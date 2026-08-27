@@ -50,6 +50,9 @@ from reasoning_attention.nla.prompts import (
 # are its last tokens, then extracts the activation at tokens[-1].
 AR_SUFFIX = "</text> <summary>"
 
+# The reference's chat-messages column type (docs/design.md, "Parquet columns").
+MESSAGES_TYPE = pa.list_(pa.struct([("role", pa.string()), ("content", pa.string())]))
+
 
 def build_av_table(table: pa.Table) -> pa.Table:
     """AV rows: constant prompt with the `<INJECT>` literal, summary as response."""
@@ -97,7 +100,14 @@ def build_rl_table(table: pa.Table) -> pa.Table:
     n = table.num_rows
     prompt = build_av_content(INJECT_PLACEHOLDER)
     columns = {
-        "prompt": pa.array([prompt] * n, type=pa.string()),
+        # list[dict] messages, NOT a bare string — unlike the AV-SFT table above.
+        # This half is consumed by the reference's NLADataSource, which sets
+        # apply_chat_template=False so the loss-mask generator keeps the message
+        # list intact, and nla_generate then asserts on the type:
+        #   "nla_generate requires list[dict] prompt (got str)".
+        # Our own SFT loop reads a plain string and applies the chat template
+        # itself, which is why the AV table stays a string.
+        "prompt": pa.array([[{"role": "user", "content": prompt}]] * n, type=MESSAGES_TYPE),
         "activation_vector": table.column("activation_vector"),
         "doc_id": table.column("doc_id"),
         "n_raw_tokens": table.column("n_raw_tokens"),

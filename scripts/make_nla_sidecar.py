@@ -32,7 +32,7 @@ from pathlib import Path
 import yaml
 from transformers import AutoTokenizer
 
-from reasoning_attention.config import NLAConfig
+from reasoning_attention.config import D_MODEL, NLAConfig
 from reasoning_attention.nla.prompts import AR_TEMPLATE, AV_TEMPLATE, build_av_content
 
 AR_SUFFIX = "</text> <summary>"
@@ -76,7 +76,7 @@ def main() -> None:
 
     meta = {
         "kind": args.kind,
-        "d_model": cfg.d_model,
+        "d_model": D_MODEL,
         "extraction": {
             "layer_index": cfg.extraction_layer,
             "injection_scale": inj,
@@ -96,7 +96,7 @@ def main() -> None:
     out = Path(args.checkpoint) / "nla_meta.yaml"
     out.write_text(yaml.safe_dump(meta, sort_keys=False), encoding="utf-8")
     print(f"wrote {out}")
-    print(f"  injection_scale={inj}  mse_scale={mse}  d_model={cfg.d_model}")
+    print(f"  injection_scale={inj}  mse_scale={mse}  d_model={D_MODEL}")
     print(f"  placeholder {cfg.placeholder_token!r} id={cfg.placeholder_token_id} "
           f"neighbors=({left}, {right})")
     print(f"  critic_suffix_ids={suffix_ids} (from {AR_SUFFIX!r})")

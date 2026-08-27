@@ -1531,3 +1531,66 @@ derived from `torch.version.cuda` rather than fixed at 12.8.
 **The gate before any further integration work** is re-running
 `scripts/check_av_generation.py` under the rebuilt venv: 5.9.0 and vLLM are clean,
 but 5.12.1 is a different minor and is not yet verified.
+
+## Resume point (end of 2026-08-27)
+
+`.venv-rl` is being rebuilt at `SGLANG_PIN=v0.5.15` (transformers 5.12.1) per D44.
+A `killer` tmux session waits for it, and deletes the pod **only on `EXIT=0`** —
+so if the pod is gone tomorrow the rebuild succeeded, and if it is still up the
+setup failed and `/workspace/data/rl_setup8.log` plus
+`/workspace/data/finish_and_kill.log` hold the reason.
+
+**Pick up here, in order:**
+
+1. **The gate — is transformers 5.12.1 clean for our AV?** 5.9.0 and vLLM 0.22 are
+   verified clean; 5.12.1 is a different minor and is NOT yet checked. Nothing else
+   is worth doing until this passes:
+
+   ```
+   CUDA_VISIBLE_DEVICES=0 .venv-rl/bin/python scripts/check_av_generation.py \
+     --checkpoint /workspace/data/checkpoints/av_sft \
+     --parquet /workspace/data/rl/rl.parquet --n 8
+   ```
+
+   Expect `greedy: closed 8/8, mean rep 0.000, mean nonlatin 0.000`. Anything like
+   `1/8` with `rep 0.26` means 5.12.1 shares 4.57.1's defect and the fallback is
+   TRL + vLLM (injection through `EmbedsPrompt` is already proven to work).
+
+2. **Undo the 4.57.1-era workarounds**, which are now not just unnecessary but
+   wrong — our checkpoints were written by transformers 5.9.0:
+   - the critic and AV tokenizer re-saves (D35) — originals are in
+     `/workspace/data/checkpoints/.bak_tok/` and `.bak_tok_av/`
+   - re-run `scripts/convert_ar_to_critic.py` under the new venv so `critic_rl`
+     carries a 5.x tokenizer again
+   - `scripts/patch_nla_nonthinking.py` must be **re-applied** after any re-clone
+     of `natural_language_autoencoders/`; `train_grpo.sh` refuses to launch without
+     it, so this fails loudly rather than silently (D43).
+
+3. **`rl_preflight.py`** on `critic_rl` — all three checks passed before (D38/D41),
+   and it is cheap insurance that the version bump did not move anything.
+
+4. **Short GRPO run, then read the dump before trusting any metric.** Launch with
+   `NLA_ROLLOUT_TEXT_DUMP` set and stop after 2-3 rollouts. The three numbers that
+   say it is genuinely training:
+   - `rollout/raw_reward` **off -2.0** (a flat -2 means every sample FAILED)
+   - `train/grad_norm` **non-zero** on both actor and critic
+   - `log_probs == ref_log_probs` at step 0 (proves the policy started from
+     `av_sft`; a gap means `--load` was silently skipped again, D42)
+
+   Note `pg_loss ≈ 0` and `advantages ≈ 0` at step 0 are **expected**, not a
+   failure: GRPO centres advantages within each group, and on-policy the ratio is
+   exactly 1. `grad_norm` is the real signal.
+
+5. **Raise `MAX_RESPONSE_LEN` 150 -> ~200.** Even in the clean stack only 4-6 of 8
+   samples close their tag within 150 tokens; their run averaged ~123 against the
+   same cap, so we sit much closer to the ceiling and pay the failure reward on
+   roughly half the batch.
+
+Everything else is ready: `rl.parquet` (393,439 rows, prompts as chat messages),
+`critic_rl` converted with the correct `extraction_layer_index: 20`, GRPO config at
+64x8=512 global / micro 16 / LR 9.97e-6 / KL 0.01 k2, and a measured step time of
+~78-90s (so 400 rollouts is ~9-10h).
+
+Still open from earlier and unrelated to the RL stack: `CLAUDE.md` still says the
+doom-loop study is "not started", and `scripts/doomtrace.py` lives only on the pod
+and should move into `src/` before it generates any study data.

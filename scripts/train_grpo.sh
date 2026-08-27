@@ -32,6 +32,18 @@ if [[ ! -x "$RL_PYTHON" ]]; then
   exit 1
 fi
 
+# Miles' entry point is train.py at its REPO root, not an installed console
+# script and not a module — their configs/rl.sh runs `python train.py` with the
+# miles checkout as cwd. setup_rl_stack.sh clones it to .rl-src/miles and
+# installs it editable, so the source tree is the right place to find it.
+MILES_SRC="${MILES_SRC:-$PROJECT_ROOT/.rl-src/miles}"
+MILES_TRAIN="$MILES_SRC/train.py"
+if [[ ! -f "$MILES_TRAIN" ]]; then
+  echo "ERROR: $MILES_TRAIN not found. Run scripts/setup_rl_stack.sh, or point" >&2
+  echo "MILES_SRC at your miles checkout." >&2
+  exit 1
+fi
+
 # --- GPU layout: 2xA100. Theirs is 8+4+4; three roles must share two devices. ---
 # Ray hangs on placement if the roles ask for more GPUs than exist, so colocation
 # is not optional here.
@@ -137,7 +149,10 @@ for ckpt in "$ACTOR_SFT_CKPT" "$CRITIC_SL_CKPT"; do
 done
 
 cd "$NLA_REPO"
-exec "$RL_PYTHON" train.py \
+# cd into the miles root to match their invocation exactly. Every path we pass
+# below is absolute, so the move is safe.
+cd "$MILES_SRC"
+exec "$RL_PYTHON" "$MILES_TRAIN" \
     --train-backend "${TRAIN_BACKEND:-fsdp}" \
     --custom-actor-cls-path "${ACTOR_CLS:-nla.train_actor.NLAFSDPActor}" \
     --loss-type policy_loss \

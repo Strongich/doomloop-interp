@@ -46,7 +46,13 @@ SGLANG_REPO="${SGLANG_REPO:-https://github.com/sgl-project/sglang.git}"
 # editable install from source is what actually gets used, and it wins because it
 # is installed after the manifest. Regenerate the manifest (`make rl-pins`) if that
 # divergence starts to matter.
-SGLANG_PIN="${SGLANG_PIN:-v0.5.8}"
+# v0.5.8 pins transformers==4.57.1, which mis-computes Qwen3's forward when the
+# prompt arrives as inputs_embeds: identical weights and tokens give a logit sum
+# of -280k vs -42k under 5.9.0, and the AV degenerates (1/8 closed tags vs 8/8).
+# transformers 5.9.0 and vLLM 0.22 agree with each other against it, so 4.57.1 is
+# the outlier. sglang moved to transformers 5.x at v0.5.10 (5.3.0) and pins 5.12.1
+# from v0.5.15 — which is why we track a newer tag. See D44.
+SGLANG_PIN="${SGLANG_PIN:-v0.5.15}"
 # cu124 per the reference's setup note; A100 is sm_80 so cu124 is fine.
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu124}"
 
@@ -137,9 +143,22 @@ git -C "$SRC_ROOT/sglang" reset --hard --quiet
 git -C "$SRC_ROOT/sglang" clean -fdqx
 git -C "$SRC_ROOT/sglang" checkout --quiet "$SGLANG_PIN"
 echo "  sglang at $SGLANG_PIN ($(git -C "$SRC_ROOT/sglang" rev-parse --short HEAD))"
-# Training needs the patched source (bf16-base64 transport, chunked-prefill
-# slicing, retract-path KV fix) — a wheel will not do.
-bash "$NLA_REPO/patches/apply_sglang_patches.sh" "$SRC_ROOT/sglang"
+# The reference's patches are cut against v0.5.8 and do NOT apply to newer tags.
+# They are not load-bearing for us: input_embeds is already NATIVE in sglang
+# (io_struct/tokenizer_manager carry it identically in v0.5.8 and v0.5.18), and
+# nla_generate only uses the bf16-base64 transport when NLA_BF16_B64_EMBEDS=1,
+# which we do not set — we ride the plain payload["input_embeds"] field. The
+# retract fix is documented by them as a no-op for Qwen ("never retract anyway —
+# KV headroom"). So apply what fits and report what does not, rather than aborting.
+for patch in "$NLA_REPO"/patches/*.patch; do
+  [[ -f "$patch" ]] || continue
+  if git -C "$SRC_ROOT/sglang" apply --check "$patch" 2>/dev/null; then
+    git -C "$SRC_ROOT/sglang" apply "$patch"
+    echo "  applied $(basename "$patch")"
+  else
+    echo "  SKIP $(basename "$patch") — does not apply to $SGLANG_PIN (native path used)"
+  fi
+done
 "${PIP[@]}" -e "$SRC_ROOT/sglang/python[all]"
 
 echo "=== 3b. flash-attn, built against the torch sglang settled on ==="
@@ -156,7 +175,11 @@ echo "=== 3b. flash-attn, built against the torch sglang settled on ==="
 #     against a cu128 torch; `apt-get install -y cuda-nvcc-12-8` supplies 12.8.
 #   - TORCH_CUDA_ARCH_LIST pins the single arch we run on, turning a very long
 #     multi-arch build into a short one.
-FA_CUDA_HOME="${FA_CUDA_HOME:-/usr/local/cuda-12.8}"
+# Match torch's CUDA exactly — torch's own _check_cuda_version aborts the build
+# otherwise ("detected CUDA version (13.0) mismatches ... (12.8)"). Derive it so a
+# torch bump does not silently pick the wrong toolkit.
+TORCH_CUDA="$("$RL_ROOT/bin/python" -c 'import torch;print(torch.version.cuda or "")')"
+FA_CUDA_HOME="${FA_CUDA_HOME:-/usr/local/cuda-${TORCH_CUDA}}"
 FA_ARCH_LIST="${FA_ARCH_LIST:-8.0}"   # A100 = sm_80
 # --no-deps is NOT optional: `--force-reinstall` without it re-resolves the whole
 # tree and pulls a cu13 torch, undoing steps 1-3 (this is D21's hazard again).
@@ -171,7 +194,7 @@ if [[ -x "$FA_CUDA_HOME/bin/nvcc" ]]; then
 else
   echo "  WARNING: no nvcc at $FA_CUDA_HOME/bin/nvcc — skipping flash-attn." >&2
   echo "  Install one matching torch's CUDA ($("$RL_ROOT/bin/python" -c 'import torch;print(torch.version.cuda)')):" >&2
-  echo "    apt-get install -y cuda-nvcc-12-8" >&2
+  echo "    apt-get install -y cuda-nvcc-${TORCH_CUDA//./-}" >&2
 fi
 
 echo "=== 4. the reference nla package + ours ==="
@@ -203,6 +226,10 @@ if ! ldconfig -p | grep -q libnuma; then
 fi
 
 echo "=== 5. verify ==="
+EXPECTED_TRANSFORMERS="$(grep -oE '"transformers==[^"]+"' "$SRC_ROOT/sglang/python/pyproject.toml" \
+  | head -1 | sed 's/.*transformers==//; s/"//')"
+export EXPECTED_TRANSFORMERS
+echo "  sglang declares transformers==${EXPECTED_TRANSFORMERS:-unknown}"
 # Import miles.backends.fsdp_utils, not just miles: that is the module that
 # pulls ring_flash_attn -> flash_attn, where a torch-ABI mismatch surfaces. A
 # bare `import miles` passes happily with a broken flash_attn.
@@ -212,6 +239,7 @@ echo "=== 5. verify ==="
 # wheel is compiled against a specific torch ABI.
 "$RL_ROOT/bin/python" - <<'PYCHECK'
 import importlib.metadata as md
+import os
 import sys
 
 import torch
@@ -227,12 +255,14 @@ import torch
 #   - no vLLM, which drags a cu130 torch and transformers 5.x (D21)
 #   - CUDA actually usable
 problems = []
-expected_transformers = "4."
-if not md.version("transformers").startswith(expected_transformers):
-    problems.append(
-        f"transformers is {md.version('transformers')}, expected {expected_transformers}x "
-        "— the critic tokenizer_config.json format is not cross-major readable"
-    )
+# Do not hardcode a version — assert the installed transformers matches what the
+# sglang checkout itself declares. That keeps this honest across pin bumps, and
+# catches the real hazard: something (vLLM, a stale manifest) quietly pulling a
+# different major than the engine was built against.
+want_tf = os.environ.get("EXPECTED_TRANSFORMERS", "")
+have_tf = md.version("transformers")
+if want_tf and have_tf != want_tf:
+    problems.append(f"transformers is {have_tf}, but sglang pins {want_tf}")
 if not torch.cuda.is_available():
     problems.append("torch.cuda.is_available() is False")
 if torch.cuda.is_available():

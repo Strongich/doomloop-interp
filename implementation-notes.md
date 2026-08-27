@@ -1441,3 +1441,93 @@ non-reasoning models (D42 being the first). Both were silent — no exception, n
 warning, just wrong numbers — and both were caught by cheap invariants worth
 keeping: `log_probs == ref_log_probs` at step 0, and dumping the actual rollout
 text before trusting any reward.
+
+## D44 — transformers 4.57.1 mis-computes Qwen3's injected forward; move to sglang v0.5.15
+
+The first GRPO run that got past every harness bug still produced garbage: the AV
+emitted `<explanation>` correctly, wrote one plausible sentence, then collapsed
+into `"the the"` / `"or or"` / stray Arabic and CJK, closing its tag in **1 of 16**
+samples. ~94% of rollouts took the flat failure reward, so advantage variance came
+from ~6% of the batch and the critic was fit against noise (`fve_nrm` -1.10, i.e.
+worse than predicting the mean).
+
+Bisected it by elimination, each step cheap and decisive:
+
+| hypothesis | test | result |
+|---|---|---|
+| AV is undertrained | standalone `NLA.verbalize` | **8/8 tags closed, rep 0.000** — AV is fine |
+| sampling too hot | greedy vs true T=1 vs Qwen3-rec | all three clean; T=1 exonerated |
+| prompt construction | byte-diff RL prompt vs verbalize prompt | **identical** (586 chars, 108 tokens) |
+| checkpoint mis-loads | `state_dict` md5 under both venvs | **identical**, 311 params, no dropped keys |
+| sglang transport | replicate RL prompt, generate locally | **reproduced the garbage without sglang** |
+| attention backend | eager / sdpa / FA2 under 4.57.1 | all three agree with each other, all differ from 5.9.0 |
+
+What remained was the **transformers version**. Same weights, same tokens,
+`position_ids` ruled out (explicit == implicit), last-position logits:
+
+| | 4.57.1 | 5.9.0 |
+|---|---|---|
+| max logit | 35.25 | **41.75** |
+| logit sum | -280,337 | **-42,183** |
+| top-5 | `<`, `The`, `<\n`, `<P`, `<j` | `<`, `<const`, `<Document`, `<number`, `<ID` |
+
+Generation quality follows exactly:
+
+| engine | transformers | greedy | true T=1 |
+|---|---|---|---|
+| HF generate | 5.9.0 | 8/8 clean | 6/8 clean |
+| vLLM 0.22 | 5.9.0 | 8/8 clean | 4/8 clean |
+| HF generate | 4.57.1 | 1/8, rep 0.26 | 0/8 |
+| sglang | 4.57.1 world | 1/16 | degenerate |
+
+Two independent implementations (transformers 5.9.0 and vLLM's own kernels) agree
+against 4.57.1, so **4.57.1 is the outlier** for Qwen3 + `inputs_embeds`, not our
+checkpoint.
+
+Why it bites us and not them: the injected vector sits at norm **1000** against a
+median token-embedding norm of **1.44** — ~700x. Their own scale table spans 2500x
+(30 for Llama-70B to 80000 for Gemma-12B) and is set by "a round number a bit above
+the mean norm of the dataset's vectors", so 1000 is unremarkable for a model whose
+layer-20 norms are 782-1004. But it puts the forward in a numerically extreme
+regime where implementation differences that are normally invisible become
+catastrophic. They note the same class of fragility: "Occasional high-norm
+positions also decode unreliably."
+
+**Fix: bump `SGLANG_PIN` v0.5.8 -> v0.5.15.** sglang hard-pins transformers
+(`transformers==4.57.1` at v0.5.8) and moved to 5.x at v0.5.10:
+
+| sglang | transformers |
+|---|---|
+| v0.5.8 | 4.57.1 |
+| v0.5.10 | 5.3.0 |
+| v0.5.13 | 5.8.1 |
+| v0.5.15 / v0.5.18 | 5.12.1 |
+
+This was chosen over migrating to TRL's GRPOTrainer because **miles gives us AR/AV
+co-training for free** — its PPO critic slot is what the reference repurposed as
+the NLA reconstructor (`--force-use-critic`, `--critic-lr`, `--critic-save`, stepped
+from `train.py:116`). GRPO is critic-free by design, so TRL has no such slot and we
+would have to rebuild the co-training loop, the reward/train path agreement assert
+included. The vLLM check above does confirm TRL remains a viable fallback:
+activation injection through `EmbedsPrompt` worked first try.
+
+The reference's five sglang patches do NOT apply to v0.5.15, and do not need to:
+`input_embeds` is already native (io_struct 21 hits, tokenizer_manager 11 in BOTH
+v0.5.8 and v0.5.18), `nla_generate` only uses the bf16-base64 transport under
+`NLA_BF16_B64_EMBEDS=1` which we never set, and the retract fix is documented as a
+no-op for Qwen. `setup_rl_stack.sh` now applies what fits and reports what does not
+instead of aborting.
+
+Newer sglang also needs two host prerequisites its build does not declare:
+**cargo** (Rust; the build dies with a bare "error: can't find Rust compiler" deep
+in a wheel-download log) and **protoc** (`sglang-grpc`'s `build.rs` shells out to
+it). Both are now handled in the setup script.
+
+The verify block no longer hardcodes a transformers version — it reads the pin out
+of the sglang checkout's own `pyproject.toml` and asserts the installed version
+matches, so a future bump stays honest. The flash-attn `CUDA_HOME` is likewise
+derived from `torch.version.cuda` rather than fixed at 12.8.
+
+**The gate before any further integration work** is re-running
+`scripts/check_av_generation.py` under the rebuilt venv: 5.9.0 and vLLM are clean,
+but 5.12.1 is a different minor and is not yet verified.

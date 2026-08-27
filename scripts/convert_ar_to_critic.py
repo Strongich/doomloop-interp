@@ -56,6 +56,22 @@ def main() -> None:
             shutil.copy2(item, out / item.name)
     print(f"copied backbone -> {out}")
 
+    # The tokenizer lives in the AR checkpoint ROOT, not in backbone/: our
+    # save_checkpoint writes `backbone.save_pretrained(dir/"backbone")` but
+    # `tokenizer.save_pretrained(dir)`. Copying only backbone/ leaves the critic dir
+    # with no tokenizer, and the reference then fails its drift check with
+    # "'<|image_pad|>' -> []" because AutoTokenizer found no vocab to load.
+    tokenizer_files = [
+        f for f in src.iterdir() if f.is_file() and (
+            f.name.startswith(("tokenizer", "vocab", "merges", "special_tokens"))
+            or f.name == "chat_template.jinja"
+        )
+    ]
+    assert tokenizer_files, f"no tokenizer files in {src} — cannot build a usable critic dir"
+    for f in tokenizer_files:
+        shutil.copy2(f, out / f.name)
+    print(f"copied tokenizer files: {sorted(f.name for f in tokenizer_files)}")
+
     sd = torch.load(affine, map_location="cpu")
     assert set(sd) == {"weight"}, f"expected only 'weight' in affine.pt, got {sorted(sd)}"
     w = sd["weight"]
@@ -84,6 +100,16 @@ def main() -> None:
         f"backbone has {n_layers} layers but the AR should have {cfg.ar_num_layers} "
         f"(layer {cfg.extraction_layer} + 1) — the truncation did not survive the save"
     )
+    # The check the reference performs at load time. Doing it here means a broken
+    # copy fails in this script instead of deep inside Miles at launch.
+    tok_out = AutoTokenizer.from_pretrained(str(out))
+    ids = tok_out.encode(cfg.placeholder_token, add_special_tokens=False)
+    assert ids == [cfg.placeholder_token_id], (
+        f"placeholder {cfg.placeholder_token!r} encodes to {ids} with the copied "
+        f"tokenizer, expected [{cfg.placeholder_token_id}] — the tokenizer did not "
+        f"survive the copy"
+    )
+    print(f"placeholder round-trip OK: {cfg.placeholder_token!r} -> {ids}")
     print("OK")
 
 

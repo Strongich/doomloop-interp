@@ -1305,3 +1305,70 @@ Their header is worth heeding on one more point — synchronous `train.py` with 
 optimizer step per rollout is *"the ONLY configuration we have tested — all
 released checkpoints were trained this way"*, and `train_async.py` overlaps
 generation with training so samples come from stale weights. We are on `train.py`.
+
+## D42 — `--load` silently ignored our HF checkpoint; the actor trained from base
+
+First GRPO step completed. Every metric that mattered was dead:
+
+```
+rollout/response_lengths: 149.92   (cap 150)
+rollout/raw_reward:        -2.0
+rollout/advantages:         0.0
+train/pg_loss:              0.0
+train/kl_loss:             23.23
+train/loss:                 0.232   (= 0.01 x 23.227 — pure KL)
+```
+
+One cause behind all of it, in the startup log:
+
+```
+[FSDP] No tracker file at .../av_sft/latest_checkpointed_iteration.txt; skipping load.
+[Rank 0] Creating separate ref model from .../av_sft
+```
+
+**miles has two non-interchangeable checkpoint loaders, and only one tolerates an
+HF directory:**
+
+| flag | code path | our HF dir |
+|---|---|---|
+| `--ref-load` | `os.path.isdir()` -> `from_pretrained()` (`fsdp_utils/actor.py:605`) | **loads** |
+| `--load` | needs `latest_checkpointed_iteration.txt` + `iter_NNNNNNN/{model,optimizer,lr_scheduler}` (`fsdp_utils/checkpoint.py:95`) | **skipped, logged at INFO, run continues** |
+
+Their `rl.sh` passes `--hf-checkpoint $INSTRUCT_MODEL` (base) and overlays SFT
+weights through `--load`, which works for them because their Stage-1 ran under
+miles and emits DCP — the arg is documented as "DCP iter dir from actor_sft.sh
+(e.g. .../iter_0002000)". Our Stage-1 is our own loop and writes plain HF. So
+`--load` did nothing, and the run had it **exactly backwards**: the actor was base
+`Qwen3-1.7B` while the ref model was our trained AV.
+
+Everything follows from that:
+
+- A base model has never seen the `<explanation>` format, so it never emits the
+  closing tag inside 150 tokens. `nla_generate` promotes TRUNCATED -> FAILED
+  (`nla_generate.py:282`), and `reward.py` pays FAILED a flat
+  `FAILED_EXTRACTION_REWARD = -2.0` without consulting the critic.
+- Every sample in every GRPO group of 8 therefore scored identically, so
+  advantages were 0 by construction and `pg_loss` was **exactly** 0.0. The KL term
+  was the only live gradient — the run was training the AV to imitate its own SFT
+  init, with zero reconstruction signal.
+- `kl_loss = 23.2` and the 5.4-nat gap between `log_probs` (-0.42, base scoring its
+  own samples) and `ref_log_probs` (-5.80, the SFT model finding base output
+  unlikely) were the visible fingerprint. At step 0 with `--load` and `--ref-load`
+  pointing at the same place, those two numbers should be nearly equal. **That
+  equality is the check worth keeping** — it is the cheapest possible test that the
+  policy actually started from the checkpoint you named.
+
+Fix: `--hf-checkpoint "$ACTOR_SFT_CKPT"`. `av_sft` is a complete HF
+`Qwen3ForCausalLM` dir, so the actor initializes from it directly and sglang loads
+it as `model_path` too (previously base, which mattered only before the first
+`update_weights` sync, but there is no reason to start mismatched). `--load` now
+means what miles intends — resume an interrupted RL run — defaulting to
+`$RUN_DIR/actor`, where a missing dir logs "not found; skipping load" harmlessly.
+
+Added a launcher guard requiring `$ACTOR_SFT_CKPT/config.json`, so a DCP dir passed
+here fails immediately instead of training from random-ish base weights for hours.
+
+Not yet explained and still open: whether the *trained* AV closes its explanation
+inside 150 tokens. `reward.py` honours `NLA_ROLLOUT_TEXT_DUMP`, which writes the
+first 20 responses with their status — that is the next measurement, before
+spending more GPU hours.

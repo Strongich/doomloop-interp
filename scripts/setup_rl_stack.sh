@@ -36,12 +36,17 @@ PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 MILES_PIN="$(cut -d@ -f2 "$NLA_REPO/nla/miles_patches/UPSTREAM_PIN")"
 MILES_REPO="${MILES_REPO:-https://github.com/radixark/miles.git}"
 SGLANG_REPO="${SGLANG_REPO:-https://github.com/sgl-project/sglang.git}"
-# PIN IT. The NLA input_embeds patches match specific source lines; an unpinned
-# clone gets whatever main is today and `apply_sglang_patches.sh` fails with
-# "pattern matched 0 times — sglang source changed, patch manually". The tag must
-# agree with the sglang version in requirements/rl.txt (0.5.9) so the editable
-# install and the pinned wheel deps describe the same code.
-SGLANG_PIN="${SGLANG_PIN:-v0.5.9}"
+# PIN IT, and to v0.5.8 specifically. The NLA input_embeds patches anchor on exact
+# source lines; an unpinned clone gets today's main and `apply_sglang_patches.sh`
+# dies with "pattern matched 0 times — sglang source changed, patch manually".
+# Tested per tag: the retract-fix anchor matches on 0.5.6 / 0.5.7 / 0.5.8 and
+# breaks on 0.5.9, where three fields were appended to `reset_for_retract` between
+# the anchor and `def offload_kv_cache`. 0.5.8 is therefore the newest usable tag.
+# NOTE this disagrees with requirements/rl.txt, which resolved sglang==0.5.9 — the
+# editable install from source is what actually gets used, and it wins because it
+# is installed after the manifest. Regenerate the manifest (`make rl-pins`) if that
+# divergence starts to matter.
+SGLANG_PIN="${SGLANG_PIN:-v0.5.8}"
 # cu124 per the reference's setup note; A100 is sm_80 so cu124 is fine.
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu124}"
 

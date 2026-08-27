@@ -126,6 +126,17 @@ done
 # flash-attn is installed in step 3b — AFTER sglang, which pins torch.
 "${PIP[@]}" -e "$SRC_ROOT/miles"
 
+# sglang >= v0.5.15 pulls build deps with no cp311 wheels (granian, and friends)
+# that compile from source and need cargo. Without it the build dies with a bare
+# "error: can't find Rust compiler" 300 lines into a wheel download log.
+if ! command -v cargo >/dev/null 2>&1 && [[ -x "$HOME/.cargo/bin/cargo" ]]; then
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "  WARNING: no cargo on PATH. If the sglang build fails on Rust, run:" >&2
+  echo "    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" >&2
+fi
+
 echo "=== 3. SGLang from source + the NLA input_embeds patches ==="
 if [[ ! -d "$SRC_ROOT/sglang/.git" ]]; then
   git clone "$SGLANG_REPO" "$SRC_ROOT/sglang"

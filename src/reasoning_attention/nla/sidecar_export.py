@@ -93,7 +93,14 @@ def build_model_sidecar(
             "av": AV_TEMPLATE.replace("{placeholder}", "{injection_char}"),
             "ar": AR_TEMPLATE,
         },
-        "critic": {"extraction_layer_index": cfg.ar_num_layers},
+        # K, the extraction LAYER INDEX (20) — not the layer COUNT (21). Their
+        # loader reads this into a field called `critic_num_layers`, but
+        # rl_preflight asserts `num_hidden_layers == k + 1`, so the value is K.
+        # Writing ar_num_layers here made the critic claim extraction at layer 21
+        # while holding blocks 0..20. Their notes price this exact off-by-one at a
+        # ~0.32 FVE ceiling, because the head must then partly undo a block the
+        # gold activation never passed through.
+        "critic": {"extraction_layer_index": cfg.extraction_layer},
     }
 
 

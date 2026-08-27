@@ -1114,3 +1114,41 @@ misreported version that sends you chasing the wrong dependency.
 And the verify block now imports `miles.backends.fsdp_utils` rather than bare
 `miles`, since that is the module that actually pulls flash_attn. `import miles`
 alone passed cleanly against the broken extension.
+
+## D38 — the critic sidecar's `extraction_layer_index` is K, not the layer count
+
+`rl_preflight` check 2 failed immediately:
+
+```
+AssertionError: critic truncated to 21 layers but extraction layer_index=21
+  -> want 22. Off-by-one in prepare_critic_checkpoint --num-layers.
+```
+
+`build_model_sidecar` wrote `critic.extraction_layer_index = cfg.ar_num_layers`
+(21, the layer COUNT) where the reference means K, the extraction **layer index**
+(20). Their loader reads the field into a variable named `critic_num_layers`,
+which is what invited the confusion, but `rl_preflight` pins the semantics:
+`assert n_layers == k + 1`. The same file's dataset sidecar already had it right
+(`extraction.layer_index = cfg.extraction_layer`), so our two sidecars disagreed
+with each other.
+
+**The checkpoint itself was never wrong** — `critic_rl/config.json` holds
+`num_hidden_layers: 21` = blocks 0..20, and block 20's output is exactly what
+datagen captured. This was a metadata-only defect. But it is the metadata their
+loader trusts, and their own comment prices the real version of this bug: *"v21's
+critic was prepared with --num-layers 33 when extraction layer_index=32 ->
+num_hidden_layers=34 (one too many). Head had to approximately undo block 33's
+transform to hit the gold at block-32 output. SFT-FVE ceiling dropped to ~0.32."*
+
+Worth flagging against my own earlier note: the `critic_num_layers 21` line in
+D35's loader dump was me reading this wrong value back and reporting it as
+confirmation the truncation was correct. It confirmed nothing — `load_nla_config`
+echoes the sidecar without cross-checking `config.json`. Only `rl_preflight`
+compares the two, which is the whole reason to run it before Ray starts.
+
+This is the third instance in three days of the `hidden_states` index (21) being
+substituted for the layer index (20). CLAUDE.md's rule — use
+`NLAConfig.hidden_states_index` / `ar_num_layers` rather than open-coding the +-1
+— is necessary but not sufficient: here BOTH helpers exist and the wrong one was
+picked, because the reference's field NAME suggests a count. When exporting to
+their schema, the check is what their reader asserts, not what our field is called.

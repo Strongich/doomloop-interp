@@ -152,6 +152,7 @@ class NLA:
         enable_thinking: bool = False,
         do_sample: bool = False,
         return_explanation: bool = False,
+        **gen_kwargs: object,
     ) -> str:
         """Run the AV mechanism: explain an activation vector in natural language.
 
@@ -186,11 +187,17 @@ class NLA:
 
         # 4. Generate from the injected embeddings (decoder-only generate with
         #    inputs_embeds returns only the new continuation tokens).
+        # gen_kwargs forwards sampling settings (temperature/top_p/top_k/...).
+        # Pass them EXPLICITLY when comparing against another generator: Qwen3's
+        # generation_config.json carries temperature=0.6/top_k=20/top_p=0.95, so a
+        # bare do_sample=True quietly samples at the model page's recommended
+        # settings rather than at T=1 (the RL rollout's default).
         generated = self.av.generate(
             inputs_embeds=injected,
             attention_mask=enc["attention_mask"],
             max_new_tokens=max_new_tokens,
             do_sample=do_sample,
+            **gen_kwargs,
         )
         text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
         if return_explanation:

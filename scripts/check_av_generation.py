@@ -74,7 +74,16 @@ def main() -> None:
     print(f"{len(vecs)} activations, norms {vecs.__abs__().max():.0f} max, "
           f"L2 {np.linalg.norm(vecs, axis=1).mean():.0f} mean\n")
 
-    for label, sample in (("greedy", False), ("T=1", True)):
+    # Explicit sampling, NOT the checkpoint's generation_config.json. Qwen3 ships
+    # temperature=0.6/top_k=20/top_p=0.95 there, so a bare do_sample=True silently
+    # runs the model page's recommended settings — which is NOT what the RL rollout
+    # does (miles defaults: T=1.0, top_p=1.0, top_k=-1).
+    regimes = [
+        ("greedy", {"do_sample": False}),
+        ("rollout T=1.0/top_p=1.0/top_k=off", {"do_sample": True, "temperature": 1.0, "top_p": 1.0, "top_k": 0}),
+        ("qwen3 rec T=0.7/top_p=0.8/top_k=20", {"do_sample": True, "temperature": 0.7, "top_p": 0.8, "top_k": 20}),
+    ]
+    for label, gen_kwargs in regimes:
         closed = 0
         reps_all, nl_all = [], []
         print(f"================ {label} ================")
@@ -82,8 +91,8 @@ def main() -> None:
             text = nla.verbalize(
                 torch.from_numpy(v),
                 max_new_tokens=args.max_new_tokens,
-                do_sample=sample,
                 enable_thinking=False,
+                **gen_kwargs,
             )
             ok = EXPL_CLOSE in text
             closed += ok

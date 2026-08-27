@@ -41,13 +41,32 @@ CRITIC_NODES="${CRITIC_NODES:-1}"
 CRITIC_GPUS="${CRITIC_GPUS:-2}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-2}"
 
-# --- Batch: theirs was 128 prompts x 8 samples = 1024 on 16 GPUs. ---
+# --- Batch. ---
+# ROLLOUT_BATCH is NOT a memory knob. It is the number of prompts per RL step;
+# GLOBAL_BATCH samples are then accumulated over ceil(GLOBAL_BATCH/(ACTOR_MICRO *
+# n_gpus)) micro-steps, so raising it costs wall-clock per step, not VRAM. Their
+# own runs prove the separation: rollout_batch 64 (the 2-GPU LR scan) and 128
+# (the 2x8-GPU production run) both at micro-batch 16. They scaled it with GPU
+# COUNT, not with memory, and rescaled LR by sqrt(batch) to match.
+#
+# 64 is therefore the right target for us: it is their 2-GPU config, and we have
+# 2 GPUs. Keep GLOBAL_BATCH an exact multiple of ACTOR_MICRO * n_gpus —
+# TRAINING_NOTES measured a non-integer grad_accum (5.33) at 479s/step vs ~9s.
+# 512 / (16 * 2) = 16 exactly.
+#
 # GRPO group size stays at 8 — it is the advantage baseline, not a throughput
 # knob, and shrinking it raises advantage variance.
-ROLLOUT_BATCH="${ROLLOUT_BATCH:-16}"
+ROLLOUT_BATCH="${ROLLOUT_BATCH:-64}"
 SAMPLES_PER_PROMPT="${SAMPLES_PER_PROMPT:-8}"
 GLOBAL_BATCH="${GLOBAL_BATCH:-$((ROLLOUT_BATCH * SAMPLES_PER_PROMPT))}"
-ACTOR_MICRO="${ACTOR_MICRO:-4}"
+# 16, not rl.sh's ${ACTOR_MICRO:-4} default — TRAINING_NOTES' RL section says
+# "m16 is fine with resp_len capped at 150", and their config sweep measured m16
+# as the fastest point (9.05s vs 12.83s at m64+ckpt): 8 microbatches of fwd+bwd
+# beat 2 of fwd+recompute+bwd, because the extra FSDP gathers cost less than the
+# recompute they save. Bigger is NOT automatically faster here. Their ceiling was
+# a 7B at d_model 3584; our 1.7B at 2048 has headroom, but the FLOP-equivalence
+# argument is about ratios, so start at their measured optimum.
+ACTOR_MICRO="${ACTOR_MICRO:-16}"
 
 # --- Their hyperparameters, copied. ---
 # Production parity LRs at 1.41e-5 = the 1e-5 scan winner scaled by sqrt(2) for

@@ -1007,3 +1007,59 @@ injection_scale 1000.0 | mse_scale 45.254833995939045
 
 Neighbor IDs are verified against the live tokenizer by `load_nla_config` itself,
 so this output is also the drift check passing.
+
+## D36 — rollout batch is a GPU-count knob, not a memory knob; RL runs at 64x8
+
+Reconsidered the GRPO batch after asking whether we should simply maximize
+`--rollout-batch-size` against available VRAM. **We should not, because it is not
+memory-bound.** `--rollout-batch-size` sets the number of *prompts* per RL step;
+the resulting `--global-batch-size` samples are accumulated over
+`global / (micro_batch * n_gpus)` micro-steps. Peak memory is set by
+`--micro-batch-size` x sequence length. Raising the rollout batch buys lower
+gradient noise at a linear wall-clock cost per step; it does not touch VRAM.
+
+The reference's own two runs are the proof:
+
+| | LR scan | production (released) |
+|---|---|---|
+| GPUs | 2 | 2 x 8 |
+| prompts / rollout | 64 | 128 |
+| **micro-batch** | **16** | **16** |
+| global batch | 512 | 1024 |
+| actor lr | 1e-5 | 1.41e-5 (= 1e-5 x sqrt2) |
+
+Same micro-batch at both batch sizes. They scaled the rollout batch with **GPU
+count** and rescaled LR by sqrt(batch).
+
+So our target is their **2-GPU** config, since we have 2 GPUs:
+`ROLLOUT_BATCH=64`, `SAMPLES_PER_PROMPT=8` -> global 512. Changed from 16 (global
+128), which was 1/4 of the batch their smallest evidenced run used.
+
+`ACTOR_MICRO` also moves **4 -> 16**. The 4 came from `configs/rl.sh`'s
+`${ACTOR_MICRO:-4}` default, but `TRAINING_NOTES.md`'s RL section states what they
+actually ran: "m16 is fine with resp_len capped at 150". Their sweep also shows
+bigger is *not* automatically faster — m16 at 9.05s beat m64+checkpointing at
+12.83s, because 8 microbatches of fwd+bwd cost less than 2 of fwd+recompute+bwd
+(the extra FSDP gathers are cheaper than the recompute saved). Their memory
+ceiling (7B, d_model 3584, 28 layers + a 152k lm_head) is far above ours, so we
+have headroom to go higher, but the FLOP-equivalence argument is about ratios and
+their measured optimum is the honest starting point.
+
+Two hard constraints carried over:
+
+- **`grad_accum` must be an integer.** `512 / (16 * 2) = 16` exactly. They
+  measured a non-integer accum (5.33) at **479s/step** against ~9s — pathological,
+  not a gentle slowdown.
+- **Never pass `--gradient-checkpointing` in RL.** It deadlocks NCCL inside
+  `update_weights()` (FSDP full-param gather changes behaviour, the broadcast
+  hangs, the 10-minute watchdog SIGABRTs). Already annotated in `train_grpo.sh`.
+
+The LR derivation is unchanged and now independently reproduces their number:
+`1.41e-5 * sqrt(512/1024) = 9.97e-6` against their scan winner of 1e-5 at global
+512. Critic at parity, "as they ran for most of training" — their scan's apparent
+preference for a 5x hotter critic is flagged in their own notes as a 30-step
+artifact that also rewards verbosity and courts OOM via length drift.
+
+Standing caveat from the top of `TRAINING_NOTES.md`, worth repeating: "These are
+the settings we used, not settings we claim are optimal. We did not sweep batch
+size, learning rate, or GRPO group size for RL."

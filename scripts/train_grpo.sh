@@ -59,6 +59,18 @@ KL_LOSS_COEF="${KL_LOSS_COEF:-0.01}"
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-150}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-300}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-100}"
+# Their released checkpoint is rollout_id 4199, which at their measured ~47s/step
+# is ~55h on 2 GPUs. Their own LR scan shows most of the gain arrives early — 30
+# steps moved fve_nrm from a 0.375 warm-start to 0.377-0.483 — so default to a
+# short run and extend if FVE is still climbing.
+NUM_ROLLOUT="${NUM_ROLLOUT:-400}"
+# Must match what the AV was trained with. 1000 for us (D29): the rule is "a round
+# number just above the dataset's mean activation norm" (~900 here), NOT sqrt(d).
+# The reference has no default for this — absent means train_actor asserts — and a
+# mismatch is the failure where the AV free-associates off the placeholder instead
+# of reading the vector. mse_scale is separate (D30) and comes from the sidecar,
+# defaulting to sqrt_d_model = 45.25, which is what we want.
+INJECTION_SCALE="${INJECTION_SCALE:-1000}"
 
 # --kl-coef is a no-op for GRPO (get_grpo_returns discards the kl tensor);
 # --use-kl-loss is the path that actually adds KL to the policy loss. It is
@@ -90,8 +102,20 @@ cat <<EOM
    lr            actor $ACTOR_LR / critic $CRITIC_LR  (1.41e-5 x sqrt($GLOBAL_BATCH/1024))
    kl coef       $KL_LOSS_COEF
    response cap  $MAX_RESPONSE_LEN
+   rollouts      $NUM_ROLLOUT  (theirs: 4199 ~= 55h on 2 GPUs)
+   inj scale     $INJECTION_SCALE  (mse_scale comes from the checkpoint sidecar)
 ==============================================================
 EOM
+
+for ckpt in "$ACTOR_SFT_CKPT" "$CRITIC_SL_CKPT"; do
+  if [[ ! -f "$ckpt/nla_meta.yaml" ]]; then
+    echo "ERROR: $ckpt/nla_meta.yaml missing." >&2
+    echo "  Stage 2 reads its NLA settings from that sidecar; our SFT loop does not" >&2
+    echo "  write one. Generate it first:" >&2
+    echo "    uv run python scripts/make_nla_sidecar.py --checkpoint $ckpt" >&2
+    exit 1
+  fi
+done
 
 cd "$NLA_REPO"
 exec "$RL_PYTHON" train.py \
@@ -136,6 +160,8 @@ exec "$RL_PYTHON" train.py \
     --rollout-batch-size "$ROLLOUT_BATCH" \
     --global-batch-size "$GLOBAL_BATCH" \
     --micro-batch-size "$ACTOR_MICRO" \
+    --num-rollout "$NUM_ROLLOUT" \
+    --nla-injection-scale "$INJECTION_SCALE" \
     --lr "$ACTOR_LR" --lr-decay-style constant \
     --attn-implementation "${ATTN_IMPL:-flash_attention_2}" \
     `# NO --gradient-checkpointing: it deadlocks NCCL in update_weights() —` \

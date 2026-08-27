@@ -138,6 +138,18 @@ class StepLog:
     pred_norm: float | None = None
 
 
+def _scale_key(stage: str) -> str:
+    """Which scale knob a stage actually uses — they are NOT the same thing (D30).
+
+    AV: injection_scale, the L2 norm the activation is mapped to before its
+        embedding is overwritten. A hyperparameter; wrong value => the AV reads
+        an out-of-distribution vector.
+    AR: mse_scale, the norm BOTH prediction and target are mapped to before the
+        MSE. Loss normalization only; the AR is never injected into.
+    """
+    return "injection_scale" if stage == "av" else "mse_scale"
+
+
 def cosine_with_floor(
     optimizer: torch.optim.Optimizer, warmup_steps: int, total_steps: int, floor_ratio: float
 ) -> torch.optim.lr_scheduler.LambdaLR:
@@ -519,7 +531,7 @@ def main() -> None:
         f"steps={total_steps} trainable={n_trainable / 1e6:.1f}M "
         f"lora={f'r{args.lora_r}' if args.lora else 'off (full finetune)'} "
         f"lr={args.learning_rate:.2e} eff_batch={effective_batch} "
-        f"{'injection_scale' if args.stage == 'av' else 'mse_scale'}={dataset.scale}"
+        f"{_scale_key(args.stage)}={dataset.scale}"
         + (f" fve_baseline={baseline:.4f}" if args.stage == "ar" else "")
     )
 
@@ -619,7 +631,12 @@ def main() -> None:
     if wandb_run is not None:
         # The dataset-level FVE denominator, so a run is interpretable on its own.
         wandb_run.summary["fve_baseline"] = baseline
-        wandb_run.summary["injection_scale"] = dataset.scale
+        # Name the knob by what it IS for this stage. The AV injects at
+        # injection_scale (1000); the AR injects nothing — its scale is mse_scale
+        # (sqrt(d_model) = 45.25), the norm BOTH prediction and target are mapped to
+        # before the loss. Logging both under one name has twice led to the AR's
+        # 45.25 being read back as the AV's injection scale (see D30).
+        wandb_run.summary[_scale_key(args.stage)] = dataset.scale
         wandb_run.finish()
 
     save_checkpoint(model, tokenizer, args.stage, out_dir)
@@ -631,7 +648,7 @@ def main() -> None:
                 "args": {k: v for k, v in vars(args).items()},
                 "rows": len(dataset),
                 "trainable_params": n_trainable,
-                "injection_scale": dataset.scale,
+                _scale_key(args.stage): dataset.scale,
                 "fve_baseline": baseline,
                 "steps": [asdict(entry) for entry in logs],
                 "eval": eval_summary,

@@ -145,10 +145,47 @@ bash "$NLA_REPO/patches/apply_sglang_patches.sh" "$SRC_ROOT/sglang"
 
 echo "=== 4. the reference nla package + ours ==="
 "${PIP[@]}" -e "$NLA_REPO"
-"${PIP[@]}" -e "$PROJECT_ROOT"
+# --no-deps for OUR project. Its dependency tree includes vLLM, which pulls a
+# cu130 torch and transformers 5.x and overwrites the pinned cu124 stack that
+# Miles, sglang and the prebuilt sgl-kernel wheel were resolved against. Observed:
+# torch 2.6.0+cu124 -> 2.13.0+cu130, transformers 4.57 -> 5.16. This is the same
+# hazard D21 created this venv to avoid, just in the other direction. All we need
+# here is the package importable for its config and prompt constants; every
+# runtime dep it uses in this env (torch, transformers, pyarrow, yaml, numpy) is
+# already pinned by the manifest.
+"${PIP[@]}" -e "$PROJECT_ROOT" --no-deps
 
 echo "=== 5. verify ==="
 "$RL_ROOT/bin/python" -c "import miles, sglang, nla; print('miles + sglang + nla import OK')"
+# Assert the pinned stack actually survived. An import check alone passes happily
+# on a torch that something upgraded underneath us, and the prebuilt sgl-kernel
+# wheel is compiled against a specific torch ABI.
+"$RL_ROOT/bin/python" - <<'PYCHECK'
+import importlib.metadata as md
+import sys
+
+import torch
+
+expected_torch = "2.6.0"
+problems = []
+if not torch.__version__.startswith(expected_torch):
+    problems.append(f"torch is {torch.__version__}, expected {expected_torch}+cu124")
+if "cu124" not in torch.__version__:
+    problems.append(f"torch {torch.__version__} is not a cu124 build")
+if not torch.cuda.is_available():
+    problems.append("torch.cuda.is_available() is False")
+try:
+    if md.version("vllm"):
+        problems.append("vLLM is installed here — it will fight the pinned torch")
+except md.PackageNotFoundError:
+    pass
+if problems:
+    print("RL STACK VERIFY FAILED:", file=sys.stderr)
+    for p in problems:
+        print(f"  - {p}", file=sys.stderr)
+    sys.exit(1)
+print(f"stack verify OK: torch {torch.__version__}, sglang {md.version('sglang')}")
+PYCHECK
 
 cat <<EOM
 

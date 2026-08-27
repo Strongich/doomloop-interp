@@ -75,6 +75,19 @@ if [[ "$COLOCATE" == "1" ]]; then
   COLOCATE_FLAGS=(--colocate --num-gpus-per-node "$NUM_GPUS_PER_NODE")
 fi
 
+# NLAFSDPActor refuses to start unless
+#   rollout_batch_size * n_samples_per_prompt == global_batch_size
+# (bypass: NLA_I_KNOW_WHAT_IM_DOING=1). Their header explains why it matters: the
+# FSDP path forces ONE optimizer step per rollout, so a mismatch does not change
+# the step count — it silently rescales gradients through the loss normalizer.
+# GLOBAL_BATCH defaults to exactly that product; this catches an override.
+if (( GLOBAL_BATCH != ROLLOUT_BATCH * SAMPLES_PER_PROMPT )); then
+  echo "ERROR: GLOBAL_BATCH=$GLOBAL_BATCH but ROLLOUT_BATCH x SAMPLES_PER_PROMPT" >&2
+  echo "= $((ROLLOUT_BATCH * SAMPLES_PER_PROMPT)). Their actor requires these to be equal:" >&2
+  echo "one optimizer step per rollout keeps training on-policy." >&2
+  exit 1
+fi
+
 # --- CUDA forward-compat guard. ---
 # miles injects a hardcoded LD_LIBRARY_PATH into every sglang engine actor's Ray
 # runtime_env, putting /usr/local/cuda/compat FIRST ("so a forward-compat
@@ -173,7 +186,11 @@ INJECTION_SCALE="${INJECTION_SCALE:-1000}"
 # --use-kl-loss is the path that actually adds KL to the policy loss. It is
 # store_true, so gate on the env var to allow turning it off entirely.
 if "$RL_PYTHON" -c "import sys;sys.exit(0 if float('$KL_LOSS_COEF') != 0 else 1)"; then
-  KL_FLAGS=(--use-kl-loss --kl-loss-coef "$KL_LOSS_COEF")
+  # k2, not miles' default k1. NLAFSDPActor asserts on k1 + --use-kl-loss: as a
+  # direct loss term, k1 = (log p - log p_ref) has zero expected gradient under
+  # the sampling distribution, so the penalty does nothing while looking active in
+  # the logs. Their configs/rl.sh ships k2; k1 is only legal with --use-unbiased-kl.
+  KL_FLAGS=(--use-kl-loss --kl-loss-coef "$KL_LOSS_COEF" --kl-loss-type "${KL_LOSS_TYPE:-k2}")
 else
   KL_FLAGS=()
 fi

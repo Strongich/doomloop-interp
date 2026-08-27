@@ -186,11 +186,27 @@ echo "=== 4. the reference nla package + ours ==="
 # already pinned by the manifest.
 "${PIP[@]}" -e "$PROJECT_ROOT" --no-deps
 
+echo "=== 4b. system shared libs sgl_kernel dlopens ==="
+# sgl_kernel's compiled extension links libnuma. It is NOT a pip dependency, so
+# the wheel installs clean and then fails at IMPORT with a message that blames
+# the wheel and tells you to reinstall it:
+#   ImportError: libnuma.so.1: cannot open shared object file
+#   ModuleNotFoundError: No module named 'common_ops'
+# Reinstalling never helps — the missing piece is a system package.
+if ! ldconfig -p | grep -q libnuma; then
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "  installing libnuma1"
+    apt-get install -y -qq libnuma1 || echo "  WARNING: libnuma1 install failed" >&2
+  else
+    echo "  WARNING: libnuma.so.1 not found and no apt-get; install it for sgl_kernel." >&2
+  fi
+fi
+
 echo "=== 5. verify ==="
 # Import miles.backends.fsdp_utils, not just miles: that is the module that
 # pulls ring_flash_attn -> flash_attn, where a torch-ABI mismatch surfaces. A
 # bare `import miles` passes happily with a broken flash_attn.
-"$RL_ROOT/bin/python" -c "import miles.backends.fsdp_utils, sglang, nla, flash_attn; print('miles(fsdp) + sglang + nla + flash_attn import OK')"
+"$RL_ROOT/bin/python" -c "import miles.backends.fsdp_utils, sglang, sgl_kernel, nla, flash_attn; print('miles(fsdp) + sglang + sgl_kernel + nla + flash_attn import OK')"
 # Assert the pinned stack actually survived. An import check alone passes happily
 # on a torch that something upgraded underneath us, and the prebuilt sgl-kernel
 # wheel is compiled against a specific torch ABI.

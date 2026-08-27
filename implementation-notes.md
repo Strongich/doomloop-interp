@@ -1372,3 +1372,72 @@ Not yet explained and still open: whether the *trained* AV closes its explanatio
 inside 150 tokens. `reward.py` honours `NLA_ROLLOUT_TEXT_DUMP`, which writes the
 first 20 responses with their status — that is the next measurement, before
 spending more GPU hours.
+
+## D43 — Qwen3 thinking mode silently re-enabled at RL time
+
+With the actor finally initialized from `av_sft` (D42), step 0 confirmed the
+checkpoint fix — `log_probs == ref_log_probs == -3.4595751762390137` exactly, and
+`kl_loss = 0.0` — but the reward was still a flat `-2.0`, and the run then died:
+
+```
+ValueError: torch.cat(): expected a non-empty list of Tensors
+  nla/train_actor.py:103 _assert_reward_train_paths_agree
+```
+
+`NLA_ROLLOUT_TEXT_DUMP` showed why in one glance:
+
+```
+=== sample 0 (status=FAILED) ===
+<think>
+Okay, let me try to figure out why the user wants the explanation. So the user has
+provided a vector inside < concept, after an explanation.
+[degenerates into multilingual noise]
+```
+
+**The AV was prompted in thinking mode.** Qwen3's stock template emits the closed
+`<think>\n\n</think>\n\n` pair only when `enable_thinking` is *explicitly* false:
+
+```jinja
+{%- if enable_thinking is defined and enable_thinking is false %}
+```
+
+Our SFT always passed `enable_thinking=False` (`training/data.py:157`,
+`nla/model.py:152`), so every training prompt ended
+`<|im_start|>assistant\n<think>\n\n</think>\n\n<explanation>...`. The reference's
+rollout calls `apply_chat_template(messages, tokenize=False,
+add_generation_prompt=True)` (`nla/rollout/nla_generate.py:165`) with **no**
+`enable_thinking`, so the block disappeared, Qwen3 opened its own `<think>`, and
+the model was far outside its fine-tuning distribution. It never emitted
+`</explanation>`, so `nla_generate` promoted every sample TRUNCATED -> FAILED and
+`reward.py` paid the flat `-2.0` without ever calling the critic — zero advantage
+variance, `pg_loss` exactly 0, then an empty tensor list when the critic path found
+nothing to concatenate.
+
+Their case-study models (Qwen2.5-7B, Gemma-3, Llama-3.3) have no thinking mode, so
+the omission is correct for them and invisible in their code. It is our
+target-model choice that makes it load-bearing.
+
+Fixed in **our checkpoint**, not their tree — `scripts/set_nonthinking_default.py`
+inverts the guard so the template declares how this checkpoint must be prompted:
+
+```jinja
+{%- if not (enable_thinking is defined and enable_thinking) %}
+```
+
+| call | before | after |
+|---|---|---|
+| `enable_thinking=False` | non-thinking | non-thinking |
+| `enable_thinking=True` | thinking | thinking |
+| **omitted** | **thinking** | **non-thinking** |
+
+Verified by rendering all three against the live tokenizer. Explicit callers are
+unchanged, so `NLA.verbalize()` and the SFT loaders behave identically; only the
+default moves. The fix travels with the checkpoint, which is the right home for it:
+any consumer that forgets the kwarg now gets the mode the weights were trained in.
+
+Note for the write-up: this is the second failure caused by our checkpoints being
+HF-shaped and Qwen3-specific where the reference assumes miles-DCP and
+non-reasoning models (D42 being the first). Both were silent — no exception, no
+warning, just wrong numbers — and both were caught by cheap invariants worth
+keeping: `log_probs == ref_log_probs` at step 0, and dumping the actual rollout
+text before trusting any reward.

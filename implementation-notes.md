@@ -1257,3 +1257,51 @@ lib older than the running driver has no legitimate use.
 against the live driver with `sort -V`) and refuses to launch with the exact `mv`
 command, rather than silently mutating `/usr/local` or letting the run die 90
 seconds in with a message about accelerators that points nowhere near the cause.
+
+## D41 — `--kl-loss-type k2`, and the reference clone is per-machine (keep it pulled)
+
+Next failure, from the reference's own actor:
+
+```
+AssertionError: --kl-loss-type k1 with --use-kl-loss has zero expected gradient;
+  use k2/k3/low_var_kl or add --use-unbiased-kl.
+```
+
+Correct and important: k1 = `log p - log p_ref` as a **direct loss term** has zero
+expected gradient under the sampling distribution, so a KL penalty configured that
+way does nothing at all while still logging a plausible `train/kl_loss`. miles
+defaults `--kl-loss-type` to k1; their `configs/rl.sh` overrides it to **k2**. Our
+launcher passed only `--use-kl-loss --kl-loss-coef`, so it inherited k1.
+
+Fixed: `--kl-loss-type "${KL_LOSS_TYPE:-k2}"`.
+
+**Process failure worth recording.** I first concluded the assertion lived in
+*miles* and that our `MILES_PIN` had outrun their config — then that we should pick
+k3 on GRPO-literature grounds. Both wrong. `natural_language_autoencoders/` is
+**gitignored** (`.gitignore:226`), so it is a separate clone on every machine, and
+the local one was behind the pod's. The pod's HEAD was `0577769 "Trim KL comments;
+allow k1 with --use-unbiased-kl; note k2 in design/header"` — the commit that
+answers this exact question — against a local `879282f`. Two searches for the
+answer came back empty because the file I was grepping did not have it yet.
+
+`git -C natural_language_autoencoders pull` before treating that tree as the
+authority. It is documentation as much as code, and it is not pinned by our repo.
+
+**Second constraint found in the same header** (and not previously in our script):
+
+> One step per rollout: NLAFSDPActor refuses to start if
+> `rollout_batch_size x n_samples_per_prompt != global_batch_size`; set
+> `NLA_I_KNOW_WHAT_IM_DOING=1` to bypass. (A mismatch would not change the step
+> count — the FSDP path forces one step — it silently rescales gradients via the
+> loss normalizer instead.)
+
+We satisfy it (64 x 8 = 512 = GLOBAL_BATCH) because GLOBAL_BATCH defaults to that
+product, but it was luck rather than intent, and an override of any one of the
+three would have broken it quietly. Now asserted in the launcher with that
+reasoning attached. It also retroactively justifies D36's choice to scale
+ROLLOUT_BATCH rather than decouple the batches: they are not independent knobs.
+
+Their header is worth heeding on one more point — synchronous `train.py` with one
+optimizer step per rollout is *"the ONLY configuration we have tested — all
+released checkpoints were trained this way"*, and `train_async.py` overlaps
+generation with training so samples come from stale weights. We are on `train.py`.

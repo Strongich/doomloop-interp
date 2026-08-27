@@ -24,6 +24,26 @@ NLA_REPO="${NLA_REPO:-$PROJECT_ROOT/natural_language_autoencoders}"
 : "${RUN_DIR:?set RUN_DIR for outputs}"
 INSTRUCT_MODEL="${INSTRUCT_MODEL:-Qwen/Qwen3-1.7B}"
 
+# --- Where the actor's INITIAL WEIGHTS come from. ---
+# Their rl.sh passes --hf-checkpoint $INSTRUCT_MODEL (base) and relies on --load
+# $ACTOR_SFT_CKPT to overlay the SFT weights, because their SFT ran under miles
+# and emits DCP checkpoints ("DCP iter dir from actor_sft.sh, e.g. .../iter_0002000").
+# OUR SFT is our own loop and writes a plain HF directory, and the two miles
+# loaders are NOT interchangeable:
+#   --ref-load  -> os.path.isdir() then from_pretrained()  = HF, works
+#   --load      -> needs latest_checkpointed_iteration.txt + iter_NNNNNNN/{model,
+#                  optimizer,lr_scheduler} DCP dirs; otherwise logs
+#                  "[FSDP] No tracker file at ...; skipping load." and CONTINUES
+# So --load silently did nothing and the actor trained from base Qwen3-1.7B while
+# the ref model was our AV — backwards, and invisible except as a ~5.4 nat gap
+# between rollout/log_probs and rollout/ref_log_probs at step 0.
+#
+# Since av_sft IS a complete HF Qwen3ForCausalLM checkpoint, point --hf-checkpoint
+# at it: the actor initializes from it, and sglang loads it as model_path too
+# (rather than base) so the pre-first-sync engine matches the policy.
+# --load is then free to mean what miles intends: resume an interrupted RL run.
+RESUME_FROM="${RESUME_FROM:-$RUN_DIR/actor}"
+
 # The RL stack lives in its own env — see scripts/setup_rl_stack.sh for why.
 RL_PYTHON="${RL_PYTHON:-$PROJECT_ROOT/.venv-rl/bin/python}"
 if [[ ! -x "$RL_PYTHON" ]]; then
@@ -221,6 +241,15 @@ cat <<EOM
 ==============================================================
 EOM
 
+# The actor init must be a readable HF checkpoint, since that is now how its
+# weights arrive. A DCP-style dir here would load nothing and train from scratch.
+if [[ ! -f "$ACTOR_SFT_CKPT/config.json" ]]; then
+  echo "ERROR: $ACTOR_SFT_CKPT has no config.json, so --hf-checkpoint cannot" >&2
+  echo "initialize the actor from it. If this is a miles DCP checkpoint dir" >&2
+  echo "(latest_checkpointed_iteration.txt + iter_*/), export it to HF first." >&2
+  exit 1
+fi
+
 for ckpt in "$ACTOR_SFT_CKPT" "$CRITIC_SL_CKPT"; do
   if [[ ! -f "$ckpt/nla_meta.yaml" ]]; then
     echo "ERROR: $ckpt/nla_meta.yaml missing." >&2
@@ -248,9 +277,9 @@ exec "$RL_PYTHON" "$MILES_TRAIN" \
     --data-source-path nla.data_source.NLADataSource \
     --prompt-data "$RL_PARQUET" \
     --input-key prompt \
-    --hf-checkpoint "$INSTRUCT_MODEL" \
+    --hf-checkpoint "$ACTOR_SFT_CKPT" \
     --ref-load "$ACTOR_SFT_CKPT" \
-    --load "$ACTOR_SFT_CKPT" \
+    --load "$RESUME_FROM" \
     --nla-sidecar-source "$ACTOR_SFT_CKPT" \
     --save "$RUN_DIR/actor" \
     --critic-load "$CRITIC_SL_CKPT" \

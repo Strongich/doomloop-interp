@@ -17,6 +17,7 @@ backbone dtype after loading, so no precision decision is made here.
 """
 
 import argparse
+import json
 import shutil
 from pathlib import Path
 
@@ -49,9 +50,10 @@ def main() -> None:
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     for item in backbone.iterdir():
-        (shutil.copytree if item.is_dir() else shutil.copy2)(
-            item, out / item.name, dirs_exist_ok=True
-        ) if item.is_dir() else shutil.copy2(item, out / item.name)
+        if item.is_dir():
+            shutil.copytree(item, out / item.name, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, out / item.name)
     print(f"copied backbone -> {out}")
 
     sd = torch.load(affine, map_location="cpu")
@@ -75,8 +77,6 @@ def main() -> None:
     cfg = NLAConfig()
     tok = AutoTokenizer.from_pretrained(cfg.model_id)
     print(f"sidecar -> {write_model_sidecar(out, build_model_sidecar(tok, cfg))}")
-
-    import json
 
     n_layers = json.loads((out / "config.json").read_text())["num_hidden_layers"]
     print(f"config.json num_hidden_layers={n_layers} (want {cfg.ar_num_layers})")

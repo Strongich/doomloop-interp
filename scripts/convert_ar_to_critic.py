@@ -22,6 +22,7 @@ import shutil
 from pathlib import Path
 
 import torch
+import transformers
 from safetensors.torch import save_file
 from transformers import AutoTokenizer
 
@@ -33,6 +34,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ar-checkpoint", required=True, help="our AR dir (has backbone/ + affine.pt)")
     ap.add_argument("--output", required=True, help="flat critic dir for --critic-load")
+    ap.add_argument(
+        "--tokenizer-from",
+        default=None,
+        help="dir to load the tokenizer from before re-saving it into --output. "
+        "Defaults to the AR checkpoint root. Point it at the base model when the "
+        "AR's own tokenizer_config.json was written by an incompatible "
+        "transformers major version.",
+    )
     ap.add_argument(
         "--megatron-compat",
         action="store_true",
@@ -58,19 +67,34 @@ def main() -> None:
 
     # The tokenizer lives in the AR checkpoint ROOT, not in backbone/: our
     # save_checkpoint writes `backbone.save_pretrained(dir/"backbone")` but
-    # `tokenizer.save_pretrained(dir)`. Copying only backbone/ leaves the critic dir
-    # with no tokenizer, and the reference then fails its drift check with
-    # "'<|image_pad|>' -> []" because AutoTokenizer found no vocab to load.
-    tokenizer_files = [
-        f for f in src.iterdir() if f.is_file() and (
-            f.name.startswith(("tokenizer", "vocab", "merges", "special_tokens"))
-            or f.name == "chat_template.jinja"
+    # `tokenizer.save_pretrained(dir)`. Leaving the critic dir with no tokenizer
+    # makes the reference fail its drift check with "'<|image_pad|>' -> []".
+    #
+    # RE-SAVE rather than copy. The AR checkpoint was written on the training side
+    # under transformers 5.x, whose tokenizer_config.json is not backward-readable:
+    # `extra_special_tokens` is serialized as a LIST there and as a DICT in 4.x, so
+    # 4.57 dies with "'list' object has no attribute 'keys'". Round-tripping through
+    # the *running* AutoTokenizer emits this env's format, and the assert below
+    # refuses to write a file the RL venv cannot read.
+    tok_src = Path(args.tokenizer_from) if args.tokenizer_from else src
+    tokenizer = AutoTokenizer.from_pretrained(str(tok_src), trust_remote_code=True)
+    # Megatron/FSDP critic_fwd passes attention_mask=None (causal-only), so a
+    # left-pad would be attended by the last real token. Match the reference.
+    tokenizer.padding_side = "right"
+    tokenizer.save_pretrained(str(out))
+    print(f"re-saved tokenizer from {tok_src} (transformers {transformers.__version__})")
+
+    cfg_path = out / "tokenizer_config.json"
+    tok_cfg = json.loads(cfg_path.read_text())
+    v5_only = sorted({"backend", "is_local", "local_files_only"} & set(tok_cfg))
+    extra = tok_cfg.get("extra_special_tokens")
+    if v5_only or isinstance(extra, list):
+        raise SystemExit(
+            f"{cfg_path} was written in transformers-5.x format "
+            f"(v5-only keys: {v5_only}; extra_special_tokens is a "
+            f"{type(extra).__name__}). The RL venv pins transformers 4.57 and "
+            f"cannot read it. Re-run this script with .venv-rl/bin/python."
         )
-    ]
-    assert tokenizer_files, f"no tokenizer files in {src} — cannot build a usable critic dir"
-    for f in tokenizer_files:
-        shutil.copy2(f, out / f.name)
-    print(f"copied tokenizer files: {sorted(f.name for f in tokenizer_files)}")
 
     sd = torch.load(affine, map_location="cpu")
     assert set(sd) == {"weight"}, f"expected only 'weight' in affine.pt, got {sorted(sd)}"

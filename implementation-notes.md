@@ -947,3 +947,63 @@ because the probe used `min_repeats=3`. The project default is
 (~50+ problems) recording, per trace, the marker positions inside `<think>`,
 whether `</think>` closed, whether a `\boxed{}` answer matched the gold, and the
 loop span if any — producing a labelled position set for the AV to verbalize.
+
+## D34 — the RL venv's torch is whatever `sglang[all]` picks, and that is fine
+
+`setup_rl_stack.sh` step 1 seeds torch 2.6.0+cu124 from the PyTorch cu124 index
+so nothing later can drag in a cu130 build. Step 2 then installs
+`sglang[all]==0.5.8`, which resolves its own torch and wins: measured
+`2.6.0+cu124 -> 2.9.1+cu128`, pulling `torchao`, `torchcodec`,
+`torch-memory-saver` along with it. The verify block asserted `2.6.0` + `cu124`
+and so failed a venv that was actually correct (`rl_setup5.log`, EXIT=1).
+
+Resolution: **stop pinning a torch version in the check.** cu128 ships sm_80
+kernels, the box is 2xA100 (sm_80), and `sgl-kernel 0.3.21` + `flashinfer 0.6.1`
+were resolved against that same torch. The verify block now asserts only what has
+actually broken a launch:
+
+- **transformers is 4.x** — this is the load-bearing one, see D35.
+- **no vLLM** — D21, in the other direction.
+- **CUDA available, and `get_arch_list()` covers every device's compute
+  capability** — a real portability check instead of a version-string match.
+
+Final stack: torch 2.9.1+cu128, transformers 4.57.1, sglang 0.5.18 editable from
+the patched v0.5.8 checkout (`0189f41c30` — the tag's `python/pyproject.toml`
+carries a higher version string than the tag name; cosmetic), sgl-kernel 0.3.21,
+flashinfer-python 0.6.1, miles 0.2.1, nla 0.1.0, no vLLM.
+
+## D35 — the critic tokenizer must be RE-SAVED, not copied, across venvs
+
+`load_nla_config` on `critic_rl` died with `AttributeError: 'list' object has no
+attribute 'keys'` inside `_set_model_specific_special_tokens`. Cause: the
+tokenizer files `convert_ar_to_critic.py` copied out of the AR checkpoint were
+written by the **training** venv's transformers 5.16, and
+`tokenizer_config.json` is not backward-readable across the major version —
+`extra_special_tokens` serializes as a **dict** in 4.x and a **list** in 5.x
+(5.x also adds `backend`, `is_local`, `local_files_only`). The RL venv pins
+transformers 4.57.1, so it cannot read its own critic dir.
+
+Fix: `convert_ar_to_critic.py` now round-trips the tokenizer through the
+**running** `AutoTokenizer` (`from_pretrained` -> `padding_side = "right"` ->
+`save_pretrained`) instead of `shutil.copy2`, so the emitted format always
+matches the env that will consume it. A new `--tokenizer-from` points the load at
+the base model when the AR's own config is from an incompatible major. The script
+then re-reads the file it just wrote and refuses to continue if it sees the 5.x
+shape, naming `.venv-rl/bin/python` as the fix — this failure belongs in the
+converter, not 20 minutes into a GRPO launch.
+
+`padding_side="right"` is copied from the reference's
+`prepare_critic_checkpoint.py`: `critic_fwd` passes `attention_mask=None`
+(causal-only), so left-pad tokens would be attended by the last real token.
+
+Loader check after the fix, under `.venv-rl`:
+
+```
+d_model 2048 | critic_num_layers 21
+injection_char '<|image_pad|>' 151655 | neighbors 29 / 522
+critic_suffix_ids [1318, 29, 366, 1708, 29]
+injection_scale 1000.0 | mse_scale 45.254833995939045
+```
+
+Neighbor IDs are verified against the live tokenizer by `load_nla_config` itself,
+so this output is also the drift check passing.

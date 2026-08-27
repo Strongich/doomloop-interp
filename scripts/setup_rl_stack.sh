@@ -130,6 +130,12 @@ if [[ ! -d "$SRC_ROOT/sglang/.git" ]]; then
   git clone "$SGLANG_REPO" "$SRC_ROOT/sglang"
 fi
 git -C "$SRC_ROOT/sglang" fetch --all --tags --quiet
+# Discard any previously-applied patches first: they leave the tree dirty and
+# `checkout` then refuses ("local changes would be overwritten"). The clone is
+# ours and disposable, and the patches are re-applied immediately below, so a hard
+# reset is the right move and makes re-running this script idempotent.
+git -C "$SRC_ROOT/sglang" reset --hard --quiet
+git -C "$SRC_ROOT/sglang" clean -fdq
 git -C "$SRC_ROOT/sglang" checkout --quiet "$SGLANG_PIN"
 echo "  sglang at $SGLANG_PIN ($(git -C "$SRC_ROOT/sglang" rev-parse --short HEAD))"
 # Training needs the patched source (bf16-base64 transport, chunked-prefill

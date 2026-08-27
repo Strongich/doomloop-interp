@@ -95,6 +95,19 @@ if [[ "$COLOCATE" == "1" ]]; then
   COLOCATE_FLAGS=(--colocate --num-gpus-per-node "$NUM_GPUS_PER_NODE")
 fi
 
+# The AV was SFT'd with enable_thinking=False, and nla_generate.py omits that
+# kwarg, so Qwen3 would default it to True and the policy would run
+# off-distribution (D43). natural_language_autoencoders/ is gitignored and cloned
+# per machine, so this edit is not carried by our history — verify it is present.
+NLA_GEN_PY="$NLA_REPO/nla/rollout/nla_generate.py"
+if [[ -f "$NLA_GEN_PY" ]] && ! grep -q "enable_thinking=False" "$NLA_GEN_PY"; then
+  echo "ERROR: $NLA_GEN_PY does not pass enable_thinking=False." >&2
+  echo "Qwen3 would prefill its own <think> block and every rollout would fail." >&2
+  echo "Apply it with:" >&2
+  echo "  $RL_PYTHON scripts/patch_nla_nonthinking.py --nla-repo $NLA_REPO" >&2
+  exit 1
+fi
+
 # --- CUDA forward-compat guard. ---
 # miles injects a hardcoded LD_LIBRARY_PATH into every sglang engine actor's Ray
 # runtime_env, putting /usr/local/cuda/compat FIRST ("so a forward-compat

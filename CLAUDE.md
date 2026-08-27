@@ -15,9 +15,17 @@ it change as the loop tightens?
 
 The plan is to make those activations *readable* by training a **Natural
 Language Autoencoder (NLA)** on the target model, then verbalizing `h_l` at
-doom-loop token positions along real reasoning traces (math problems from
-GSM8K / AIME2025 / AMC23) and comparing them against healthy reasoning
-positions.
+self-doubt token positions along real reasoning traces (math problems from
+GSM8K / AIME2025 / AMC23).
+
+**The contrast is recovered-vs-failed, NOT doubt-phrase-vs-healthy-phrase.**
+Measured on 5 traces (D33): self-doubt markers are ordinary reasoning behaviour
+at every difficulty — even a 260-token GSM8K trace that answers correctly carries
+3 of them, at a *higher* density (11.5/1k tokens) than the AIME trace that
+derailed (6.3/1k). Phrase-matching would therefore file the same `Hmm` under both
+labels. So the case study reads `h_l` at the same marker phrases in traces that
+**reach a correct `\boxed{}` answer** versus traces that **produce no answer at
+all** (budget exhausted inside `<think>`), and asks the NLA what differs.
 
 So the pipeline has two halves, and they are at very different maturity:
 1. **NLA machinery** (the instrument) — mostly scaffolded, not yet trained.

@@ -900,3 +900,50 @@ backwards. Measured at 1143 steps: AV train loss 1.3642@500 -> 1.4584@1143, AR F
 
 v1 artifacts are preserved for reproduction: `warmstart/v1_leaky/` (parquets +
 sidecars + chunks) and `v1_leaky_checkpoints/`.
+
+### D33 — The case study is recovered-vs-failed, not phrase-vs-phrase
+
+First traces from the target model (`Qwen3-1.7B`, thinking mode, R1-style system
+prompt, Qwen sampling temp 0.6 / top_p 0.95 / top_k 20, 8192-token budget) over 5
+math problems spanning GSM8K -> AIME difficulty.
+
+Doom looping reproduces exactly as described: both AIME-level problems consumed
+the full 8192 tokens, never closed `<think>`, and produced no answer. The genuine
+derailment in `aime-hard` starts at token 4281 (52% through) — the same modular
+step re-derived 4x:
+`'0 mod7 => N = -1000(1 - A) mod7 => N = 1000(A -'`
+
+**But the obvious labelling scheme does not work.** Self-doubt marker density
+does not separate success from failure — it inverts:
+
+| trace | think tok | markers | density /1k | per-quarter | outcome |
+|---|---|---|---|---|---|
+| gsm8k-easy | 260 | 3 | **11.5** | [1,0,0,2] | correct |
+| trap | 1994 | 16 | 8.0 | [6,3,3,4] | correct |
+| amc23-ish | 4379 | 51 | **11.6** | [20,10,11,10] | correct |
+| aime-ish | 8192 | 80 | 9.8 | [27,22,17,14] | **no answer** |
+| aime-hard | 8192 | 52 | **6.3** | [7,12,18,15] | **no answer** |
+
+The highest-density trace answered correctly; the failure had the lowest density.
+The 4-gram repetition ratio inverts the same way (0.286 for the success vs 0.214
+for the failure), which is why `metrics.is_degenerate` requires BOTH signals.
+
+*"Wait, let me verify"* is therefore normal reasoning, not distress. What
+separates the failure is the **trajectory**: `aime-hard` is the only trace whose
+marker density rises toward the end ([7,12,18,15]) while every successful trace
+front-loads and decays. The loop lands inside that rising region.
+
+**Consequence for the study**: a doom-loop-vs-healthy split by phrase matching
+would put the same `Hmm` in both buckets and measure nothing. The contrast is the
+same marker phrase in a trace that **recovers** (correct `\boxed{}`) versus one
+that **produces no answer**, and the NLA's job is to say what differs in `h_l`.
+
+Caveats on this sample: n=5, and the reported loop in `aime-ish` at token 47 is a
+false positive — the model restating the problem's equation 3x, surfaced only
+because the probe used `min_repeats=3`. The project default is
+`DOOM_LOOP_MIN_REPEATS = 20` and the trace pipeline should keep it.
+
+**Next**: a trace-collection stage over the real GSM8K / AIME2025 / AMC23 sets
+(~50+ problems) recording, per trace, the marker positions inside `<think>`,
+whether `</think>` closed, whether a `\boxed{}` answer matched the gold, and the
+loop span if any — producing a labelled position set for the AV to verbalize.

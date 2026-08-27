@@ -75,19 +75,6 @@ if [[ "$COLOCATE" == "1" ]]; then
   COLOCATE_FLAGS=(--colocate --num-gpus-per-node "$NUM_GPUS_PER_NODE")
 fi
 
-# NLAFSDPActor refuses to start unless
-#   rollout_batch_size * n_samples_per_prompt == global_batch_size
-# (bypass: NLA_I_KNOW_WHAT_IM_DOING=1). Their header explains why it matters: the
-# FSDP path forces ONE optimizer step per rollout, so a mismatch does not change
-# the step count — it silently rescales gradients through the loss normalizer.
-# GLOBAL_BATCH defaults to exactly that product; this catches an override.
-if (( GLOBAL_BATCH != ROLLOUT_BATCH * SAMPLES_PER_PROMPT )); then
-  echo "ERROR: GLOBAL_BATCH=$GLOBAL_BATCH but ROLLOUT_BATCH x SAMPLES_PER_PROMPT" >&2
-  echo "= $((ROLLOUT_BATCH * SAMPLES_PER_PROMPT)). Their actor requires these to be equal:" >&2
-  echo "one optimizer step per rollout keeps training on-policy." >&2
-  exit 1
-fi
-
 # --- CUDA forward-compat guard. ---
 # miles injects a hardcoded LD_LIBRARY_PATH into every sglang engine actor's Ray
 # runtime_env, putting /usr/local/cuda/compat FIRST ("so a forward-compat
@@ -158,6 +145,19 @@ GLOBAL_BATCH="${GLOBAL_BATCH:-$((ROLLOUT_BATCH * SAMPLES_PER_PROMPT))}"
 # a 7B at d_model 3584; our 1.7B at 2048 has headroom, but the FLOP-equivalence
 # argument is about ratios, so start at their measured optimum.
 ACTOR_MICRO="${ACTOR_MICRO:-16}"
+
+# NLAFSDPActor refuses to start unless
+#   rollout_batch_size * n_samples_per_prompt == global_batch_size
+# (bypass: NLA_I_KNOW_WHAT_IM_DOING=1). Their header explains why it matters: the
+# FSDP path forces ONE optimizer step per rollout, so a mismatch does not change
+# the step count — it silently rescales gradients through the loss normalizer.
+# GLOBAL_BATCH defaults to exactly that product; this catches an override.
+if (( GLOBAL_BATCH != ROLLOUT_BATCH * SAMPLES_PER_PROMPT )); then
+  echo "ERROR: GLOBAL_BATCH=$GLOBAL_BATCH but ROLLOUT_BATCH x SAMPLES_PER_PROMPT" >&2
+  echo "= $((ROLLOUT_BATCH * SAMPLES_PER_PROMPT)). Their actor requires these to be equal:" >&2
+  echo "one optimizer step per rollout keeps training on-policy." >&2
+  exit 1
+fi
 
 # --- Their hyperparameters, copied. ---
 # Production parity LRs at 1.41e-5 = the 1e-5 scan winner scaled by sqrt(2) for

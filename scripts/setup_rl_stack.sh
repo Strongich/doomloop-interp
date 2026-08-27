@@ -136,6 +136,16 @@ if ! command -v cargo >/dev/null 2>&1; then
   echo "  WARNING: no cargo on PATH. If the sglang build fails on Rust, run:" >&2
   echo "    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" >&2
 fi
+# sglang-grpc's build.rs shells out to protoc; without it cargo dies with
+# 'Could not find `protoc`' after several minutes of compiling.
+if ! command -v protoc >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "  installing protobuf-compiler"
+    apt-get install -y -qq protobuf-compiler || echo "  WARNING: protoc install failed" >&2
+  else
+    echo "  WARNING: no protoc; sglang-grpc will fail to build." >&2
+  fi
+fi
 
 echo "=== 3. SGLang from source + the NLA input_embeds patches ==="
 if [[ ! -d "$SRC_ROOT/sglang/.git" ]]; then

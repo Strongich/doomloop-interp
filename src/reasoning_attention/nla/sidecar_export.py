@@ -82,7 +82,17 @@ def build_model_sidecar(
             "injection_right_neighbor_id": right,
             "critic_suffix_ids": suffix_ids,
         },
-        "prompt_templates": {"av": AV_TEMPLATE, "ar": AR_TEMPLATE},
+        # Their loader formats the actor template as
+        # `actor_template.format(injection_char=...)` (`nla/schema.py`
+        # compute_canonical_neighbors), so the exported template must use THEIR
+        # field name. Ours says {placeholder} — the one documented deviation from
+        # their verbatim template — so translate it on the way out and leave the
+        # in-repo constant alone. The AR template needs no translation: both call
+        # the field {explanation}.
+        "prompt_templates": {
+            "av": AV_TEMPLATE.replace("{placeholder}", "{injection_char}"),
+            "ar": AR_TEMPLATE,
+        },
         "critic": {"extraction_layer_index": cfg.ar_num_layers},
     }
 

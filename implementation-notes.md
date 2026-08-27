@@ -861,3 +861,42 @@ for the size of the effect.
 v1; a good v2 should beat that but will not approach 0.58. A lower, leak-free
 number is the better result for the doom-loop study, where the question is what
 the model represents at a position, not which token sits there.
+
+### D32 — Stage-1 results: v1 vs v2, and what the ablations showed
+
+Warm-start complete on both prompt versions. All numbers held-out, ~2% tail.
+
+| | reference (Qwen2.5-7B) | ours v1 (their prompt) | ours v2 (leak-free) |
+|---|---|---|---|
+| AR final loss | 0.586 | 0.3022 | 0.5587 |
+| AR baseline | 0.938 | 0.7279 | 0.7285 |
+| **AR FVE** | **0.375** | **0.5848** | **0.2331** |
+| AV loss @ step 300 | 1.5 | — | 1.368 |
+| AV held-out | not published | interrupted | 1.3609 (ppl 3.90) |
+| `critic_rand` | ~0 (0.922/0.938) | not run | **~0** (-0.07..+0.02 @ step 300) |
+| masked ablation | **not run** | 0.141 (-74%) | ~0.12 (-50%) |
+| verbatim leak | undocumented | ~84% | **0** (0.56% caught + dropped) |
+
+**Their 0.375 is not comparable to our 0.2331** — theirs used the leaky prompt.
+The like-for-like number is our v1 **0.5848**, which exceeds their 0.375 (smaller
+model, lower-dimensional target, and our baseline is lower, which makes FVE
+harder to score, not easier). So we reproduce their recipe and beat it, then show
+~60% of that score was surface-form lookup.
+
+The two controls answer different questions and both are needed:
+- `critic_rand` (shuffled pairing) ~0 confirms the AR needs the *correct*
+  explanation — it is not scoring off a generic prior.
+- The masked ablation confirms *why* it needs it. On v1 removing quotes cost 74%;
+  on v2 removing the final-feature paragraph costs ~50%, which is not a leak —
+  `h_l` is read AT the final token, so its description is legitimately the most
+  informative feature, and the remaining ~50% coming from the other two means the
+  signal is distributed rather than a single lookup.
+
+**Epochs back to 1.** Their `--num-rollout 1000` is one pass over their half, and
+the pass is what matters, not the step count — D28's 3-epoch reasoning had this
+backwards. Measured at 1143 steps: AV train loss 1.3642@500 -> 1.4584@1143, AR FVE
+0.2011@580 -> 0.1753@1143, held-out better than final train loss in both. Epochs
+1-2 bought nothing and cost mild overfitting. One epoch is ~381 steps.
+
+v1 artifacts are preserved for reproduction: `warmstart/v1_leaky/` (parquets +
+sidecars + chunks) and `v1_leaky_checkpoints/`.

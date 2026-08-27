@@ -44,14 +44,54 @@ if [[ ! -f "$MILES_TRAIN" ]]; then
   exit 1
 fi
 
-# --- GPU layout: 2xA100. Theirs is 8+4+4; three roles must share two devices. ---
-# Ray hangs on placement if the roles ask for more GPUs than exist, so colocation
-# is not optional here.
+# --- GPU layout: 2xA100. Theirs is 8 actor + 4 critic + 4 rollout = 16. ---
+# miles sizes ONE placement group for every role up front
+# (miles/ray/placement_group.py:create_placement_groups) and Ray then blocks
+# forever if the total exceeds the cluster — no error, no timeout, just a live
+# process at idle CPU with no worker actors and empty nvidia-smi. Observed with
+# 2/2/2: the non-colocate branch asks for actor + rollout + critic = 6 GPUs.
+#
+# The two branches that matter here:
+#   default:     actor + rollout + critic   -> 2+2+2 = 6  (hangs)
+#   --colocate:  actor + critic             -> 2+0+2 = 4  (still hangs)
+# --colocate folds the sglang engines onto the ACTOR's GPUs and ignores
+# --rollout-num-gpus, but the critic always gets its own. So the only layout
+# that fits two devices is 1 actor (sharing with rollout) + 1 critic.
+COLOCATE="${COLOCATE:-1}"
 ACTOR_NODES="${ACTOR_NODES:-1}"
-ACTOR_GPUS="${ACTOR_GPUS:-2}"
+ACTOR_GPUS="${ACTOR_GPUS:-1}"
 CRITIC_NODES="${CRITIC_NODES:-1}"
-CRITIC_GPUS="${CRITIC_GPUS:-2}"
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-2}"
+CRITIC_GPUS="${CRITIC_GPUS:-1}"
+# Ignored under --colocate (miles sets it to ACTOR_GPUS * ACTOR_NODES); kept so
+# COLOCATE=0 on a bigger box still works.
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-1}"
+# Defaults to 8 in miles. Its own help: "If you are going to use less than 8 gpus
+# per node under colocate mode, you should set this number."
+NUM_GPUS_PER_NODE="${NUM_GPUS_PER_NODE:-2}"
+COLOCATE_FLAGS=()
+if [[ "$COLOCATE" == "1" ]]; then
+  # --colocate also forces --offload, so the actor is swapped to CPU while sglang
+  # generates and back for the training pass. That is the cost of two devices.
+  COLOCATE_FLAGS=(--colocate --num-gpus-per-node "$NUM_GPUS_PER_NODE")
+fi
+
+# Guard the arithmetic above rather than rediscovering the hang. Mirrors
+# create_placement_groups: colocate drops the rollout term, nothing drops critic.
+VISIBLE_GPUS="$("$RL_PYTHON" -c "import torch;print(torch.cuda.device_count())")"
+if [[ "$COLOCATE" == "1" ]]; then
+  WANT_GPUS=$((ACTOR_NODES * ACTOR_GPUS + CRITIC_NODES * CRITIC_GPUS))
+else
+  WANT_GPUS=$((ACTOR_NODES * ACTOR_GPUS + ROLLOUT_GPUS + CRITIC_NODES * CRITIC_GPUS))
+fi
+if (( WANT_GPUS > VISIBLE_GPUS )); then
+  echo "ERROR: this layout needs $WANT_GPUS GPUs but only $VISIBLE_GPUS are visible." >&2
+  echo "Ray would wait on the placement group forever instead of failing." >&2
+  echo "  actor  ${ACTOR_NODES}x${ACTOR_GPUS}" >&2
+  echo "  critic ${CRITIC_NODES}x${CRITIC_GPUS}" >&2
+  [[ "$COLOCATE" == "1" ]] && echo "  rollout colocated with actor" >&2 \
+                          || echo "  rollout ${ROLLOUT_GPUS}" >&2
+  exit 1
+fi
 
 # --- Batch. ---
 # ROLLOUT_BATCH is NOT a memory knob. It is the number of prompts per RL step;
@@ -128,7 +168,7 @@ cat <<EOM
    data          $RL_PARQUET
    actor ckpt    $ACTOR_SFT_CKPT
    critic ckpt   $CRITIC_SL_CKPT
-   gpus          actor $ACTOR_GPUS / critic $CRITIC_GPUS / rollout $ROLLOUT_GPUS
+   gpus          actor $ACTOR_GPUS / critic $CRITIC_GPUS / rollout $([[ "$COLOCATE" == "1" ]] && echo "colocated with actor" || echo "$ROLLOUT_GPUS")  ($WANT_GPUS of $VISIBLE_GPUS visible)
    batch         $ROLLOUT_BATCH prompts x $SAMPLES_PER_PROMPT samples = $GLOBAL_BATCH
    lr            actor $ACTOR_LR / critic $CRITIC_LR  (1.41e-5 x sqrt($GLOBAL_BATCH/1024))
    kl coef       $KL_LOSS_COEF
@@ -178,6 +218,7 @@ exec "$RL_PYTHON" "$MILES_TRAIN" \
     --critic-num-nodes "$CRITIC_NODES" \
     --critic-num-gpus-per-node "$CRITIC_GPUS" \
     --rollout-num-gpus "$ROLLOUT_GPUS" \
+    "${COLOCATE_FLAGS[@]}" \
     --rollout-max-response-len "$MAX_RESPONSE_LEN" \
     --rollout-max-context-len "$MAX_CONTEXT_LEN" \
     `# REQUIRED. The radix cache keys on token IDs, but we inject a different` \

@@ -1200,3 +1200,60 @@ Revised expectation for the 400-step probe: the ~47s/step figure from their note
 was measured at `rollout_batch=64x8` on their hardware without offload swapping,
 so it is now a floor rather than an estimate. Real step time gets measured, not
 predicted.
+
+## D40 — miles' hardcoded cuda-compat path breaks CUDA in the sglang engines
+
+With the placement group fixed (D39), the run got further and died in
+`SGLangEngine.init()`:
+
+```
+RuntimeError: No accelerator (CUDA, XPU, HPU, NPU) is available.
+  sglang/srt/server_args.py:825 _handle_missing_default_values -> get_device()
+```
+
+Misleading message: `nvidia-smi` was healthy, the driver was fine, and
+`torch.cuda.is_available()` was True everywhere else. Not a GPU-visibility
+problem either — miles deliberately sets `NOSET_VISIBLE_DEVICES_ENV_VARS_LIST`
+so the engine sees every device and selects via `base_gpu_id`.
+
+The cause is the `LD_LIBRARY_PATH` miles injects into each engine actor's Ray
+`runtime_env` (`miles/ray/rollout.py`):
+
+```python
+"LD_LIBRARY_PATH": f"/usr/local/cuda/compat:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:{sys.prefix}/lib",
+```
+
+Its comment says "cuda-compat first so a forward-compat libcuda.so wins if
+present". Forward-compat libs exist for a driver **older** than the toolkit. Here
+the box is the other way round:
+
+| | version |
+|---|---|
+| kernel driver (`/sys/module/nvidia/version`) | **580.105.08** |
+| `/usr/local/cuda-13.0/compat/libcuda.so.*` | **580.65.06** |
+
+so the stale compat `libcuda.so.1` shadowed the real one and CUDA init failed with
+`Error 803: system has unsupported display driver / cuda driver combination`.
+
+Bisected the path entry by entry:
+
+| LD_LIBRARY_PATH | `torch.cuda.is_available()` |
+|---|---|
+| unset | True |
+| miles' full string | **False** |
+| `/usr/local/cuda/compat` alone | **False** |
+| miles' string minus compat | True |
+
+So `compat` is the entire problem; the CUDA-13 `lib64` alongside a cu128 torch is
+harmless (torch uses its own bundled runtime).
+
+Fix: `mv /usr/local/cuda-13.0/compat{,.disabled-mismatched-driver}`. We cannot
+override this from our side — Ray `runtime_env` env_vars beat the launcher's — and
+patching the pinned miles clone would be undone by the `reset --hard` in
+`setup_rl_stack.sh`. Disabling the directory is also simply correct here: a compat
+lib older than the running driver has no legitimate use.
+
+`train_grpo.sh` now **detects** the mismatch (compares the compat lib's version
+against the live driver with `sort -V`) and refuses to launch with the exact `mv`
+command, rather than silently mutating `/usr/local` or letting the run die 90
+seconds in with a message about accelerators that points nowhere near the cause.

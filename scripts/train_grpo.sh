@@ -75,6 +75,32 @@ if [[ "$COLOCATE" == "1" ]]; then
   COLOCATE_FLAGS=(--colocate --num-gpus-per-node "$NUM_GPUS_PER_NODE")
 fi
 
+# --- CUDA forward-compat guard. ---
+# miles injects a hardcoded LD_LIBRARY_PATH into every sglang engine actor's Ray
+# runtime_env, putting /usr/local/cuda/compat FIRST ("so a forward-compat
+# libcuda.so wins if present", miles/ray/rollout.py). Compat libs are for a
+# driver OLDER than the toolkit. When the driver is NEWER, that libcuda shadows
+# the real one and CUDA init fails inside the engine with
+#   Error 803: system has unsupported display driver / cuda driver combination
+# surfacing as sglang's "No accelerator (CUDA, XPU, HPU, NPU) is available."
+# while nvidia-smi and the driver process are perfectly healthy. We cannot
+# override it — runtime_env env_vars win over ours — so check it here.
+COMPAT_DIR="$(readlink -f /usr/local/cuda 2>/dev/null || true)/compat"
+if [[ -d "$COMPAT_DIR" ]]; then
+  DRV="$(cat /sys/module/nvidia/version 2>/dev/null || echo unknown)"
+  COMPAT_LIB="$(ls "$COMPAT_DIR"/libcuda.so.*.* 2>/dev/null | head -1)"
+  COMPAT_VER="${COMPAT_LIB##*/libcuda.so.}"
+  if [[ -n "$COMPAT_VER" && "$DRV" != "unknown" ]] &&
+     [[ "$(printf '%s\n' "$COMPAT_VER" "$DRV" | sort -V | head -1)" == "$COMPAT_VER" ]] &&
+     [[ "$COMPAT_VER" != "$DRV" ]]; then
+    echo "ERROR: $COMPAT_DIR holds libcuda $COMPAT_VER but the driver is $DRV." >&2
+    echo "The compat lib is OLDER than the driver, so it will break CUDA init in" >&2
+    echo "the sglang engine actors (error 803). Disable it:" >&2
+    echo "  mv $COMPAT_DIR $COMPAT_DIR.disabled-mismatched-driver" >&2
+    exit 1
+  fi
+fi
+
 # Guard the arithmetic above rather than rediscovering the hang. Mirrors
 # create_placement_groups: colocate drops the rollout term, nothing drops critic.
 VISIBLE_GPUS="$("$RL_PYTHON" -c "import torch;print(torch.cuda.device_count())")"

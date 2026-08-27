@@ -166,14 +166,31 @@ import sys
 
 import torch
 
-expected_torch = "2.6.0"
+# Step 1 seeds torch 2.6.0+cu124, but `sglang[all]==0.5.8` resolves its own
+# torch and wins: measured 2.6.0+cu124 -> 2.9.1+cu128. That is FINE and is not
+# worth fighting — cu128 ships sm_80 kernels, the A100 is sm_80, and sgl-kernel
+# + flashinfer were resolved against that same torch. So do not pin a torch
+# version here; assert only the things that actually broke a launch:
+#   - transformers major version, because the critic checkpoint's
+#     tokenizer_config.json is not readable across the 4.x/5.x boundary
+#     (`extra_special_tokens` is a dict in 4.x, a list in 5.x)
+#   - no vLLM, which drags a cu130 torch and transformers 5.x (D21)
+#   - CUDA actually usable
 problems = []
-if not torch.__version__.startswith(expected_torch):
-    problems.append(f"torch is {torch.__version__}, expected {expected_torch}+cu124")
-if "cu124" not in torch.__version__:
-    problems.append(f"torch {torch.__version__} is not a cu124 build")
+expected_transformers = "4."
+if not md.version("transformers").startswith(expected_transformers):
+    problems.append(
+        f"transformers is {md.version('transformers')}, expected {expected_transformers}x "
+        "— the critic tokenizer_config.json format is not cross-major readable"
+    )
 if not torch.cuda.is_available():
     problems.append("torch.cuda.is_available() is False")
+if torch.cuda.is_available():
+    caps = {torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())}
+    arch = {int(a.split("_")[1]) for a in torch.cuda.get_arch_list() if a.startswith("sm_")}
+    missing = {c for c in caps if c[0] * 10 + c[1] not in arch}
+    if missing:
+        problems.append(f"torch {torch.__version__} has no kernels for device caps {missing}")
 try:
     if md.version("vllm"):
         problems.append("vLLM is installed here — it will fight the pinned torch")
@@ -184,7 +201,10 @@ if problems:
     for p in problems:
         print(f"  - {p}", file=sys.stderr)
     sys.exit(1)
-print(f"stack verify OK: torch {torch.__version__}, sglang {md.version('sglang')}")
+print(
+    f"stack verify OK: torch {torch.__version__}, "
+    f"transformers {md.version('transformers')}, sglang {md.version('sglang')}"
+)
 PYCHECK
 
 cat <<EOM

@@ -36,6 +36,12 @@ PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 MILES_PIN="$(cut -d@ -f2 "$NLA_REPO/nla/miles_patches/UPSTREAM_PIN")"
 MILES_REPO="${MILES_REPO:-https://github.com/radixark/miles.git}"
 SGLANG_REPO="${SGLANG_REPO:-https://github.com/sgl-project/sglang.git}"
+# PIN IT. The NLA input_embeds patches match specific source lines; an unpinned
+# clone gets whatever main is today and `apply_sglang_patches.sh` fails with
+# "pattern matched 0 times — sglang source changed, patch manually". The tag must
+# agree with the sglang version in requirements/rl.txt (0.5.9) so the editable
+# install and the pinned wheel deps describe the same code.
+SGLANG_PIN="${SGLANG_PIN:-v0.5.9}"
 # cu124 per the reference's setup note; A100 is sm_80 so cu124 is fine.
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu124}"
 
@@ -118,6 +124,9 @@ echo "=== 3. SGLang from source + the NLA input_embeds patches ==="
 if [[ ! -d "$SRC_ROOT/sglang/.git" ]]; then
   git clone "$SGLANG_REPO" "$SRC_ROOT/sglang"
 fi
+git -C "$SRC_ROOT/sglang" fetch --all --tags --quiet
+git -C "$SRC_ROOT/sglang" checkout --quiet "$SGLANG_PIN"
+echo "  sglang at $SGLANG_PIN ($(git -C "$SRC_ROOT/sglang" rev-parse --short HEAD))"
 # Training needs the patched source (bf16-base64 transport, chunked-prefill
 # slicing, retract-path KV fix) — a wheel will not do.
 bash "$NLA_REPO/patches/apply_sglang_patches.sh" "$SRC_ROOT/sglang"

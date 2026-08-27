@@ -64,8 +64,13 @@ def main() -> None:
     print(f"loading AV from {args.checkpoint} (injection_scale={cfg.injection_scale})")
     nla = NLA.from_pretrained(cfg)
 
-    col = pq.ParquetFile(args.parquet).read_row_group(0, columns=["activation_vector"])
-    vecs = np.asarray(col.column("activation_vector").to_pylist()[: args.n], dtype=np.float32)
+    # Slice BEFORE to_pylist(). A row group here is ~100k rows x 2048 floats, and
+    # materializing that as Python floats takes minutes and gigabytes — the same
+    # trap their data_source hit (list -> np.asarray, ~2.6s GC stalls).
+    pf = pq.ParquetFile(args.parquet)
+    batch = next(pf.iter_batches(batch_size=args.n, columns=["activation_vector"]))
+    flat = batch.column("activation_vector").flatten().to_numpy(zero_copy_only=False)
+    vecs = flat.astype(np.float32).reshape(len(batch), -1)[: args.n]
     print(f"{len(vecs)} activations, norms {vecs.__abs__().max():.0f} max, "
           f"L2 {np.linalg.norm(vecs, axis=1).mean():.0f} mean\n")
 

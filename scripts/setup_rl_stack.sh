@@ -117,12 +117,7 @@ for patch in "$NLA_REPO"/nla/miles_patches/*.patch; do
     echo "  SKIP $(basename "$patch") — already applied or does not apply"
   fi
 done
-# ring_flash_attn assumes flash-attn is present; needed when not using build_conda.sh.
-"${PIP[@]}" flash-attn --no-build-isolation || {
-  echo "  WARNING: flash-attn build failed. Miles' ring_flash_attn needs it, and" >&2
-  echo "  the reference RL config runs --attn-implementation flash_attention_2." >&2
-  echo "  Install a matching prebuilt wheel for your CUDA/torch before training." >&2
-}
+# flash-attn is installed in step 3b — AFTER sglang, which pins torch.
 "${PIP[@]}" -e "$SRC_ROOT/miles"
 
 echo "=== 3. SGLang from source + the NLA input_embeds patches ==="
@@ -135,13 +130,49 @@ git -C "$SRC_ROOT/sglang" fetch --all --tags --quiet
 # ours and disposable, and the patches are re-applied immediately below, so a hard
 # reset is the right move and makes re-running this script idempotent.
 git -C "$SRC_ROOT/sglang" reset --hard --quiet
-git -C "$SRC_ROOT/sglang" clean -fdq
+# -x so IGNORED files go too. setuptools_scm writes python/sglang/_version.py,
+# which is gitignored: a plain `clean -fdq` leaves a stale one behind and the
+# rebuilt package then reports the PREVIOUS checkout's version (observed:
+# a correct v0.5.8 tree installing as "sglang 0.5.18").
+git -C "$SRC_ROOT/sglang" clean -fdqx
 git -C "$SRC_ROOT/sglang" checkout --quiet "$SGLANG_PIN"
 echo "  sglang at $SGLANG_PIN ($(git -C "$SRC_ROOT/sglang" rev-parse --short HEAD))"
 # Training needs the patched source (bf16-base64 transport, chunked-prefill
 # slicing, retract-path KV fix) — a wheel will not do.
 bash "$NLA_REPO/patches/apply_sglang_patches.sh" "$SRC_ROOT/sglang"
 "${PIP[@]}" -e "$SRC_ROOT/sglang/python[all]"
+
+echo "=== 3b. flash-attn, built against the torch sglang settled on ==="
+# ORDER MATTERS. flash-attn ships a compiled extension bound to torch's C++ ABI,
+# and step 2's install would bind it to step 1's torch — which step 3 then
+# replaces (sglang v0.5.8 hard-pins torch==2.9.1). Symptom, at import inside
+# miles' FSDP actor: "flash_attn_2_cuda...so: undefined symbol:
+# _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_jb". So install it LAST.
+#
+# There is no prebuilt FA2 wheel for torch 2.9 (the v2.8.3 release tops out at
+# cu12torch2.8), so this compiles. Two things make that work:
+#   - CUDA_HOME must point at an nvcc whose major.minor matches torch's CUDA, or
+#     torch's own _check_cuda_version aborts the build. The image ships 13.0
+#     against a cu128 torch; `apt-get install -y cuda-nvcc-12-8` supplies 12.8.
+#   - TORCH_CUDA_ARCH_LIST pins the single arch we run on, turning a very long
+#     multi-arch build into a short one.
+FA_CUDA_HOME="${FA_CUDA_HOME:-/usr/local/cuda-12.8}"
+FA_ARCH_LIST="${FA_ARCH_LIST:-8.0}"   # A100 = sm_80
+# --no-deps is NOT optional: `--force-reinstall` without it re-resolves the whole
+# tree and pulls a cu13 torch, undoing steps 1-3 (this is D21's hazard again).
+if [[ -x "$FA_CUDA_HOME/bin/nvcc" ]]; then
+  CUDA_HOME="$FA_CUDA_HOME" PATH="$FA_CUDA_HOME/bin:$PATH" \
+    TORCH_CUDA_ARCH_LIST="$FA_ARCH_LIST" MAX_JOBS="${FA_MAX_JOBS:-48}" \
+    FLASH_ATTENTION_FORCE_BUILD=TRUE \
+    "${PIP[@]}" flash-attn --no-build-isolation --no-deps --no-cache-dir || {
+      echo "  WARNING: flash-attn build failed. Miles' ring_flash_attn imports it" >&2
+      echo "  unconditionally in the FSDP actor, so training will not start." >&2
+    }
+else
+  echo "  WARNING: no nvcc at $FA_CUDA_HOME/bin/nvcc — skipping flash-attn." >&2
+  echo "  Install one matching torch's CUDA ($("$RL_ROOT/bin/python" -c 'import torch;print(torch.version.cuda)')):" >&2
+  echo "    apt-get install -y cuda-nvcc-12-8" >&2
+fi
 
 echo "=== 4. the reference nla package + ours ==="
 "${PIP[@]}" -e "$NLA_REPO"
@@ -156,7 +187,10 @@ echo "=== 4. the reference nla package + ours ==="
 "${PIP[@]}" -e "$PROJECT_ROOT" --no-deps
 
 echo "=== 5. verify ==="
-"$RL_ROOT/bin/python" -c "import miles, sglang, nla; print('miles + sglang + nla import OK')"
+# Import miles.backends.fsdp_utils, not just miles: that is the module that
+# pulls ring_flash_attn -> flash_attn, where a torch-ABI mismatch surfaces. A
+# bare `import miles` passes happily with a broken flash_attn.
+"$RL_ROOT/bin/python" -c "import miles.backends.fsdp_utils, sglang, nla, flash_attn; print('miles(fsdp) + sglang + nla + flash_attn import OK')"
 # Assert the pinned stack actually survived. An import check alone passes happily
 # on a torch that something upgraded underneath us, and the prebuilt sgl-kernel
 # wheel is compiled against a specific torch ABI.

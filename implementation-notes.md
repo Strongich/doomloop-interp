@@ -977,7 +977,7 @@ flashinfer-python 0.6.1, miles 0.2.1, nla 0.1.0, no vLLM.
 `load_nla_config` on `critic_rl` died with `AttributeError: 'list' object has no
 attribute 'keys'` inside `_set_model_specific_special_tokens`. Cause: the
 tokenizer files `convert_ar_to_critic.py` copied out of the AR checkpoint were
-written by the **training** venv's transformers 5.16, and
+written by the **training** venv's transformers 5.9.0, and
 `tokenizer_config.json` is not backward-readable across the major version —
 `extra_special_tokens` serializes as a **dict** in 4.x and a **list** in 5.x
 (5.x also adds `backend`, `is_local`, `local_files_only`). The RL venv pins
@@ -1063,3 +1063,54 @@ artifact that also rewards verbosity and courts OOM via length drift.
 Standing caveat from the top of `TRAINING_NOTES.md`, worth repeating: "These are
 the settings we used, not settings we claim are optimal. We did not sweep batch
 size, learning rate, or GRPO group size for RL."
+
+## D37 — flash-attn must be installed AFTER sglang, and needs a matching nvcc
+
+The preflight never reached its first check:
+
+```
+ImportError: .../flash_attn_2_cuda.cpython-311-x86_64-linux-gnu.so:
+  undefined symbol: _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_jb
+```
+
+That symbol lives in `libc10_cuda`, so this is a torch C++ ABI mismatch, reached
+through `miles.backends.fsdp_utils.actor` -> `ring_flash_attn` -> `flash_attn`.
+An **ordering** bug in `setup_rl_stack.sh`: flash-attn was installed in step 2,
+binding it to step 1's torch 2.6.0+cu124, and step 3 then replaced torch with
+2.9.1+cu128. Step 2 didn't compile — it silently took the prebuilt
+`cu12torch2.6` wheel, which is why nothing failed at install time.
+
+Moved to a new **step 3b**, after sglang. Consequences worth recording:
+
+- **torch 2.9.1 is correct, not an accident.** The `v0.5.8` tree (HEAD
+  `0189f41c30`, tagged, 2026-01-23) hard-pins `torch==2.9.1` in
+  `python/pyproject.toml`. D34 accepted this version on kernel-coverage grounds;
+  it is in fact what sglang requires. `sgl-kernel 0.3.21` and
+  `flashinfer-python 0.6.1` are resolved against the same torch. flash-attn was
+  the only package out of step.
+- **No prebuilt FA2 wheel exists for torch 2.9.** The v2.8.x releases top out at
+  `cu12torch2.8`; everything newer on the releases page is FA4 beta with no cp311
+  assets. So step 3b compiles from source.
+- **The build needs an nvcc matching torch's CUDA.** The image ships CUDA **13.0**
+  only, and torch's `_check_cuda_version` aborts: *"The detected CUDA version
+  (13.0) mismatches the version that was used to compile PyTorch (12.8)"*.
+  `nvidia-cuda-nvcc-cu12==12.8.*` from PyPI is NOT enough — it ships `ptxas` and
+  `nvvm` but no `nvcc` driver binary. `apt-get install -y cuda-nvcc-12-8` supplies
+  a real one at `/usr/local/cuda-12.8` (the CUDA apt repo is already configured in
+  this image). `TORCH_CUDA_ARCH_LIST=8.0` keeps it to the one arch we run on.
+- **`--no-deps` is mandatory on that install.** A first attempt with
+  `--force-reinstall` and no `--no-deps` began re-resolving the whole tree and
+  downloading `nvidia-nccl-cu13` + triton — D21's hazard from a new direction.
+  Killed mid-download; the venv was verified intact afterwards (torch 2.9.1+cu128,
+  transformers 4.57.1, sglang, sgl-kernel 0.3.21 all unchanged).
+
+Also fixed alongside: `git clean -fdq` on the sglang clone becomes **`-fdqx`**.
+setuptools_scm writes `python/sglang/_version.py`, which is gitignored, so a plain
+clean left a stale one from the earlier v0.5.9 attempt and the correctly
+checked-out v0.5.8 tree installed itself as **"sglang 0.5.18"**. Cosmetic here —
+the code and its pyproject were genuinely v0.5.8 — but it is exactly the kind of
+misreported version that sends you chasing the wrong dependency.
+
+And the verify block now imports `miles.backends.fsdp_utils` rather than bare
+`miles`, since that is the module that actually pulls flash_attn. `import miles`
+alone passed cleanly against the broken extension.

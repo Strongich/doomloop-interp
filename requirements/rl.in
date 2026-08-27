@@ -7,7 +7,12 @@
 #
 # torch is deliberately unpinned here and installed FIRST from the cu124 index by
 # the setup script. Pinning it in this file would fight that.
-sglang[all]>=0.5.6
+# PINNED, not >=. The NLA input_embeds patches anchor on exact source lines and
+# stop applying at 0.5.9 (three fields were appended to `reset_for_retract`
+# between the anchor and `def offload_kv_cache`). An open bound here resolved to
+# 0.5.9 while setup_rl_stack.sh builds v0.5.8 from source, so the manifest and the
+# installed code disagreed. Keep this equal to SGLANG_PIN in setup_rl_stack.sh.
+sglang[all]==0.5.8
 transformers
 accelerate
 ray

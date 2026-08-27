@@ -2,8 +2,6 @@
 #    uv pip compile requirements/rl.in --python-version 3.11 --index-strategy unsafe-best-match -o requirements/rl.txt
 accelerate==1.14.0
     # via -r requirements/rl.in
-addict==2.4.0
-    # via sglang
 aiohappyeyeballs==2.7.1
     # via aiohttp
 aiohttp==3.14.3
@@ -43,8 +41,6 @@ blobfile==3.0.0
     # via sglang
 build==1.5.0
     # via sglang
-cache-dit==1.2.0
-    # via sglang
 certifi==2026.7.22
     # via
     #   httpcore
@@ -60,9 +56,7 @@ click==8.4.2
     #   ray
     #   uvicorn
 cloudpickle==3.1.2
-    # via
-    #   outlines
-    #   sglang
+    # via outlines
 compressed-tensors==0.15.0.1
     # via sglang
 cuda-bindings==12.9.7
@@ -75,14 +69,8 @@ cuda-python==12.9.0
     #   sglang
 datasets==5.0.1
     # via sglang
-decorator==5.3.1
-    # via moviepy
 decord2==3.4.0
     # via sglang
-diffusers==0.36.0
-    # via
-    #   cache-dit
-    #   sglang
 dill==0.4.1
     # via
     #   datasets
@@ -105,16 +93,15 @@ filelock==3.32.4
     # via
     #   blobfile
     #   datasets
-    #   diffusers
     #   huggingface-hub
     #   modelscope
     #   modelscope-hub
     #   ray
     #   torch
     #   transformers
-flashinfer-cubin==0.6.3
+flashinfer-cubin==0.6.1
     # via sglang
-flashinfer-python==0.6.3
+flashinfer-python==0.6.1
     # via sglang
 frozenlist==1.8.0
     # via
@@ -127,20 +114,17 @@ fsspec==2026.6.0
     #   torch
 gguf==0.19.0
     # via sglang
-googleapis-common-protos==1.75.1
-    # via
-    #   opentelemetry-exporter-otlp-proto-grpc
-    #   opentelemetry-exporter-otlp-proto-http
-grpcio==1.83.0
+grpcio==1.75.1
     # via
     #   grpcio-health-checking
     #   grpcio-reflection
-    #   opentelemetry-exporter-otlp-proto-grpc
+    #   grpcio-tools
     #   sglang
-    #   smg-grpc-proto
-grpcio-health-checking==1.83.0
+grpcio-health-checking==1.75.1
     # via sglang
-grpcio-reflection==1.83.0
+grpcio-reflection==1.75.1
+    # via sglang
+grpcio-tools==1.75.1
     # via sglang
 h11==0.16.0
     # via
@@ -159,7 +143,6 @@ httpx==0.28.1
     # via
     #   -r requirements/rl.in
     #   datasets
-    #   diffusers
     #   openai
 httpx2==2.12.0
     # via anthropic
@@ -167,13 +150,10 @@ huggingface-hub==0.36.2
     # via
     #   accelerate
     #   datasets
-    #   diffusers
     #   sglang
     #   timm
     #   tokenizers
     #   transformers
-humanize==4.16.0
-    # via runai-model-streamer
 idna==3.19
     # via
     #   anyio
@@ -181,16 +161,6 @@ idna==3.19
     #   httpx2
     #   requests
     #   yarl
-imageio==2.36.0
-    # via
-    #   moviepy
-    #   sglang
-imageio-ffmpeg==0.5.1
-    # via
-    #   moviepy
-    #   sglang
-importlib-metadata==9.0.0
-    # via diffusers
 interegular==0.3.3
     # via
     #   outlines
@@ -233,8 +203,6 @@ modelscope==1.39.1
     # via sglang
 modelscope-hub==0.2.0
     # via modelscope
-moviepy==2.2.1
-    # via sglang
 mpmath==1.3.0
     # via sympy
 msgpack==1.2.1
@@ -262,16 +230,11 @@ numpy==2.4.6
     #   accelerate
     #   datasets
     #   decord2
-    #   diffusers
     #   flashinfer-python
     #   gguf
-    #   imageio
-    #   moviepy
     #   nvidia-cutlass-dsl
-    #   opencv-python-headless
     #   outlines
     #   pandas
-    #   runai-model-streamer
     #   scipy
     #   sglang
     #   soundfile
@@ -332,39 +295,6 @@ openai==2.6.1
     # via sglang
 openai-harmony==0.0.4
     # via sglang
-opencv-python-headless==4.10.0.84
-    # via sglang
-opentelemetry-api==1.44.0
-    # via
-    #   opentelemetry-exporter-otlp-proto-grpc
-    #   opentelemetry-exporter-otlp-proto-http
-    #   opentelemetry-sdk
-    #   opentelemetry-semantic-conventions
-    #   sglang
-opentelemetry-exporter-otlp==1.44.0
-    # via sglang
-opentelemetry-exporter-otlp-proto-common==1.44.0
-    # via
-    #   opentelemetry-exporter-otlp-proto-grpc
-    #   opentelemetry-exporter-otlp-proto-http
-opentelemetry-exporter-otlp-proto-grpc==1.44.0
-    # via
-    #   opentelemetry-exporter-otlp
-    #   sglang
-opentelemetry-exporter-otlp-proto-http==1.44.0
-    # via opentelemetry-exporter-otlp
-opentelemetry-proto==1.44.0
-    # via
-    #   opentelemetry-exporter-otlp-proto-common
-    #   opentelemetry-exporter-otlp-proto-grpc
-    #   opentelemetry-exporter-otlp-proto-http
-opentelemetry-sdk==1.44.0
-    # via
-    #   opentelemetry-exporter-otlp-proto-grpc
-    #   opentelemetry-exporter-otlp-proto-http
-    #   sglang
-opentelemetry-semantic-conventions==0.65b0
-    # via opentelemetry-sdk
 orjson==3.12.0
     # via
     #   -r requirements/rl.in
@@ -394,13 +324,8 @@ pexpect==4.9.0
     # via ipython
 pillow==11.3.0
     # via
-    #   diffusers
-    #   imageio
-    #   moviepy
     #   sglang
     #   torchvision
-proglog==0.1.12
-    # via moviepy
 prometheus-client==0.26.0
     # via sglang
 prompt-toolkit==3.0.53
@@ -409,14 +334,12 @@ propcache==0.5.2
     # via
     #   aiohttp
     #   yarl
-protobuf==7.36.0
+protobuf==6.33.6
     # via
-    #   googleapis-common-protos
     #   grpcio-health-checking
     #   grpcio-reflection
-    #   opentelemetry-proto
+    #   grpcio-tools
     #   ray
-    #   smg-grpc-proto
 psutil==7.2.2
     # via
     #   accelerate
@@ -460,20 +383,16 @@ pyproject-hooks==1.2.0
     # via build
 python-dateutil==2.9.0.post0
     # via pandas
-python-dotenv==1.2.3
-    # via moviepy
 python-multipart==0.0.32
     # via sglang
 pyyaml==6.0.1
     # via
     #   -r requirements/rl.in
     #   accelerate
-    #   cache-dit
     #   datasets
     #   gguf
     #   huggingface-hub
     #   ray
-    #   sglang
     #   timm
     #   transformers
 pyzmq==27.2.0
@@ -489,21 +408,16 @@ referencing==0.37.0
     #   outlines
 regex==2026.7.19
     # via
-    #   diffusers
     #   tiktoken
     #   transformers
-remote-pdb==2.1.0
-    # via sglang
 requests==2.34.2
     # via
     #   datasets
-    #   diffusers
     #   flashinfer-python
     #   gguf
     #   huggingface-hub
     #   modelscope
     #   modelscope-hub
-    #   opentelemetry-exporter-otlp-proto-http
     #   outlines
     #   ray
     #   sglang
@@ -513,13 +427,10 @@ rpds-py==2026.6.3
     # via
     #   jsonschema
     #   referencing
-runai-model-streamer==0.16.1
-    # via sglang
 safetensors==0.8.0
     # via
     #   -r requirements/rl.in
     #   accelerate
-    #   diffusers
     #   timm
     #   transformers
 scipy==1.17.1
@@ -530,23 +441,19 @@ setproctitle==1.3.7
     # via sglang
 setuptools==84.0.0
     # via
-    #   imageio-ffmpeg
+    #   grpcio-tools
     #   modelscope
 sgl-kernel==0.3.21
     # via sglang
-sglang==0.5.9
+sglang==0.5.8
     # via -r requirements/rl.in
 six==1.17.0
     # via python-dateutil
-smg-grpc-proto==0.4.14
-    # via sglang
 sniffio==1.3.1
     # via
     #   anthropic
     #   openai
 soundfile==0.13.1
-    # via sglang
-st-attn==0.0.7
     # via sglang
 stack-data==0.6.3
     # via ipython
@@ -565,19 +472,15 @@ tokenizers==0.22.2
 torch==2.9.1
     # via
     #   accelerate
-    #   cache-dit
     #   compressed-tensors
     #   flashinfer-python
     #   outlines
     #   quack-kernels
-    #   runai-model-streamer
     #   sglang
-    #   st-attn
     #   timm
     #   torch-c-dlpack-ext
     #   torchaudio
     #   torchvision
-    #   vsa
     #   xgrammar
 torch-c-dlpack-ext==0.1.5
     # via quack-kernels
@@ -604,7 +507,6 @@ tqdm==4.70.0
     #   modelscope-hub
     #   openai
     #   outlines
-    #   proglog
     #   sglang
     #   transformers
 traitlets==5.16.1
@@ -614,7 +516,6 @@ traitlets==5.16.1
 transformers==4.57.1
     # via
     #   -r requirements/rl.in
-    #   cache-dit
     #   compressed-tensors
     #   sglang
     #   xgrammar
@@ -640,11 +541,6 @@ typing-extensions==4.16.0
     #   ipython
     #   nvidia-cutlass-dsl
     #   openai
-    #   opentelemetry-api
-    #   opentelemetry-exporter-otlp-proto-grpc
-    #   opentelemetry-exporter-otlp-proto-http
-    #   opentelemetry-sdk
-    #   opentelemetry-semantic-conventions
     #   outlines
     #   pydantic
     #   pydantic-core
@@ -667,8 +563,6 @@ uvicorn==0.52.4
     # via sglang
 uvloop==0.22.1
     # via sglang
-vsa==0.0.4
-    # via sglang
 wcwidth==0.8.2
     # via prompt-toolkit
 xgrammar==0.1.27
@@ -677,5 +571,3 @@ xxhash==4.0.1
     # via datasets
 yarl==1.24.5
     # via aiohttp
-zipp==4.1.0
-    # via importlib-metadata

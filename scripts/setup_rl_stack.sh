@@ -129,7 +129,7 @@ done
 # context parallelism needs it, so make the import lazy. Without this,
 # `import miles.backends.fsdp_utils` raises ImportError under transformers 5.12.1.
 "$RL_ROOT/bin/python" "$PROJECT_ROOT/scripts/patch_miles_ring_attn.py" \
-  --miles-src "$SRC_ROOT/miles"
+  --miles-src "$SRC_ROOT/miles" || echo "  (skipped — upstream moved it; the ring_flash_attn fix below is the load-bearing one)"
 
 "${PIP[@]}" -e "$SRC_ROOT/miles"
 
@@ -236,6 +236,10 @@ echo "=== 4. the reference nla package + ours ==="
 # runtime dep it uses in this env (torch, transformers, pyarrow, yaml, numpy) is
 # already pinned by the manifest.
 "${PIP[@]}" -e "$PROJECT_ROOT" --no-deps
+
+echo "=== 4a. ring-flash-attn transformers-5.x fallback ==="
+# Must run AFTER every install step, since a reinstall restores the stock file.
+"$RL_ROOT/bin/python" "$PROJECT_ROOT/scripts/patch_ring_flash_attn.py" --venv "$RL_ROOT"
 
 echo "=== 4b. system shared libs sgl_kernel dlopens ==="
 # sgl_kernel's compiled extension links libnuma. It is NOT a pip dependency, so

@@ -107,6 +107,17 @@ if [[ -f "$NLA_GEN_PY" ]] && ! grep -q "enable_thinking=False" "$NLA_GEN_PY"; th
   echo "  $RL_PYTHON scripts/patch_nla_nonthinking.py --nla-repo $NLA_REPO" >&2
   exit 1
 fi
+# Same class of check: under transformers 5.x, apply_chat_template(tokenize=True)
+# returns a BatchEncoding, and compute_canonical_neighbors iterates it expecting
+# list[int]. Every config load goes through that function.
+NLA_SCHEMA_PY="$NLA_REPO/nla/schema.py"
+if [[ -f "$NLA_SCHEMA_PY" ]] && ! grep -q 'hasattr(ids, "keys")' "$NLA_SCHEMA_PY"; then
+  echo "ERROR: $NLA_SCHEMA_PY does not unwrap BatchEncoding." >&2
+  echo "Neighbor verification would report the injection token 0x and abort." >&2
+  echo "Apply it with:" >&2
+  echo "  $RL_PYTHON scripts/patch_nla_batchencoding.py --nla-repo $NLA_REPO" >&2
+  exit 1
+fi
 
 # --- CUDA forward-compat guard. ---
 # miles injects a hardcoded LD_LIBRARY_PATH into every sglang engine actor's Ray

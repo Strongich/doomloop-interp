@@ -36,6 +36,10 @@ COLS = [
     ("fve_nrm", "train/fve_nrm", "{:>8.3f}"),
     ("mse", "critic/loss", "{:>7.3f}"),
     ("grad", "train/grad_norm", "{:>6.2f}"),
+    # train<->rollout logprob mismatch. ~0.001 healthy; ~0.20 means the rollout
+    # transport is corrupting the injected embeddings (TRAINING_NOTES.md:277).
+    # Only present with --get-mismatch-metrics (TIS_METRICS=1).
+    ("tis_k3", "train/tis_k3", "{:>8.4f}"),
     ("resp_len", "rollout/total_lengths", "{:>8.1f}"),
     ("trunc", "rollout/truncated", "{:>6.2f}"),
     ("lr", "train/lr-pg_0", "{:>9.2e}"),

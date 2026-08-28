@@ -239,6 +239,40 @@ else
   KL_FLAGS=()
 fi
 
+# --- rollout transport --------------------------------------------------
+# Every request ships the prompt's whole embedding matrix. nla_generate picks
+# the encoding at rollout/nla_generate.py:221:
+#
+#   bf16_safe = sglang_disable_radix_cache and scale < 1000
+#   if _BF16_B64_EMBEDS or bf16_safe: <bf16-base64>  else: <fp32 JSON>
+#
+# Our injection_scale is EXACTLY 1000 and the gate is `< 1000`, so we take the
+# fp32 branch: ~12 MB of JSON per request against ~2.8 MB for bf16-base64
+# (their line 54). At 512 requests/rollout that is ~6 GB serialized on the
+# single RolloutManager event loop — measured pinned at 100% of one core while
+# sglang idled at 2.3 concurrent requests (server cap 4096, semaphore 512, KV
+# usage 0.00) and step time sat at 158s against their documented ~47s at the
+# same 64x8 batch.
+#
+# BF16_EMBEDS=1 sets the env override, taking the compact path without touching
+# injection_scale. Their gate is labelled a heuristic and is aimed at gemma27b
+# at scale 60000 (~4% KL spikes); we are 60x below that. It is still a numerics
+# change, so it is OFF by default and TIS_METRICS is the check: `tis_k3` is the
+# train<->rollout logprob mismatch, ~0.001 when the transport is right and ~0.20
+# when it is wrong (TRAINING_NOTES.md:277).
+if [[ "${BF16_EMBEDS:-0}" == "1" ]]; then
+  export NLA_BF16_B64_EMBEDS=1
+fi
+
+# metrics_only returns pg_loss unchanged — pure observation, so it is on by
+# default. Without --get-mismatch-metrics the tis_* keys are never computed.
+if [[ "${TIS_METRICS:-1}" == "1" ]]; then
+  TIS_FLAGS=(--get-mismatch-metrics
+             --custom-tis-function-path "${TIS_FUNCTION:-nla.tis_metrics.metrics_only}")
+else
+  TIS_FLAGS=()
+fi
+
 # Per-step ~1 GB embedding dump. /tmp is overlayfs (disk, ~1.5s/step); /dev/shm is
 # tmpfs. Needs >= 8g of shm.
 export NLA_EMBED_DUMP_DIR="${NLA_EMBED_DUMP_DIR:-/dev/shm/nla}"
@@ -262,6 +296,8 @@ cat <<EOM
    response cap  $MAX_RESPONSE_LEN
    rollouts      $NUM_ROLLOUT  (theirs: 4199 ~= 55h on 2 GPUs)
    inj scale     $INJECTION_SCALE  (mse_scale comes from the checkpoint sidecar)
+   embeds        $([[ "${BF16_EMBEDS:-0}" == "1" ]] && echo "bf16-base64 (~2.8MB/req, FORCED past the scale<1000 gate)" || echo "fp32 JSON (~12MB/req — the default at scale $INJECTION_SCALE)")
+   tis metrics   $([[ "${TIS_METRICS:-1}" == "1" ]] && echo "on — watch tis_k3: ~0.001 good, ~0.20 means the transport is wrong" || echo "off")
 ==============================================================
 EOM
 
@@ -283,6 +319,20 @@ for ckpt in "$ACTOR_SFT_CKPT" "$CRITIC_SL_CKPT"; do
     exit 1
   fi
 done
+
+# The tis function is imported by path inside the training process; a typo
+# would surface as a crash tens of GPU-minutes in, after Ray and sglang start.
+if [[ "${TIS_METRICS:-1}" == "1" ]]; then
+  "$RL_PYTHON" -c "
+import importlib, sys
+mod, _, fn = sys.argv[1].rpartition('.')
+getattr(importlib.import_module(mod), fn)
+" "${TIS_FUNCTION:-nla.tis_metrics.metrics_only}" || {
+    echo "ERROR: cannot import ${TIS_FUNCTION:-nla.tis_metrics.metrics_only}" >&2
+    echo "  Set TIS_METRICS=0 to run without the mismatch diagnostic." >&2
+    exit 1
+  }
+fi
 
 cd "$NLA_REPO"
 # cd into the miles root to match their invocation exactly. Every path we pass
@@ -343,6 +393,7 @@ exec "$RL_PYTHON" "$MILES_TRAIN" \
     `# NO --gradient-checkpointing: it deadlocks NCCL in update_weights() —` \
     `# FSDP's full-param gather changes, the broadcast hangs, watchdog SIGABRTs.` \
     "${KL_FLAGS[@]}" \
+    "${TIS_FLAGS[@]}" \
     --save-interval "$SAVE_INTERVAL" \
     --loss-mask-type "${LOSS_MASK_TYPE:-qwen}" \
     "$@"

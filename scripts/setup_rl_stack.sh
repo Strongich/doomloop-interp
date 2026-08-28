@@ -124,6 +124,13 @@ for patch in "$NLA_REPO"/nla/miles_patches/*.patch; do
   fi
 done
 # flash-attn is installed in step 3b — AFTER sglang, which pins torch.
+# Our own patch, applied after theirs: ring-flash-attn 0.1.8 (its latest) imports
+# a symbol transformers 5.x removed, and miles pulls it at module scope. Only
+# context parallelism needs it, so make the import lazy. Without this,
+# `import miles.backends.fsdp_utils` raises ImportError under transformers 5.12.1.
+"$RL_ROOT/bin/python" "$PROJECT_ROOT/scripts/patch_miles_ring_attn.py" \
+  --miles-src "$SRC_ROOT/miles"
+
 "${PIP[@]}" -e "$SRC_ROOT/miles"
 
 # sglang >= v0.5.15 pulls build deps with no cp311 wheels (granian, and friends)

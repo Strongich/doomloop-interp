@@ -306,6 +306,25 @@ if [[ "$WANTS_BF16" == "1" ]]; then
   [[ "${BF16_EMBEDS:-0}" == "1" ]] && export NLA_BF16_B64_EMBEDS=1
 fi
 
+# --- rollout POST fan-out (D47) ------------------------------------------
+# The fp32 payload is ~12 MB/request and 512 requests per rollout are encoded on
+# ONE asyncio loop: measured RolloutManager pinned at 100% of a single core on a
+# 256-core box while sglang idled at 2.3 concurrent requests and step time sat at
+# 158s vs their ~47s. --use-distributed-post moves the POST (and its json
+# encoding) onto Ray actors, and hands the payload over via Ray's binary
+# serialization instead of an inline json.dumps on the caller.
+#
+# miles creates `num_gpus_per_node` actors per node (http_utils.py:274) — the
+# MILES_HTTP_POST_ACTORS_PER_NODE in its docstring is NOT read by the code. So
+# this buys us 2 posters, not 256: expect roughly 2x on the serialization share,
+# not a full close of the 3.4x gap. Numerics are untouched, which is why this is
+# worth trying before rebasing nla_input_embeds_b64.patch.
+if [[ "${DISTRIBUTED_POST:-0}" == "1" ]]; then
+  DPOST_FLAGS=(--use-distributed-post)
+else
+  DPOST_FLAGS=()
+fi
+
 # metrics_only returns pg_loss unchanged — pure observation, so it is on by
 # default. Without --get-mismatch-metrics the tis_* keys are never computed.
 if [[ "${TIS_METRICS:-1}" == "1" ]]; then
@@ -339,6 +358,7 @@ cat <<EOM
    rollouts      $NUM_ROLLOUT  (theirs: 4199 ~= 55h on 2 GPUs)
    inj scale     $INJECTION_SCALE  (mse_scale comes from the checkpoint sidecar)
    embeds        $([[ "${BF16_EMBEDS:-0}" == "1" ]] && echo "bf16-base64 (~2.8MB/req, FORCED past the scale<1000 gate)" || echo "fp32 JSON (~12MB/req — the default at scale $INJECTION_SCALE)")
+   post fan-out  $([[ "${DISTRIBUTED_POST:-0}" == "1" ]] && echo "on — $NUM_GPUS_PER_NODE Ray POST actors (watch perf/train_wait_time)" || echo "off — all 512 requests encoded on one event loop")
    tis metrics   $([[ "${TIS_METRICS:-1}" == "1" ]] && echo "on — watch tis_k3: ~0.001 good, ~0.20 means the transport is wrong" || echo "off")
 ==============================================================
 EOM
@@ -436,6 +456,7 @@ exec "$RL_PYTHON" "$MILES_TRAIN" \
     `# FSDP's full-param gather changes, the broadcast hangs, watchdog SIGABRTs.` \
     "${KL_FLAGS[@]}" \
     "${TIS_FLAGS[@]}" \
+    "${DPOST_FLAGS[@]}" \
     --save-interval "$SAVE_INTERVAL" \
     --loss-mask-type "${LOSS_MASK_TYPE:-qwen}" \
     "$@"

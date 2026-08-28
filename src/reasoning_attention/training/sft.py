@@ -55,7 +55,8 @@ from reasoning_attention.training.data import (
     AVBatch,
     AVCollator,
     AVDataset,
-    predict_mean_baseline,
+    Baselines,
+    predict_mean_baselines,
 )
 
 # Untuned defaults. Every one of these is a placeholder chosen to make the loop
@@ -130,8 +131,12 @@ class StepLog:
     lr: float
     grad_norm: float
     seconds: float
-    # AR only.
+    # AR only. `fve` is the HEADLINE, against the rawvar baseline — the metric
+    # Stage-2 GRPO logs as `fve_nrm` and the one the reference publishes.
+    # `fve_meannorm` is the looser achievable-floor variant, kept because it is
+    # what their warm-start 37.5% is quoted against.
     fve: float | None = None
+    fve_meannorm: float | None = None
     # AV only.
     perplexity: float | None = None
     # AR only — watched because a direction-only loss lets |pred| drift upward.
@@ -233,11 +238,18 @@ def ar_loss(
 def fraction_variance_explained(mse: float, baseline: float) -> float:
     """`1 - MSE/baseline` — the paper's FVE.
 
-    `baseline` is the achievable predict-the-mean loss from
-    `data.predict_mean_baseline`, fixed for the dataset, so the number is
-    comparable across steps and runs. The reference's warm-start reached
-    **37.5%** by this measure (0.586 against a 0.938 baseline); joint RL takes it
-    to 0.6-0.8.
+    `baseline` is a fixed dataset-level predict-the-mean loss from
+    `data.predict_mean_baselines`, never a per-batch variance, so the number is
+    comparable across steps and runs.
+
+    WHICH baseline decides what the number means (see `data.Baselines`). Pass
+    `rawvar` for the headline: that is what miles' `fve_nrm` divides by, so it
+    is the only version comparable to our own Stage-2 logs or to the reference's
+    published 0.752. Pass `meannorm` for the looser achievable-floor reading —
+    their warm-start's **37.5%** (0.586 against 0.938) is quoted against that.
+
+    The two are far apart. On our AR corpus the same checkpoint scores 0.233
+    (meannorm 0.729) and 0.063 (rawvar 0.596); joint RL takes rawvar to 0.6-0.8.
     """
     if baseline == 0.0:
         return float("nan")
@@ -469,10 +481,13 @@ def main() -> None:
         )
         collate = ARCollator(tokenizer.pad_token_id or 0, dataset.scale)
 
-    # Fixed FVE denominator for the AR — the achievable predict-the-mean loss,
-    # the reference's `load_predict_mean_baselines`.
-    baseline = (
-        predict_mean_baseline(dataset.activations, dataset.scale) if args.stage == "ar" else 0.0
+    # Fixed FVE denominators for the AR, the reference's
+    # `load_predict_mean_baselines`. Both are computed; `rawvar` is the headline
+    # (it is what Stage-2 `fve_nrm` uses), `meannorm` is logged beside it.
+    baselines = (
+        predict_mean_baselines(dataset.activations, dataset.scale)
+        if args.stage == "ar"
+        else Baselines(0.0, 0.0)
     )
 
     n_eval = max(1, int(len(dataset) * args.eval_frac)) if len(dataset) > 20 else 0
@@ -532,7 +547,12 @@ def main() -> None:
         f"lora={f'r{args.lora_r}' if args.lora else 'off (full finetune)'} "
         f"lr={args.learning_rate:.2e} eff_batch={effective_batch} "
         f"{_scale_key(args.stage)}={dataset.scale}"
-        + (f" fve_baseline={baseline:.4f}" if args.stage == "ar" else "")
+        + (
+            f" fve_baseline={baselines.rawvar:.4f} (rawvar, headline)"
+            f" / {baselines.meannorm:.4f} (meannorm)"
+            if args.stage == "ar"
+            else ""
+        )
     )
 
     out_dir = Path(args.output_dir) / f"{args.stage}_sft"
@@ -551,7 +571,10 @@ def main() -> None:
             else:
                 loss, predictions, targets = ar_loss(model, batch, device, dataset.scale)
                 extra = {
-                    "fve": fraction_variance_explained(float(loss.detach()), baseline),
+                    "fve": fraction_variance_explained(float(loss.detach()), baselines.rawvar),
+                    "fve_meannorm": fraction_variance_explained(
+                        float(loss.detach()), baselines.meannorm
+                    ),
                     "pred_norm": float(predictions.detach().float().norm(dim=-1).mean()),
                 }
             (loss / args.grad_accum).backward()
@@ -591,7 +614,7 @@ def main() -> None:
                     metric = (
                         f"ppl {entry.perplexity:.2f}"
                         if entry.perplexity is not None
-                        else f"FVE {entry.fve:.4f}"
+                        else f"FVE {entry.fve:.4f} (mn {entry.fve_meannorm:.4f})"
                     )
                     print(
                         f"  epoch {epoch} step {step}/{total_steps} "
@@ -622,15 +645,21 @@ def main() -> None:
         if args.stage == "av":
             eval_summary["perplexity"] = math.exp(eval_summary["loss"])
         else:
-            eval_summary["fve"] = fraction_variance_explained(eval_summary["loss"], baseline)
+            eval_summary["fve"] = fraction_variance_explained(
+                eval_summary["loss"], baselines.rawvar
+            )
+            eval_summary["fve_meannorm"] = fraction_variance_explained(
+                eval_summary["loss"], baselines.meannorm
+            )
             eval_summary["pred_norm"] = float(torch.cat(preds).norm(dim=-1).mean())
         print(f"eval: {json.dumps({k: round(v, 4) for k, v in eval_summary.items()})}")
         if wandb_run is not None:
             wandb_run.summary.update({f"eval/{k}": v for k, v in eval_summary.items()})
 
     if wandb_run is not None:
-        # The dataset-level FVE denominator, so a run is interpretable on its own.
-        wandb_run.summary["fve_baseline"] = baseline
+        # The dataset-level FVE denominators, so a run is interpretable on its own.
+        wandb_run.summary["fve_baseline"] = baselines.rawvar
+        wandb_run.summary["fve_baseline_meannorm"] = baselines.meannorm
         # Name the knob by what it IS for this stage. The AV injects at
         # injection_scale (1000); the AR injects nothing — its scale is mse_scale
         # (sqrt(d_model) = 45.25), the norm BOTH prediction and target are mapped to
@@ -649,7 +678,8 @@ def main() -> None:
                 "rows": len(dataset),
                 "trainable_params": n_trainable,
                 _scale_key(args.stage): dataset.scale,
-                "fve_baseline": baseline,
+                "fve_baseline": baselines.rawvar,
+                "fve_baseline_meannorm": baselines.meannorm,
                 "steps": [asdict(entry) for entry in logs],
                 "eval": eval_summary,
             },

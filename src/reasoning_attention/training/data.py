@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -122,7 +122,7 @@ def shuffled_activations(activations: np.ndarray, seed: int) -> np.ndarray:
     measured 0.922 against a 0.938 baseline, i.e. FVE ~= 0, and as the AV's
     "random baseline" where the real run sat ~0.21 lower in loss.
 
-    The permutation reuses the same multiset of vectors, so `predict_mean_baseline`
+    The permutation reuses the same multiset of vectors, so `predict_mean_baselines`
     is bit-identical between the real and control runs and the two FVEs are
     directly comparable. That is the whole point of the control: only the pairing
     changes.
@@ -295,23 +295,52 @@ class ARCollator:
         )
 
 
-def predict_mean_baseline(
+class Baselines(NamedTuple):
+    """The two predict-the-mean FVE denominators, as the reference computes them.
+
+    `rawvar` is the HEADLINE. Both are needed because they answer different
+    questions and the reference reports both under confusingly similar names
+    (`nla/schema.py:compute_predict_mean_baselines`):
+
+    - `meannorm` = `MSE(gold_norm, normalize(mu))` — the *achievable* floor. The
+      AR's output is normalized too, so a signal-free AR can only emit one
+      constant direction, and `mu` projected back to the sphere is its best one.
+      FVE > 0 against this means the AR beats a constant. Their shuffled-target
+      control lands here.
+    - `rawvar` = `MSE(gold_norm, mu)` — the classical FVE denominator. `mu` of
+      unit-sphere vectors lies *inside* the sphere, so this is the SMALLER and
+      therefore HARSHER number, and the resulting FVE is lower.
+
+    `docs/inference.md:476` is explicit that normalizing the mean "inflates FVE"
+    and that the released `fve_nrm` figures (0.752 for Qwen2.5-7B) use `rawvar`.
+    Stage-2 agrees: miles' `fve_nrm` divides by `nla_baseline_rawvar`
+    (`nla/train_actor.py:451`). So `rawvar` is the only one comparable to the
+    published numbers OR to our own GRPO logs, and reporting `meannorm` alone
+    made our warm-start look 0.233 where Stage 2 scored the same weights 0.063.
+
+    Their measured `meannorm` numbers: baseline 0.938, trained critic 0.586,
+    so `1 - 0.586/0.938 = 37.5%`; shuffled control 0.922, i.e. the baseline —
+    what a model with no real signal should get.
+    """
+
+    meannorm: float
+    rawvar: float
+
+
+def predict_mean_baselines(
     activations: np.ndarray, scale: float | None, sample_size: int = 20_000
-) -> float:
-    """The loss a constant predictor achieves — the FVE denominator.
+) -> Baselines:
+    """Both FVE denominators for `activations` — see `Baselines`.
 
-    This is the reference repo's `load_predict_mean_baselines`, not a plain
-    variance. Because the AR loss normalizes the *prediction* as well as the
-    target, the best a signal-free model can do is emit one constant direction,
-    so the honest denominator is `MSE(normalize(mean_gold), normalize(gold))`
-    averaged over the set — the achievable floor, not the raw spread.
-
-    Their measured numbers: baseline 0.938, trained critic 0.586, so
-    `FVE = 1 - 0.586/0.938 = 37.5%`. Their shuffled-target control scored 0.922,
-    i.e. essentially the baseline — exactly what a model with no real signal
-    should get.
+    Mirrors the reference's `nla.schema.compute_predict_mean_baselines`: scale
+    the golds to `scale`, take their mean `mu`, and measure the spread around
+    `normalize(mu)` and around `mu`.
     """
     rows = torch.from_numpy(activations[:sample_size])
     scaled = normalize_activation(rows, scale).float()
-    constant = normalize_activation(scaled.mean(dim=0, keepdim=True), scale).float()
-    return float(torch.mean((constant - scaled) ** 2).item())
+    mu = scaled.mean(dim=0, keepdim=True)
+    constant = normalize_activation(mu, scale).float()
+    return Baselines(
+        meannorm=float(torch.mean((constant - scaled) ** 2).item()),
+        rawvar=float(torch.mean((mu - scaled) ** 2).item()),
+    )

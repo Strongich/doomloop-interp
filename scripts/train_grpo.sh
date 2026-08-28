@@ -321,6 +321,11 @@ exec "$RL_PYTHON" "$MILES_TRAIN" \
     `# activation vector at the same marker token every time — a cache hit would` \
     `# silently return another activation's output. Do NOT remove to "optimize".` \
     --sglang-disable-radix-cache \
+    `# sglang >= 0.5.15 captures a "breakable" prefill CUDA graph, which raises` \
+    `# NotImplementedError: Breakable CUDA graph is not compatible with memory` \
+    `# saver mode. --colocate forces --offload, which needs the memory saver, so` \
+    `# the prefill graph is what has to give. Decode graphs are unaffected.` \
+    --sglang-disable-prefill-cuda-graph \
     --sglang-context-length "$MAX_CONTEXT_LEN" \
     --router-history-backend none \
     `# cache_aware routing builds a prefix tree holding request bodies; with` \

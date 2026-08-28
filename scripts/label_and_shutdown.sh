@@ -8,6 +8,15 @@
 #
 #   NO_SHUTDOWN=1 scripts/label_and_shutdown.sh     # keep the pod alive at the end
 #   LIMIT=2000 scripts/label_and_shutdown.sh        # small trial run
+#   N_DOCS=100000 scripts/label_and_shutdown.sh     # EXTEND an existing corpus
+#
+# Extending: set N_DOCS above what is already extracted and re-run. The script
+# extracts only the missing documents into a second shard, re-splits with the
+# existing doc->half assignment PINNED, and relabels nothing that already has a
+# summary. The reference trained on 100k docs x 5 positions = 500k pairs split
+# 250k/250k (configs/TRAINING_NOTES.md); our first pass did 40k docs = 200k
+# pairs, and the AR warm-start plateaued by step ~290 of 1143 — data-limited,
+# not undertrained (D46).
 #
 # Labeling runs against a locally served model, so it costs GPU time and no API
 # credit. Every stage is resumable: extract/split skip if their output exists, and
@@ -39,10 +48,36 @@ mkdir -p "$D"
 log () { echo "[$(date +%H:%M:%S)] $*"; }
 
 # --- 1. extract -----------------------------------------------------------
+# Shards, oldest first. split streams them IN THIS ORDER, which is what keeps
+# each half a prefix of its previous self and lets explain resume by offset.
+SHARDS=("$D/base.parquet")
+HAVE_DOCS=0
+if [[ -f "$D/base.parquet" ]]; then
+  HAVE_DOCS=$(uv run python -c "
+from reasoning_attention.datagen.sidecar import read_sidecar
+import sys
+m = read_sidecar(sys.argv[1])['extraction']
+print(m['corpus_start'] + m['n_documents'])
+" "$D/base.parquet")
+fi
+
 # Wait rather than start a second one: an extract may already be running in
 # another tmux session, and two writers on one parquet path corrupt it.
-if [[ -f "$D/base.parquet" ]]; then
-  log "extract: base.parquet exists, skipping"
+if [[ "$HAVE_DOCS" -ge "$N_DOCS" ]]; then
+  log "extract: base.parquet already covers $HAVE_DOCS >= $N_DOCS docs, skipping"
+elif [[ "$HAVE_DOCS" -gt 0 ]]; then
+  # Extend. Positions are drawn from an RNG keyed on (seed, doc_id), so a run
+  # over a disjoint document range merges row-for-row with the first one.
+  EXTRA="$D/base_${HAVE_DOCS}_${N_DOCS}.parquet"
+  SHARDS+=("$EXTRA")
+  if [[ -f "$EXTRA" ]]; then
+    log "extract: $EXTRA exists, skipping"
+  else
+    log "extract: extending by $((N_DOCS - HAVE_DOCS)) docs from offset $HAVE_DOCS"
+    uv run python -m reasoning_attention.datagen.extract \
+        --output "$EXTRA" --corpus-start "$HAVE_DOCS" \
+        --n-documents "$((N_DOCS - HAVE_DOCS))" --batch-size 16
+  fi
 elif pgrep -f "datagen.extract" >/dev/null; then
   log "extract: already running elsewhere — waiting for it"
   while pgrep -f "datagen.extract" >/dev/null; do sleep 60; done
@@ -55,11 +90,25 @@ else
 fi
 
 # --- 2. split -------------------------------------------------------------
-if [[ -f "$D/halves/av_half.parquet" ]]; then
-  log "split: halves exist, skipping"
+# Always re-run: with one shard this is a no-op rebuild, with two it appends the
+# new documents. --preserve-halves pins every doc already assigned, so the old
+# rows keep both their half and their position and the chunk cache stays valid.
+PRESERVE=()
+[[ -f "$D/halves/av_half.parquet" ]] && PRESERVE=(--preserve-halves "$D/halves")
+if [[ ${#SHARDS[@]} -eq 1 && -f "$D/halves/av_half.parquet" ]]; then
+  log "split: halves exist and there is nothing to add, skipping"
 else
-  log "split: partitioning by document into disjoint AV / AR halves"
-  uv run python -m reasoning_attention.datagen.split --base "$D/base.parquet" --output-dir "$D/halves"
+  log "split: partitioning ${#SHARDS[@]} shard(s) into disjoint AV / AR halves"
+  # The final chunk of a previous labelling run covers a PARTIAL slice; once the
+  # half grows, that same offset denotes a full chunk. Chunks written before the
+  # nla_input_rows key existed cannot report this, so drop the last one of each
+  # and let it be relabelled — a few hundred rows, versus silently losing them.
+  for half in av ar; do
+    last=$(ls -1 "$D/${half}_explained.parquet.chunks"/chunk_*.parquet 2>/dev/null | tail -1 || true)
+    [[ -n "$last" ]] && { log "split: dropping partial tail chunk $(basename "$last")"; rm -f "$last"; }
+  done
+  uv run python -m reasoning_attention.datagen.split \
+      --base "${SHARDS[@]}" --output-dir "$D/halves" "${PRESERVE[@]}"
 fi
 
 # --- 3. serve -------------------------------------------------------------
@@ -102,6 +151,8 @@ LIMIT_ARG=()
 # prevents the leak — measured 0/256 — but 0% on a sample is not 0% on 200k.
 REJECT_ARG=()
 [[ -n "${REJECT_VERBATIM:-1}" ]] && REJECT_ARG=(--reject-verbatim)
+# Resumes chunk-by-chunk: everything already labelled is skipped, so extending
+# costs GPU time only for the new rows.
 for half in av ar; do
   log "label: $half half"
   uv run python -m reasoning_attention.datagen.explain \

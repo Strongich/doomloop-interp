@@ -42,6 +42,38 @@ from reasoning_attention.datagen.sidecar import (
     write_sidecar,
 )
 
+# Written into each cached chunk so a later, longer run can tell a COMPLETE chunk
+# from one that was merely the short tail of a smaller input. Without it,
+# extending a corpus silently loses up to chunk_size rows: the final chunk of the
+# old run sits in the cache holding (say) 87 rows, the extended run computes the
+# same start offset for a now-full 512-row slice, sees the file, and skips it.
+# Chunks written before this existed have no key and are trusted as-is.
+_INPUT_ROWS_KEY = b"nla_input_rows"
+
+
+def _stamp_input_rows(table: pa.Table, n_input: int) -> dict[bytes, bytes]:
+    """Chunk metadata carrying how many INPUT rows the chunk was built from.
+
+    Not the same as the chunk's own row count — `explain_chunk` drops rows that
+    fail to parse, so a complete chunk is routinely shorter than its input.
+    """
+    existing = table.schema.metadata or {}
+    return {**existing, _INPUT_ROWS_KEY: str(n_input).encode()}
+
+
+def _cached_input_rows(chunk_path: Path) -> int | None:
+    """How many input rows a cached chunk covers, or None if it predates the key.
+
+    None is trusted, so chunks written before this key existed still resume. That
+    leaves exactly one blind spot — the final, partial chunk of a pre-existing
+    run — which the extend path in `label_and_shutdown.sh` deletes by hand before
+    resuming. Chunks written from now on carry the key and self-heal.
+    """
+    metadata = pq.read_schema(chunk_path).metadata or {}
+    raw = metadata.get(_INPUT_ROWS_KEY)
+    return int(raw) if raw is not None else None
+
+
 # How many unusable raw responses to keep for the error message when a chunk fails.
 _MAX_SAMPLE_FAILURES = 3
 
@@ -215,7 +247,8 @@ def main() -> None:
     n_resumed = 0
     n_leaked = 0
     for start, chunk_path in zip(starts, chunk_paths, strict=True):
-        if chunk_path.exists():
+        n_input = min(args.chunk_size, table.num_rows - start)
+        if chunk_path.exists() and _cached_input_rows(chunk_path) in (None, n_input):
             n_resumed += 1
             continue
         out_chunk, dropped, failures, leaked = explain_chunk(
@@ -239,7 +272,9 @@ def main() -> None:
         # tmp + rename so a kill mid-write can't leave a half-written chunk that
         # a later run would mistake for complete.
         tmp = chunk_path.with_suffix(".tmp")
-        pq.write_table(out_chunk, tmp)
+        pq.write_table(
+            out_chunk.replace_schema_metadata(_stamp_input_rows(out_chunk, n_input)), tmp
+        )
         tmp.rename(chunk_path)
         print(
             f"  chunk {start}: +{out_chunk.num_rows} rows, -{dropped} dropped, "

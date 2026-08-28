@@ -270,26 +270,40 @@ fi
 # applied on v0.5.8 (rl_setup2.log) but not on v0.5.15, where upstream had moved
 # the file, and setup_rl_stack.sh SKIPped it without failing. Check for the
 # decoder rather than trusting the flag.
-if [[ "${BF16_EMBEDS:-0}" == "1" ]]; then
+# The client takes the bf16 branch on EITHER condition, and `bf16_safe` never
+# checks whether the server can decode. We disable the radix cache always
+# (required for input_embeds), so the ONLY thing keeping us off the broken path
+# is injection_scale being exactly 1000 rather than < 1000. Lower the scale — a
+# rounding choice, e.g. 900 for a mean norm of ~800 — and the fast path turns
+# itself on with no flag set and the run dies at step 0. So gate on the EFFECTIVE
+# transport, not on BF16_EMBEDS.
+WANTS_BF16=0
+[[ "${BF16_EMBEDS:-0}" == "1" ]] && WANTS_BF16=1
+if awk "BEGIN{exit !($INJECTION_SCALE < 1000)}"; then WANTS_BF16=1; fi
+
+if [[ "$WANTS_BF16" == "1" ]]; then
+  WHY="BF16_EMBEDS=1"
+  [[ "${BF16_EMBEDS:-0}" != "1" ]] && \
+    WHY="injection_scale=$INJECTION_SCALE is < 1000, which turns on bf16 transport by itself"
   HTTP_SERVER="$("$RL_PYTHON" -c \
       "import sglang.srt.entrypoints.http_server as m; print(m.__file__)" 2>/dev/null)"
   if [[ -z "$HTTP_SERVER" || ! -f "$HTTP_SERVER" ]]; then
-    echo "ERROR: BF16_EMBEDS=1 but sglang.srt.entrypoints.http_server is not importable" >&2
-    echo "  from $RL_PYTHON. Fix the RL venv, or unset BF16_EMBEDS." >&2
+    echo "ERROR: $WHY, but sglang.srt.entrypoints.http_server is not importable" >&2
+    echo "  from $RL_PYTHON. Fix the RL venv." >&2
     exit 1
   fi
   if ! grep -q "input_embeds_b64_bf16" "$HTTP_SERVER"; then
-    echo "ERROR: BF16_EMBEDS=1 but the server-side bf16 decoder is missing from" >&2
+    echo "ERROR: $WHY, but the server-side bf16 decoder is missing from" >&2
     echo "  $HTTP_SERVER" >&2
     echo "  Every /generate would return 400 Bad Request and no rollout would" >&2
     echo "  complete. Apply patches/nla_input_embeds_b64.patch (it must be REBASED" >&2
     echo "  for sglang >= v0.5.15 — the upstream file moved), or run with" >&2
-    echo "  BF16_EMBEDS=0 and accept the fp32 path." >&2
+    echo "  BF16_EMBEDS=0 and an injection_scale >= 1000 to stay on fp32." >&2
     echo "  NOTE: --use-distributed-post is the numerics-free alternative for the" >&2
     echo "  same bottleneck — see D47." >&2
     exit 1
   fi
-  export NLA_BF16_B64_EMBEDS=1
+  [[ "${BF16_EMBEDS:-0}" == "1" ]] && export NLA_BF16_B64_EMBEDS=1
 fi
 
 # metrics_only returns pg_loss unchanged — pure observation, so it is on by

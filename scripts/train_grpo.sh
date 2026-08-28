@@ -260,7 +260,35 @@ fi
 # change, so it is OFF by default and TIS_METRICS is the check: `tis_k3` is the
 # train<->rollout logprob mismatch, ~0.001 when the transport is right and ~0.20
 # when it is wrong (TRAINING_NOTES.md:277).
+#
+# bf16 is a TWO-SIDED protocol and the server half is a separate patch. The
+# client sends `input_embeds_b64_bf16` + `input_embeds_shape`;
+# patches/nla_input_embeds_b64.patch teaches sglang's http_server.py to decode
+# them. Without it FastAPI validates a base64 STRING against a numeric-array
+# schema and answers 400 on every request — the run reaches step 0, generates
+# nothing, and dies. That is exactly what happened on 2026-08-28: the patch
+# applied on v0.5.8 (rl_setup2.log) but not on v0.5.15, where upstream had moved
+# the file, and setup_rl_stack.sh SKIPped it without failing. Check for the
+# decoder rather than trusting the flag.
 if [[ "${BF16_EMBEDS:-0}" == "1" ]]; then
+  HTTP_SERVER="$("$RL_PYTHON" -c \
+      "import sglang.srt.entrypoints.http_server as m; print(m.__file__)" 2>/dev/null)"
+  if [[ -z "$HTTP_SERVER" || ! -f "$HTTP_SERVER" ]]; then
+    echo "ERROR: BF16_EMBEDS=1 but sglang.srt.entrypoints.http_server is not importable" >&2
+    echo "  from $RL_PYTHON. Fix the RL venv, or unset BF16_EMBEDS." >&2
+    exit 1
+  fi
+  if ! grep -q "input_embeds_b64_bf16" "$HTTP_SERVER"; then
+    echo "ERROR: BF16_EMBEDS=1 but the server-side bf16 decoder is missing from" >&2
+    echo "  $HTTP_SERVER" >&2
+    echo "  Every /generate would return 400 Bad Request and no rollout would" >&2
+    echo "  complete. Apply patches/nla_input_embeds_b64.patch (it must be REBASED" >&2
+    echo "  for sglang >= v0.5.15 — the upstream file moved), or run with" >&2
+    echo "  BF16_EMBEDS=0 and accept the fp32 path." >&2
+    echo "  NOTE: --use-distributed-post is the numerics-free alternative for the" >&2
+    echo "  same bottleneck — see D47." >&2
+    exit 1
+  fi
   export NLA_BF16_B64_EMBEDS=1
 fi
 

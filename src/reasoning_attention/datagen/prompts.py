@@ -40,7 +40,7 @@ THINK_CLOSE = "</think>"
 # labels 97.4% of explanations quoted something, 82% of those quotes appeared
 # verbatim in the context, and 69.8% fell in the last six words, i.e. exactly where
 # h_l is read. See EXPLAIN_INSTRUCTION for the replacement and D31.
-EXPLAIN_INSTRUCTION_V1 = """A language model needs to predict what text comes next after a snippet which will be presented to you shortly. Identify the 2-3 most important features it would use for this prediction.
+EXPLAIN_INSTRUCTION_REFERENCE = """A language model needs to predict what text comes next after a snippet which will be presented to you shortly. Identify the 2-3 most important features it would use for this prediction.
 Focus on what the language model must be "thinking about" at the point where the provided text ends. You should not need to reference the fact that the text is truncated/incomplete/a prefix: the language model is causal, so only sees the prefix to what it predicts and this is implicit.
 Order features by what is most important for predicting the next tokens. Each feature should consist of a concise ~10-20 word description. Feel free to include specific textual examples inline.
 
@@ -68,7 +68,7 @@ Text to analyze:
 # v2 — describe, never quote. Same task, same format, same length budget; the only
 # change is that naming the text's own tokens is forbidden, so the AR has to
 # reconstruct h_l from the described *role* of the ending rather than its identity.
-EXPLAIN_INSTRUCTION = """A language model needs to predict what text comes next after a snippet which will be presented to you shortly. Identify the 2-3 most important features it would use for this prediction.
+EXPLAIN_INSTRUCTION_NOQUOTE = """A language model needs to predict what text comes next after a snippet which will be presented to you shortly. Identify the 2-3 most important features it would use for this prediction.
 Focus on what the language model must be attending to at the point where the provided text ends. You should not need to reference the fact that the text is truncated/incomplete/a prefix: the language model is causal, so only sees the prefix to what it predicts and this is implicit.
 Order features by what is most important for predicting the next tokens. Each feature should consist of a concise ~10-20 word description.
 
@@ -113,9 +113,37 @@ _LIST_PREFIX_RE = re.compile(
 _BOLD_WRAP_RE = re.compile(r"^\*\*(.+?)\*\*\s*")
 
 
-def build_explain_prompt(text: str) -> str:
+# Which instruction the datagen actually uses. `reference` is the DEFAULT and is
+# byte-identical to their `_DEFAULT_INSTRUCTION`
+# (nla/datagen/stage2_api_explain.py:35), verified by diff.
+#
+# D31 replaced it with `noquote` to stop explanations reproducing the context:
+# 97.4% of reference-prompt explanations quoted something, 82% verbatim, 69.8% in
+# the last six words — exactly where h_l is read. That was read as a leak. It is
+# better read as the SIGNAL: h_l at the final token substantially encodes those
+# tokens, and the reference invites naming them ("Feel free to include specific
+# textual examples inline") precisely because that is the most reconstructable
+# thing a summary can carry. Forbidding it left the labeler filling its 3-feature
+# budget with register and document structure — near-constant across the 5
+# positions sampled from one document — and our AR warm-start stalled at 0.056
+# FVE against their 0.186, unmoved by 2.5x the data (D48).
+INSTRUCTIONS = {
+    "reference": EXPLAIN_INSTRUCTION_REFERENCE,
+    "noquote": EXPLAIN_INSTRUCTION_NOQUOTE,
+}
+DEFAULT_INSTRUCTION_NAME = "reference"
+
+
+def get_instruction(name: str = DEFAULT_INSTRUCTION_NAME) -> str:
+    """The instruction template by name — see `INSTRUCTIONS`."""
+    if name not in INSTRUCTIONS:
+        raise ValueError(f"unknown instruction {name!r}; want one of {sorted(INSTRUCTIONS)}")
+    return INSTRUCTIONS[name]
+
+
+def build_explain_prompt(text: str, instruction: str | None = None) -> str:
     """Fill the instruction template with the snippet to explain."""
-    return EXPLAIN_INSTRUCTION.format(text=text)
+    return (instruction or get_instruction()).format(text=text)
 
 
 def extract_and_clean(raw: str) -> str | None:

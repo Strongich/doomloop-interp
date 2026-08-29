@@ -30,6 +30,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 D="${DATA_DIR:-/workspace/data/warmstart}"
+# Output stem for the explained/sft parquets. Set this when changing the prompt:
+# explain resumes from `{stem}_explained.parquet.chunks`, so reusing the stem
+# after a prompt change would silently keep the OLD labels.
+STEM="${STEM:-}"
 MODEL="${LABEL_MODEL:-Qwen/Qwen3.8-27B}"
 PORT="${PORT:-8000}"
 TP="${TP:-2}"
@@ -104,7 +108,7 @@ else
   # nla_input_rows key existed cannot report this, so drop the last one of each
   # and let it be relabelled — a few hundred rows, versus silently losing them.
   for half in av ar; do
-    last=$(ls -1 "$D/${half}_explained.parquet.chunks"/chunk_*.parquet 2>/dev/null | tail -1 || true)
+    last=$(ls -1 "$D/${half}${STEM}_explained.parquet.chunks"/chunk_*.parquet 2>/dev/null | tail -1 || true)
     [[ -n "$last" ]] && { log "split: dropping partial tail chunk $(basename "$last")"; rm -f "$last"; }
   done
   uv run python -m reasoning_attention.datagen.split \
@@ -147,18 +151,22 @@ curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null || { log "ERROR: server n
 # --- 4. label -------------------------------------------------------------
 LIMIT_ARG=()
 [[ -n "$LIMIT" ]] && LIMIT_ARG=(--limit "$LIMIT")
-# Backstop for the prompt's no-quote rule (D31). The prompt is what actually
-# prevents the leak — measured 0/256 — but 0% on a sample is not 0% on 200k.
+# INSTRUCTION selects the explainer prompt. Default `reference` is byte-identical
+# to theirs and INVITES inline textual examples, so --reject-verbatim is invalid
+# with it (explain.py refuses the combination) — verbatim overlap is the signal
+# there, not a leak. See D48.
+INSTRUCTION="${INSTRUCTION:-reference}"
 REJECT_ARG=()
-[[ -n "${REJECT_VERBATIM:-1}" ]] && REJECT_ARG=(--reject-verbatim)
+[[ "$INSTRUCTION" == "noquote" && "${REJECT_VERBATIM:-1}" == "1" ]] && REJECT_ARG=(--reject-verbatim)
 # Resumes chunk-by-chunk: everything already labelled is skipped, so extending
 # costs GPU time only for the new rows.
 for half in av ar; do
   log "label: $half half"
   uv run python -m reasoning_attention.datagen.explain \
       --input "$D/halves/${half}_half.parquet" \
-      --output "$D/${half}_explained.parquet" \
+      --output "$D/${half}${STEM}_explained.parquet" \
       --base-url "http://127.0.0.1:$PORT/v1" --model "$MODEL" \
+      --instruction "$INSTRUCTION" \
       --concurrency "$CONC" "${REJECT_ARG[@]}" "${LIMIT_ARG[@]}"
 done
 
@@ -166,7 +174,7 @@ done
 for half in av ar; do
   log "build: ${half}_sft"
   uv run python -m reasoning_attention.datagen.build \
-      --input "$D/${half}_explained.parquet" --output "$D/${half}_sft.parquet" --stage "${half}_sft"
+      --input "$D/${half}${STEM}_explained.parquet" --output "$D/${half}${STEM}_sft.parquet" --stage "${half}_sft"
 done
 log "done: $(ls -1 "$D"/*_sft.parquet | tr '\n' ' ')"
 

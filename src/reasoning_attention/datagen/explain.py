@@ -26,11 +26,13 @@ from tqdm import tqdm
 
 from reasoning_attention.config import CHAT_MAX_OUTPUT_TOKENS, ExplainerConfig, load_project_env
 from reasoning_attention.datagen.prompts import (
-    EXPLAIN_INSTRUCTION,
+    DEFAULT_INSTRUCTION_NAME,
+    INSTRUCTIONS,
     MIN_FEATURES,
     build_explain_prompt,
     count_features,
     extract_and_clean,
+    get_instruction,
     verbatim_overlap,
 )
 from reasoning_attention.datagen.providers import CompletionProvider, OpenAIProvider
@@ -79,7 +81,10 @@ _MAX_SAMPLE_FAILURES = 3
 
 
 def explain_chunk(
-    chunk: pa.Table, provider: CompletionProvider, reject_verbatim: bool = False
+    chunk: pa.Table,
+    provider: CompletionProvider,
+    reject_verbatim: bool = False,
+    instruction: str | None = None,
 ) -> tuple[pa.Table, int, list[str], int]:
     """Add a `summary` column to one chunk, dropping unusable rows.
 
@@ -89,7 +94,7 @@ def explain_chunk(
     to see one response.
     """
     texts = chunk.column("context_text").to_pylist()
-    completions = provider.complete([build_explain_prompt(t) for t in texts])
+    completions = provider.complete([build_explain_prompt(t, instruction) for t in texts])
     assert len(completions) == len(texts), (
         f"provider returned {len(completions)} completions for {len(texts)} prompts — "
         f"length mismatch violates the CompletionProvider contract"
@@ -121,7 +126,7 @@ def explain_chunk(
     return table, n_dropped, failures, n_leaked
 
 
-def _explainer_meta(config: ExplainerConfig) -> ExplainerMeta:
+def _explainer_meta(config: ExplainerConfig, instruction: str) -> ExplainerMeta:
     """Record how the labels were actually produced.
 
     The local chat path and the hosted reasoning path have disjoint knobs, so only
@@ -133,7 +138,7 @@ def _explainer_meta(config: ExplainerConfig) -> ExplainerMeta:
         model=config.model,
         reasoning_effort=config.chat_reasoning_effort or "" if local else config.reasoning_effort,
         max_output_tokens=config.max_output_tokens,
-        instruction_prompt=EXPLAIN_INSTRUCTION,
+        instruction_prompt=instruction,
         api_kind=config.api_kind,
         enable_thinking=config.chat_enable_thinking if local else None,
         temperature=config.chat_temperature if local else None,
@@ -173,10 +178,19 @@ def main() -> None:
         "<analysis> tag appears. The hosted default applies otherwise.",
     )
     parser.add_argument(
+        "--instruction",
+        default=DEFAULT_INSTRUCTION_NAME,
+        choices=sorted(INSTRUCTIONS),
+        help="which explainer instruction to use. `reference` is byte-identical to "
+        "theirs and INVITES inline textual examples; `noquote` is the D31 variant "
+        "that forbids reproducing any of the context (see prompts.py).",
+    )
+    parser.add_argument(
         "--reject-verbatim",
         action="store_true",
         help="drop explanations that reproduce the context (a quoted span present in it, "
-        "or any shared 5-word shingle). Without this the leak is only counted, not acted on.",
+        "or any shared 5-word shingle). Without this the leak is only counted, not acted on. "
+        "Only meaningful with --instruction noquote.",
     )
     parser.add_argument(
         "--reasoning-effort",
@@ -230,6 +244,19 @@ def main() -> None:
         f"{config.base_url or 'hosted API'} ({config.api_kind}), "
         f"concurrency {config.concurrency}"
     )
+    # The reference prompt asks for inline textual examples, so verbatim overlap is
+    # the intended signal there, not a defect. Rejecting on it would discard most
+    # of the corpus (measured 97.4% quoting under this prompt) — refuse the
+    # combination rather than silently throw the run away.
+    instruction = get_instruction(args.instruction)
+    if args.reject_verbatim and args.instruction == "reference":
+        raise SystemExit(
+            "--reject-verbatim with --instruction reference would drop ~97% of rows: "
+            "that prompt explicitly invites inline textual examples. Use "
+            "--instruction noquote if you want the D31 behaviour."
+        )
+    print(f"instruction: {args.instruction}")
+
     in_meta = read_sidecar(args.input)
     provider = OpenAIProvider(config)
 
@@ -252,7 +279,7 @@ def main() -> None:
             n_resumed += 1
             continue
         out_chunk, dropped, failures, leaked = explain_chunk(
-            table.slice(start, args.chunk_size), provider, args.reject_verbatim
+            table.slice(start, args.chunk_size), provider, args.reject_verbatim, instruction
         )
         n_leaked += leaked
         n_dropped += dropped
@@ -303,7 +330,7 @@ def main() -> None:
         n_documents=in_meta["n_documents"],
         extraction=ExtractionMeta(**in_meta["extraction"]),
         created_by="reasoning_attention.datagen.explain",
-        explainer=_explainer_meta(config),
+        explainer=_explainer_meta(config, instruction),
         parent_datasets=[in_meta["dataset_id"]],
     )
     print(f"wrote {row_count} rows -> {args.output}")

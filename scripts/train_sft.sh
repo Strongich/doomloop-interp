@@ -38,6 +38,12 @@ GRAD_ACCUM="${GRAD_ACCUM:-4}"       # effective batch = BATCH_SIZE * GRAD_ACCUM
 # 1 epoch: both halves plateau inside epoch 0 (see DEFAULTS / D32).
 EPOCHS="${EPOCHS:-1}"
 MAX_LENGTH="${MAX_LENGTH:-1024}"
+# wandb is OFF by default so a smoke run does not create a project; set WANDB=1
+# for any run whose curves you want to keep. `--wandb-name` is derived per stage
+# so the AV and AR halves land as separate runs instead of overwriting.
+WANDB="${WANDB:-0}"
+WANDB_PROJECT="${WANDB_PROJECT:-doomloop-nla-sft}"
+WANDB_TAG="${WANDB_TAG:-}"
 LORA_R="${LORA_R:-16}"
 LOG_EVERY="${LOG_EVERY:-10}"
 LIMIT="${LIMIT:-}"                  # empty = all rows
@@ -63,6 +69,7 @@ run_stage () {
   echo "=============================================================="
   echo " ${stage^^} SFT  |  data=$data"
   echo " lr=$LR->$MIN_LR cosine batch=$BATCH_SIZE x $GRAD_ACCUM epochs=$EPOCHS lora_r=$LORA_R"
+  echo " wandb=$([[ "$WANDB" == "1" ]] && echo "$WANDB_PROJECT / sft-${stage}${WANDB_TAG:+-$WANDB_TAG}" || echo off)"
   echo "=============================================================="
 
   local limit_arg=()
@@ -73,6 +80,10 @@ run_stage () {
   local opt_args=()
   [[ -n "$attn" ]] && opt_args+=(--attn-implementation "$attn")
   [[ -n "$INJECTION_SCALE" ]] && opt_args+=(--injection-scale "$INJECTION_SCALE")
+  if [[ "$WANDB" == "1" ]]; then
+    opt_args+=(--wandb --wandb-project "$WANDB_PROJECT"
+               --wandb-name "sft-${stage}${WANDB_TAG:+-$WANDB_TAG}")
+  fi
 
   # shellcheck disable=SC2086  # EXTRA_ARGS is intentionally word-split
   uv run python -m reasoning_attention.training.sft \

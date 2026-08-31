@@ -19,6 +19,7 @@ backbone dtype after loading, so no precision decision is made here.
 import argparse
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import torch
@@ -43,6 +44,13 @@ def main() -> None:
         "transformers major version.",
     )
     ap.add_argument(
+        "--verify-with",
+        default=None,
+        help="path to the interpreter that will CONSUME this critic (normally "
+        ".venv-rl/bin/python). Loads the written tokenizer with it and asserts the "
+        "placeholder round-trips, instead of guessing from version numbers.",
+    )
+    ap.add_argument(
         "--megatron-compat",
         action="store_true",
         help="also write model-megatron-compat.safetensors (norm.weight=ones, "
@@ -50,6 +58,9 @@ def main() -> None:
         "--train-backend fsdp, where mbridge is not involved.",
     )
     args = ap.parse_args()
+    _cfg = NLAConfig()
+    PLACEHOLDER_TOKEN = _cfg.placeholder_token
+    PLACEHOLDER_TOKEN_ID = _cfg.placeholder_token_id
 
     src = Path(args.ar_checkpoint)
     backbone, affine = src / "backbone", src / "affine.pt"
@@ -86,20 +97,58 @@ def main() -> None:
 
     cfg_path = out / "tokenizer_config.json"
     tok_cfg = json.loads(cfg_path.read_text())
-    v5_only = sorted({"backend", "is_local", "local_files_only"} & set(tok_cfg))
-    extra = tok_cfg.get("extra_special_tokens")
-    if v5_only or isinstance(extra, list):
-        raise SystemExit(
-            f"{cfg_path} was written in transformers-5.x format "
-            f"(v5-only keys: {v5_only}; extra_special_tokens is a "
-            f"{type(extra).__name__}). The RL venv pins transformers 4.57 and "
-            f"cannot read it. Re-run this script with .venv-rl/bin/python."
+    # D35 was a FORMAT mismatch: the AR checkpoint was written under transformers
+    # 5.x, whose tokenizer_config.json 4.57 cannot read (`extra_special_tokens` is
+    # a list there, a dict in 4.x). The original guard hardcoded "the RL venv pins
+    # 4.57" — stale since D44 moved it to 5.12.1, where 5.x format is the CORRECT
+    # output and that guard aborts a valid conversion.
+    #
+    # Version heuristics keep going stale, so test the thing we actually care
+    # about: can the venv that will READ this file load it, and does the
+    # placeholder still round-trip? (The reference's drift check fails with
+    # "'<|image_pad|>' -> []" when it does not.)
+    if args.verify_with:
+        probe = subprocess.run(
+            [
+                args.verify_with,
+                "-c",
+                "import sys;from transformers import AutoTokenizer;"
+                "t=AutoTokenizer.from_pretrained(sys.argv[1],trust_remote_code=True);"
+                "ids=t.encode(sys.argv[2],add_special_tokens=False);"
+                "print(t.__class__.__module__.split('.')[0],ids)",
+                str(out),
+                PLACEHOLDER_TOKEN,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode != 0:
+            raise SystemExit(
+                f"{args.verify_with} cannot read {cfg_path}:\n{probe.stderr.strip()[-800:]}\n"
+                f"Re-run this script with that interpreter so the tokenizer is "
+                f"written in the format the RL venv reads."
+            )
+        if f"[{PLACEHOLDER_TOKEN_ID}]" not in probe.stdout:
+            raise SystemExit(
+                f"placeholder {PLACEHOLDER_TOKEN!r} does not round-trip to "
+                f"[{PLACEHOLDER_TOKEN_ID}] under {args.verify_with}: {probe.stdout.strip()}"
+            )
+        print(
+            f"verified: {args.verify_with} reads the tokenizer, "
+            f"{PLACEHOLDER_TOKEN} -> [{PLACEHOLDER_TOKEN_ID}]"
+        )
+    else:
+        print(
+            "WARNING: no --verify-with; the RL venv's ability to read this "
+            "tokenizer is UNVERIFIED (see D35)"
         )
 
     sd = torch.load(affine, map_location="cpu")
     assert set(sd) == {"weight"}, f"expected only 'weight' in affine.pt, got {sorted(sd)}"
     w = sd["weight"]
-    assert w.shape == (D_MODEL, D_MODEL), f"affine weight is {tuple(w.shape)}, want {(D_MODEL,)*2}"
+    assert w.shape == (D_MODEL, D_MODEL), (
+        f"affine weight is {tuple(w.shape)}, want {(D_MODEL,) * 2}"
+    )
     save_file({"weight": w.contiguous()}, str(out / "value_head.safetensors"))
     print(f"affine.pt -> value_head.safetensors {tuple(w.shape)} {w.dtype}")
 

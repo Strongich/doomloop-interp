@@ -240,6 +240,27 @@ echo "=== 4a. ring-flash-attn transformers-5.x fallback ==="
 # Must run AFTER every install step, since a reinstall restores the stock file.
 "$RL_ROOT/bin/python" "$PROJECT_ROOT/scripts/patch_ring_flash_attn.py" --venv "$RL_ROOT"
 
+echo "=== 4a2. sglang /generate fast-parse (measured 145s -> 76s per rollout) ==="
+# FastAPI validates the whole request body into GenerateReqInput before our
+# handler runs, and for NLA that body is the prompt's embedding matrix as an fp32
+# JSON list. Measured: #running-req pinned at mean 2.3 (of a 512 semaphore) with
+# the scheduler idle, step_time 145s. After this patch: mean 176.8, max 512,
+# step_time 76s, train_wait 118s -> 71s. No numerics change (D49).
+#
+# This is hunk 1 of their patches/nla_input_embeds.patch, rewritten for v0.5.15 —
+# theirs does not apply (upstream moved the file) and the tolerant loop above
+# SKIPs it SILENTLY, which is how we ran a month of rollouts at half speed.
+# Hence a hard failure here rather than a skip.
+SGLANG_HTTP_SERVER="$("$RL_ROOT/bin/python" -c \
+    "import sglang.srt.entrypoints.http_server as m; print(m.__file__)")"
+"$RL_ROOT/bin/python" "$PROJECT_ROOT/scripts/patch_sglang_fast_generate.py" \
+    "$SGLANG_HTTP_SERVER" || {
+  echo "ERROR: could not apply the /generate fast-parse patch." >&2
+  echo "  Upstream likely changed the endpoint signature; re-derive the patch." >&2
+  echo "  Running without it costs ~2x on every rollout." >&2
+  exit 1
+}
+
 echo "=== 4b. system shared libs sgl_kernel dlopens ==="
 # sgl_kernel's compiled extension links libnuma. It is NOT a pip dependency, so
 # the wheel installs clean and then fails at IMPORT with a message that blames

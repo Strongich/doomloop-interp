@@ -44,6 +44,46 @@ INSTRUCT_MODEL="${INSTRUCT_MODEL:-Qwen/Qwen3-1.7B}"
 # --load is then free to mean what miles intends: resume an interrupted RL run.
 RESUME_FROM="${RESUME_FROM:-$RUN_DIR/actor}"
 
+# RESUMING AN RL RUN — the two halves resume by DIFFERENT mechanisms, and getting
+# only one of them right is silent:
+#
+#   actor  --load $RUN_DIR/actor           miles-native DCP, restores weights +
+#                                          optimizer + the dataset iterator
+#                                          position (placement_group.py:176), so
+#                                          the prompt stream continues and one
+#                                          epoch really means no repeats.
+#   critic --critic-load <HF dir>          FSDP resolves the critic's
+#                                          hf_checkpoint FROM --critic-load
+#                                          (arguments.py:284), so this must point
+#                                          at the RL critic's saved HF dir —
+#                                          $RUN_DIR/critic/iter_NNNNNNN/hf — and
+#                                          NOT at the Stage-1 SFT critic.
+#
+# Leaving CRITIC_SL_CKPT at the SFT critic on a resume reverts the reward model to
+# its warm-start while the actor carries on from a trained policy: the AV then
+# optimizes against a WORSE critic and fve_nrm drops back to its step-0 value.
+# That is the D42 failure mode with the roles swapped. `--num-rollout` is the
+# TOTAL (range(start_rollout_id, num_rollout)), not an increment.
+#
+# The check that it worked: fve_nrm at the first resumed step should match the
+# last window of the previous run, not its opening window.
+if [[ -f "$RESUME_FROM/latest_checkpointed_iteration.txt" ]]; then
+  _resume_iter="$(cat "$RESUME_FROM/latest_checkpointed_iteration.txt")"
+  echo "NOTE: resuming actor from $RESUME_FROM at iteration $_resume_iter" >&2
+  case "$CRITIC_SL_CKPT" in
+    "$RUN_DIR"/critic/*) : ;;
+    *)
+      echo "WARNING: --load will resume the actor at iteration $_resume_iter, but" >&2
+      echo "  CRITIC_SL_CKPT=$CRITIC_SL_CKPT is not under $RUN_DIR/critic/." >&2
+      echo "  The critic would restart from its SFT init and the reward signal" >&2
+      echo "  would regress. Set:" >&2
+      echo "    CRITIC_SL_CKPT=$RUN_DIR/critic/iter_$(printf '%07d' "$_resume_iter")/hf" >&2
+      echo "  Set ALLOW_CRITIC_MISMATCH=1 only if you intend to reset the critic." >&2
+      [[ "${ALLOW_CRITIC_MISMATCH:-0}" == "1" ]] || exit 1
+      ;;
+  esac
+fi
+
 # The RL stack lives in its own env — see scripts/setup_rl_stack.sh for why.
 RL_PYTHON="${RL_PYTHON:-$PROJECT_ROOT/.venv-rl/bin/python}"
 if [[ ! -x "$RL_PYTHON" ]]; then

@@ -274,6 +274,10 @@ def main() -> None:
                     "question": row["question"],
                     "gold": row["answer"],
                     "source": row["source"],
+                    # gsm8k is train+test concatenated (8792 rows); keep the
+                    # split so the traces can be filtered to test-only later.
+                    "split": row.get("split", ""),
+                    "subset": row.get("subset", ""),
                     "prompt_tokens": n_prompt,
                     "_messages_prompt": messages,
                 }

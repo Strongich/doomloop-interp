@@ -25,8 +25,8 @@ min_p=0). Generation is NOT capped by a fixed `max_tokens`: each request gets
 that loops until exhaustion is *recorded as such* rather than truncated early by
 a limit of ours. That matters — the budget boundary is the phenomenon.
 
-All 8 rollouts for a question go in ONE request via `SamplingParams(n=...)`, so
-the prompt is prefilled once instead of eight times.
+All rollouts for a question go in ONE request via `SamplingParams(n=...)`, so the
+prompt is prefilled once rather than once per sample.
 
 Output is JSONL (one row per rollout), streamed and appended, so a crash or a
 pod restart loses only the question in flight. Re-running skips questions already
@@ -55,7 +55,7 @@ from reasoning_attention.serving.vllm_server import build_llm
 
 # The whole prompt+generation budget. Qwen3-1.7B's native window is 32768.
 MAX_MODEL_LEN = 32_768
-ROLLOUTS_PER_QUESTION = 8
+ROLLOUTS_PER_QUESTION = 4
 THINK_CLOSE = "</think>"
 
 

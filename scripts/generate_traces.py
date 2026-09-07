@@ -1,6 +1,6 @@
 """Sample reasoning traces from the target model over the math eval sets.
 
-This produces the raw material for the doom-loop study: many rollouts per
+This produces the raw material for the doom-loop study: several rollouts per
 question, each labelled with the outcome the study splits on. From `CLAUDE.md`:
 
     the case study reads `h_l` at the same marker phrases in traces that
@@ -10,12 +10,12 @@ question, each labelled with the outcome the study splits on. From `CLAUDE.md`:
 so every record carries enough to sort itself into those buckets without
 re-running anything:
 
-    outcome     "correct" | "incorrect" | "no_answer"
-    stop_reason vLLM's finish_reason — "length" means the window ran out
+    outcome      "correct" | "incorrect" | "no_answer"
+    stop_reason  vLLM's finish_reason — "length" means the window ran out
     exited_think whether `</think>` was ever emitted
 
 `no_answer` + `stop_reason="length"` + `exited_think=False` is the derailment
-case; `no_answer` with `exited_think=True` is a trace that finished talking
+case; `no_answer` with `exited_think=True` is a trace that stopped talking
 without boxing anything, which is a *different* failure and must not be pooled
 with it.
 
@@ -25,18 +25,32 @@ min_p=0). Generation is NOT capped by a fixed `max_tokens`: each request gets
 that loops until exhaustion is *recorded as such* rather than truncated early by
 a limit of ours. That matters — the budget boundary is the phenomenon.
 
-All rollouts for a question go in ONE request via `SamplingParams(n=...)`, so the
-prompt is prefilled once rather than once per sample.
+All rollouts for one question go in ONE request via `SamplingParams(n=...)`, so
+the prompt is prefilled once rather than once per sample.
 
-Output is JSONL (one row per rollout), streamed and appended, so a crash or a
-pod restart loses only the question in flight. Re-running skips questions already
-present.
+SHARDING. One vLLM engine per GPU, each taking a stride of the questions
+(`--shard-index i --num-shards n` -> questions i, i+n, i+2n, ...). A stride
+rather than contiguous blocks because datasets are often ordered by difficulty,
+and contiguous blocks would leave one GPU with all the long traces. Each shard
+writes its own file; `--merge` concatenates them.
+
+Per-question RNG seeds use the GLOBAL question index, so a question gets the same
+seed no matter which shard draws it and the sharding does not change results.
+
+Output is JSONL, appended per question, so a crash loses only the question in
+flight. Re-running a shard skips questions already in its own file.
 
 Usage:
-    uv run python scripts/generate_traces.py --out data/traces
+    # one GPU
     uv run python scripts/generate_traces.py --datasets aime2025 amc23
-    uv run python scripts/generate_traces.py --datasets gsm8k --limit 200
-    uv run python scripts/generate_traces.py --system "You are a helpful assistant."
+
+    # two GPUs, then merge (see generate_traces.sh for the driver)
+    CUDA_VISIBLE_DEVICES=0 uv run python scripts/generate_traces.py \\
+        --shard-index 0 --num-shards 2 &
+    CUDA_VISIBLE_DEVICES=1 uv run python scripts/generate_traces.py \\
+        --shard-index 1 --num-shards 2 &
+    wait
+    uv run python scripts/generate_traces.py --merge
 """
 
 from __future__ import annotations
@@ -55,16 +69,37 @@ from reasoning_attention.serving.vllm_server import build_llm
 
 # The whole prompt+generation budget. Qwen3-1.7B's native window is 32768.
 MAX_MODEL_LEN = 32_768
-ROLLOUTS_PER_QUESTION = 4
 THINK_CLOSE = "</think>"
+
+# Rollouts per question, per dataset. GSM8K is the *recovered* control and is
+# huge (8792 questions), so 4 is plenty; AIME/AMC are tiny (30 and 40) and are
+# where derailment actually happens, so 8 buys per-question outcome variance —
+# the mixed-outcome questions, where some rollouts recover and some derail, are
+# the matched pairs the study wants.
+DEFAULT_ROLLOUTS: dict[str, int] = {"gsm8k": 4, "aime2025": 8, "amc23": 8}
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--out", default="data/traces", help="output directory for <dataset>.jsonl")
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("--out", default="data/traces", help="output directory")
     p.add_argument("--datasets", nargs="+", default=sorted(DATASETS), choices=sorted(DATASETS))
-    p.add_argument("--n", type=int, default=ROLLOUTS_PER_QUESTION, help="rollouts per question")
+    p.add_argument(
+        "--n",
+        type=int,
+        default=None,
+        help=f"rollouts per question, overriding the per-dataset default {DEFAULT_ROLLOUTS}",
+    )
     p.add_argument("--limit", type=int, default=None, help="first N questions per dataset")
+    p.add_argument("--num-shards", type=int, default=1)
+    p.add_argument("--shard-index", type=int, default=0)
+    p.add_argument(
+        "--merge",
+        action="store_true",
+        help="merge <dataset>.shard*.jsonl into <dataset>.jsonl and print a summary; "
+        "runs no model and needs no GPU",
+    )
     p.add_argument("--max-model-len", type=int, default=MAX_MODEL_LEN)
     p.add_argument(
         "--system",
@@ -86,22 +121,71 @@ def parse_args() -> argparse.Namespace:
         help="skip a question whose prompt leaves less room than this (never happens "
         "at 32k, but a smaller --max-model-len would silently produce stubs)",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if not 0 <= args.shard_index < args.num_shards:
+        p.error(f"--shard-index must be in [0, {args.num_shards})")
+    return args
 
 
-def done_question_ids(path: Path) -> set[str]:
-    """Question ids already fully written, for resume."""
+def shard_path(out_dir: Path, name: str, index: int, total: int) -> Path:
+    """Where one shard writes. `total == 1` keeps the plain, unsharded name."""
+    if total == 1:
+        return out_dir / f"{name}.jsonl"
+    return out_dir / f"{name}.shard{index}of{total}.jsonl"
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Rows from a JSONL file, tolerating a truncated final line."""
     if not path.exists():
-        return set()
-    seen: dict[str, int] = {}
+        return []
+    rows = []
     with path.open(encoding="utf-8") as fh:
         for line in fh:
             try:
-                row = json.loads(line)
+                rows.append(json.loads(line))
             except json.JSONDecodeError:
-                continue  # truncated last line from a hard kill
-            seen[row["question_id"]] = seen.get(row["question_id"], 0) + 1
-    return {q for q, n in seen.items() if n > 0}
+                continue  # a hard kill mid-write leaves one partial line
+    return rows
+
+
+def summarize(rows: list[dict[str, Any]], label: str) -> None:
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
+    stuck = sum(1 for r in rows if r["outcome"] == "no_answer" and not r["exited_think"])
+    loops = sum(1 for r in rows if r["has_doom_loop"])
+    qs = len({r["question_id"] for r in rows})
+    # Questions whose rollouts disagree: the matched pairs the study wants.
+    by_q: dict[str, set[str]] = {}
+    for r in rows:
+        by_q.setdefault(r["question_id"], set()).add(r["outcome"])
+    mixed = sum(1 for v in by_q.values() if len(v) > 1)
+    print(f"  {label}: {len(rows)} rollouts over {qs} questions")
+    print(f"    outcomes: {counts}")
+    print(f"    derailed inside <think> (no answer, tag never closed): {stuck}")
+    print(f"    doom-loop detector fired: {loops}")
+    print(f"    mixed-outcome questions (recovered AND failed): {mixed}")
+
+
+def do_merge(out_dir: Path, datasets: list[str]) -> None:
+    for name in datasets:
+        shards = sorted(out_dir.glob(f"{name}.shard*of*.jsonl"))
+        if not shards:
+            print(f"{name}: no shards found, skipping")
+            continue
+        # Dedupe on (question_id, rollout_index): re-running a shard after a
+        # partial write can otherwise duplicate a question's rollouts.
+        merged: dict[tuple[str, int], dict[str, Any]] = {}
+        for sh in shards:
+            for row in read_jsonl(sh):
+                merged[(row["question_id"], row["rollout_index"])] = row
+        rows = [merged[k] for k in sorted(merged, key=lambda k: (k[0], k[1]))]
+        dest = out_dir / f"{name}.jsonl"
+        with dest.open("w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"{name}: {len(shards)} shards -> {dest}")
+        summarize(rows, name)
 
 
 def classify(text: str, gold: str, stop_reason: str, token_ids: list[int]) -> dict[str, Any]:
@@ -126,9 +210,12 @@ def classify(text: str, gold: str, stop_reason: str, token_ids: list[int]) -> di
 def main() -> None:
     args = parse_args()
     load_project_env()
-
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.merge:
+        do_merge(out_dir, args.datasets)
+        return
 
     cfg = replace(VLLMConfig(), max_model_len=args.max_model_len)
     llm = build_llm(cfg)
@@ -137,16 +224,21 @@ def main() -> None:
     from vllm import SamplingParams
 
     for name in args.datasets:
+        n_rollouts = args.n if args.n is not None else DEFAULT_ROLLOUTS.get(name, 4)
         ds = load_one(name)
         if args.limit is not None:
             ds = ds.select(range(min(args.limit, len(ds))))
-        path = out_dir / f"{name}.jsonl"
-        already = done_question_ids(path)
+        path = shard_path(out_dir, name, args.shard_index, args.num_shards)
+        already = {r["question_id"] for r in read_jsonl(path)}
 
         prompts: list[str] = []
         params: list[Any] = []
         meta: list[dict[str, Any]] = []
         for i, row in enumerate(ds):
+            # Stride assignment on the GLOBAL index, so shards are disjoint and
+            # a question's seed does not depend on how many shards there are.
+            if i % args.num_shards != args.shard_index:
+                continue
             qid = f"{name}:{i}"
             if qid in already:
                 continue
@@ -162,14 +254,14 @@ def main() -> None:
                 print(f"  skip {qid}: prompt {n_prompt} tok leaves only {room}")
                 continue
             prompts.append(prompt)
-            # Per-request cap: the window, not an arbitrary generation limit.
             params.append(
                 SamplingParams(
-                    n=args.n,
+                    n=n_rollouts,
                     temperature=args.temperature,
                     top_p=args.top_p,
                     top_k=args.top_k,
                     min_p=args.min_p,
+                    # The window, not an arbitrary generation limit.
                     max_tokens=room,
                     seed=args.seed + i,
                 )
@@ -182,44 +274,40 @@ def main() -> None:
                     "question": row["question"],
                     "gold": row["answer"],
                     "source": row["source"],
-                    "messages_prompt": messages,
                     "prompt_tokens": n_prompt,
+                    "_messages_prompt": messages,
                 }
             )
 
-        print(f"\n=== {name}: {len(prompts)} questions x {args.n} rollouts "
-              f"({len(already)} already done) ===")
+        print(
+            f"\n=== {name} shard {args.shard_index}/{args.num_shards}: "
+            f"{len(prompts)} questions x {n_rollouts} rollouts "
+            f"({len(already)} already done) ==="
+        )
         if not prompts:
             continue
 
-        # generate() returns results aligned with `prompts`; write per question so
-        # an interrupted run leaves complete questions behind, never half of one.
         outputs = llm.generate(prompts, params)
         with path.open("a", encoding="utf-8") as fh:
             for m, out in zip(meta, outputs, strict=True):
+                prompt_messages = m.pop("_messages_prompt")
                 for k, comp in enumerate(out.outputs):
                     rec = {
                         **m,
                         "rollout_index": k,
+                        "n_rollouts": n_rollouts,
                         "response": comp.text,
                         "completion_tokens": len(comp.token_ids),
-                        "messages": [*m["messages_prompt"], {"role": "assistant", "content": comp.text}],
+                        "messages": [
+                            *prompt_messages,
+                            {"role": "assistant", "content": comp.text},
+                        ],
                         **classify(comp.text, m["gold"], comp.finish_reason, list(comp.token_ids)),
                     }
-                    rec.pop("messages_prompt")
                     fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 fh.flush()
 
-        rows = [json.loads(line) for line in path.open(encoding="utf-8")]
-        n = len(rows)
-        counts: dict[str, int] = {}
-        for r in rows:
-            counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
-        stuck = sum(1 for r in rows if r["outcome"] == "no_answer" and not r["exited_think"])
-        print(f"  {n} rollouts -> {path}")
-        print(f"  outcomes: {counts}")
-        print(f"  derailed inside <think> (no answer, never closed the tag): {stuck}")
-        print(f"  doom-loop detector fired: {sum(1 for r in rows if r['has_doom_loop'])}")
+        summarize(read_jsonl(path), f"{name} shard {args.shard_index}")
 
 
 if __name__ == "__main__":

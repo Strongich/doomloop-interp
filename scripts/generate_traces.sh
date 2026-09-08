@@ -18,7 +18,10 @@ cd "$(dirname "$0")/.."
 
 OUT="${OUT:-data/traces}"
 DATASETS="${DATASETS:-aime2025 amc23 gsm8k}"
-GSM8K_LIMIT="${GSM8K_LIMIT:-300}"
+# `-` not `:-`: GSM8K_LIMIT= (explicitly empty) must mean "no limit", but `:-`
+# treats empty as unset and would silently reapply the 300 default. That cost a
+# run: the driver reported success having sampled 300 of 8792 questions.
+GSM8K_LIMIT="${GSM8K_LIMIT-300}"
 NUM_SHARDS="${NUM_SHARDS:-2}"
 mkdir -p "$OUT"
 

@@ -44,6 +44,7 @@ from reasoning_attention.tokenview import (  # noqa: E402
     build_view,
     cosine,
     think_close_char,
+    think_last_content_char,
 )
 
 
@@ -130,7 +131,9 @@ def main() -> None:
         n_tok = states.shape[0]
 
         close_idx = view.char_to_token(close_char)
-        if close_idx is None:
+        content_char = think_last_content_char(text)
+        content_idx = view.char_to_token(content_char) if content_char is not None else None
+        if close_idx is None or content_idx is None:
             skipped += 1
             view.states = None
             continue
@@ -138,6 +141,7 @@ def main() -> None:
 
         ctx = Ctx(row=row, view=view, states=states, close_idx=close_idx, out=out)
         score(ctx, "think_close->last", last_idx, close_idx, "")
+        score(ctx, "think_last->think_close", content_idx, close_idx, "")
         bounds = block_boundaries(text, view.think_chars, args.marker)
         doubt = [b for b in bounds if b[2]][: args.max_blocks]
         plain = [b for b in bounds if not b[2]][: args.max_blocks]
@@ -145,8 +149,12 @@ def main() -> None:
             idx = view.char_to_token(end_char)
             if idx is None:
                 continue
-            name = "doubt_block->think_close" if is_doubt else "plain_block->think_close"
-            score(ctx, name, idx, close_idx, round(idx / max(close_idx, 1), 3))
+            kind = "doubt" if is_doubt else "plain"
+            frac = round(idx / max(content_idx, 1), 3)
+            # Both anchors, so the format-token artefact is visible rather than
+            # silently baked into the result.
+            score(ctx, f"{kind}_block->think_close", idx, close_idx, frac)
+            score(ctx, f"{kind}_block->think_last", idx, content_idx, frac)
 
         print(
             f"  [{n}/{len(rows_in)}] {row['question_id']}#{row['rollout_index']} "
@@ -165,8 +173,11 @@ def main() -> None:
 
     for pair in (
         "think_close->last",
+        "think_last->think_close",
         "doubt_block->think_close",
         "plain_block->think_close",
+        "doubt_block->think_last",
+        "plain_block->think_last",
     ):
         zs = [float(r["z"]) for r in out if r["pair"] == pair and r["z"] != ""]
         if not zs:

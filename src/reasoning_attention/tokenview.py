@@ -101,6 +101,25 @@ def think_close_char(text: str) -> int | None:
     return at if at >= 0 else None
 
 
+def think_last_content_char(text: str) -> int | None:
+    """Char offset of the last non-whitespace character before `</think>`.
+
+    `</think>` itself is a poor anchor: measured against random reasoning states
+    it sits at ~0.25 cosine where those states sit at ~0.48 with each other, so
+    `h_l` on the tag is dominated by "emit the closing tag" and lives off the
+    reasoning manifold the null is drawn from. The last *content* token is the
+    model's final reasoning state and stays on that manifold, so a similarity to
+    it is comparable to the null.
+    """
+    at = text.find("</think>")
+    if at < 0:
+        return None
+    pos = at - 1
+    while pos >= 0 and text[pos].isspace():
+        pos -= 1
+    return pos if pos >= 0 else None
+
+
 def _chat_header(tokenizer: Any, question: str) -> str:
     """The prompt as the model saw it during generation, up to the assistant turn."""
     return str(

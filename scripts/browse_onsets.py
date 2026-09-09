@@ -55,8 +55,11 @@ def load(path: Path) -> list[dict[str, Any]]:
 class Store:
     """Loaded CSV sets, indexed for pairing."""
 
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, traces_dir: Path, base_model: str, av_path: Path) -> None:
         self.data_dir = data_dir
+        self.traces_dir = traces_dir
+        self.base_model = base_model
+        self.av_path = av_path
         self.sets = discover(data_dir)
         self.cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
 
@@ -264,6 +267,127 @@ def traj_facts(rows: list[dict[str, Any]], label: str) -> str:
     return f"<table class='tt'>{head}{body}</table>"
 
 
+# --------------------------------------------------------------------------- #
+# token explorer
+# --------------------------------------------------------------------------- #
+
+EXPLORER_CACHE = "explorer_traces.jsonl"
+TOKEN_WINDOW = 900
+# Distinct enough to read at a glance, and legible in both themes.
+TOKEN_COLORS = {"doubt": "#f59e0b", "gold": "#10b981"}
+
+
+def build_explorer_cache(data_dir: Path, traces_dir: Path) -> Path:
+    """Extract the traces the explorer offers into one small jsonl.
+
+    Scanning gsm8k.jsonl is 568 MB per lookup; the interesting traces are the 68
+    from the trajectory run plus the 34 loopers, so pull them out once.
+    """
+    out = data_dir / EXPLORER_CACHE
+    if out.exists():
+        return out
+    wanted: set[tuple[str, str]] = set()
+    for name in ("trajectories/summary.csv", "loop_onsets.csv"):
+        path = data_dir / name
+        if path.exists():
+            for row in load(path):
+                wanted.add((row["question_id"], str(row["rollout_index"])))
+    kept = []
+    for path in sorted(traces_dir.glob("*.jsonl")):
+        with path.open() as fh:
+            for line in fh:
+                row = json.loads(line)
+                if (row["question_id"], str(row["rollout_index"])) in wanted:
+                    kept.append(
+                        {
+                            k: row[k]
+                            for k in (
+                                "question_id",
+                                "rollout_index",
+                                "dataset",
+                                "question",
+                                "gold",
+                                "response",
+                                "outcome",
+                                "is_correct",
+                            )
+                        }
+                    )
+    with out.open("w") as fh:
+        for row in kept:
+            fh.write(json.dumps(row) + "\n")
+    return out
+
+
+def explorer_traces(data_dir: Path, traces_dir: Path) -> list[dict[str, Any]]:
+    path = build_explorer_cache(data_dir, traces_dir)
+    if not path.exists():
+        return []
+    with path.open() as fh:
+        return [json.loads(line) for line in fh]
+
+
+def explorer_label(row: dict[str, Any]) -> str:
+    tag = "correct" if str(row["is_correct"]).lower() in ("true", "1") else row["outcome"]
+    return f"{row['question_id']}#{row['rollout_index']}  [{tag}]"
+
+
+class Models:
+    """Target model and AV, loaded on first use rather than at startup."""
+
+    def __init__(self, base: str, av: Path) -> None:
+        self.base = base
+        self.av_path = av
+        self.cache: Any = None
+        self.nla: Any = None
+
+    def ready(self) -> tuple[Any, Any]:
+        if self.cache is None:
+            from reasoning_attention.config import NLAConfig
+            from reasoning_attention.tokenview import StateCache
+
+            cfg = NLAConfig()
+            print("loading target model for the token explorer...")
+            self.cache = StateCache(self.base, cfg.extraction_layer)
+        if self.nla is None:
+            from reasoning_attention.nla.model import NLA
+
+            print("loading AV...")
+            self.nla = NLA.av_only(str(self.av_path))
+            self.nla.av.eval()
+        return self.cache, self.nla
+
+
+def similarity_table(view: Any, index: int) -> str:
+    """Cosine from the selected token to each anchor, against a matched null.
+
+    The null is the point: arbitrary layer-20 states inside one trace already sit
+    at ~0.88 cosine, so a raw similarity to the answer state says nothing. Each
+    row reports how many sd above chance the pair is, for pairs the same distance
+    apart.
+    """
+    from reasoning_attention.tokenview import baseline, cosine
+
+    states = view.states
+    rows = ""
+    for anchor in view.anchors:
+        sim = cosine(states, index, anchor.token_index)
+        sep = abs(index - anchor.token_index)
+        mu, sd = baseline(states, sep)
+        z = (sim - mu) / sd if sd > 0 else float("nan")
+        verdict = "above chance" if z > 2 else ("below chance" if z < -2 else "chance")
+        rows += (
+            f"<tr><td>{esc(anchor.label)}</td><td>{anchor.token_index}</td>"
+            f"<td>{sim:.4f}</td><td>{mu:.4f} ± {sd:.4f}</td>"
+            f"<td>{z:+.1f}σ</td><td>{verdict}</td></tr>"
+        )
+    head = (
+        "<tr><th>anchor</th><th>token</th><th>cosine</th>"
+        "<th>chance at same distance</th><th>z</th><th></th></tr>"
+    )
+    return f"<table class='tt'>{head}{rows}</table>"
+
+
 CSS = """
 #wrap {max-width: 1500px; margin: 0 auto}
 .pane {font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
@@ -289,6 +413,9 @@ table.tt th {text-align: left; font-weight: 600; opacity: .6; padding: 4px 10px 
   border-bottom: 1px solid var(--border-color-primary)}
 table.tt td {padding: 4px 10px 4px 0; font-family: ui-monospace, monospace}
 table.tt tr.hl td {font-weight: 700; color: var(--body-text-color)}
+.tokens {font-family: ui-monospace, monospace; font-size: 12.5px; line-height: 2.1;
+  max-height: 560px; overflow-y: auto}
+.tokens span {cursor: pointer}
 .qbox {font-size: 13.5px; padding: 10px 12px; border-radius: 8px;
   background: var(--background-fill-secondary); border: 1px solid var(--border-color-primary)}
 h3.sec {font-size: 12px; text-transform: uppercase; letter-spacing: .07em; opacity: .6;
@@ -316,6 +443,9 @@ def build(store: Store) -> gr.Blocks:
 
     # Gradio 6 moved css/theme from Blocks() to launch(); they are passed in main().
     trajectories = traj_rows(store.data_dir)
+    explorer = explorer_traces(store.data_dir, store.traces_dir)
+    models = Models(store.base_model, store.av_path)
+    view_box: dict[str, Any] = {}
 
     with gr.Blocks(title="Onset explanations") as demo:
         with gr.Tabs():
@@ -411,6 +541,105 @@ def build(store: Store) -> gr.Blocks:
                     traj_dd.change(show_traj, traj_dd, [traj_tbl, traj_fig])
                     demo.load(show_traj, traj_dd, [traj_tbl, traj_fig])
 
+            if explorer:
+                with gr.Tab("token explorer"), gr.Column(elem_id="wrap"):
+                    doubt_c, gold_c = TOKEN_COLORS["doubt"], TOKEN_COLORS["gold"]
+                    gr.Markdown(
+                        "## Click a token, read its activation\n"
+                        "Layer-20 state at the clicked position, verbalized by "
+                        f"the AV. <span style='color:{doubt_c}'>**self-doubt "
+                        f"markers**</span> and <span style='color:{gold_c}'>**the "
+                        "gold answer's first appearance**</span> are highlighted. "
+                        "First click loads the models (~20s)."
+                    )
+                    ex_dd = gr.Dropdown(
+                        [explorer_label(r) for r in explorer],
+                        value=explorer_label(explorer[0]),
+                        label="trace",
+                    )
+                    ex_info = gr.Markdown()
+                    ex_slider = gr.Slider(
+                        0, 1, step=TOKEN_WINDOW, value=0, label="token window start"
+                    )
+                    with gr.Row():
+                        with gr.Column(scale=3):
+                            ex_tokens = gr.HighlightedText(
+                                color_map=TOKEN_COLORS,
+                                show_legend=False,
+                                combine_adjacent=False,
+                                show_label=False,
+                                elem_classes=["tokens"],
+                            )
+                        with gr.Column(scale=2):
+                            ex_sel = gr.Markdown("*click a token*")
+                            ex_sim = gr.HTML()
+                            gr.HTML("<h3 class='sec'>AV explanation of this token's h_l</h3>")
+                            ex_expl = gr.Markdown()
+
+                    ex_state = gr.State({"label": None, "start": 0, "index": None})
+
+                    def ex_load(label: str, start: float) -> tuple[Any, ...]:
+                        row = next(r for r in explorer if explorer_label(r) == label)
+                        cache, _ = models.ready()
+                        from reasoning_attention.tokenview import build_view
+
+                        key = (label,)
+                        if view_box.get("key") != key:
+                            view = build_view(
+                                cache.tokenizer, row["question"], row["response"], row["gold"]
+                            )
+                            cache.fill(view)
+                            view_box["key"] = key
+                            view_box["view"] = view
+                        view = view_box["view"]
+                        n = len(view.ids)
+                        start = int(min(max(0, start), max(0, n - 1)))
+                        anchors = ", ".join(f"**{a.label}** @{a.token_index}" for a in view.anchors)
+                        info = (
+                            f"gold `{row['gold']}` · {n} response tokens · "
+                            f"{sum(1 for x in view.labels if x == 'doubt')} doubt-marker tokens · "
+                            f"anchors: {anchors}"
+                        )
+                        return (
+                            info,
+                            gr.update(minimum=0, maximum=max(n - TOKEN_WINDOW, 0), value=start),
+                            view.tokens_for_display(start, start + TOKEN_WINDOW),
+                            {"label": label, "start": start, "index": None},
+                        )
+
+                    def ex_pick(st: dict[str, Any], evt: gr.SelectData) -> tuple[Any, ...]:
+                        view = view_box["view"]
+                        index = int(st["start"]) + int(evt.index)
+                        piece = view.piece(index)
+                        return (
+                            f"**token {index}** · {piece!r} · label `{view.labels[index]}`",
+                            similarity_table(view, index),
+                            {**st, "index": index},
+                        )
+
+                    def ex_explain(st: dict[str, Any]) -> str:
+                        if st.get("index") is None:
+                            return ""
+                        _, nla = models.ready()
+                        view = view_box["view"]
+                        vec = view.states[int(st["index"])].float().cpu()
+                        return nla.verbalize(
+                            vec, max_new_tokens=256, return_explanation=True
+                        ).strip()
+
+                    ex_dd.change(
+                        ex_load, [ex_dd, ex_slider], [ex_info, ex_slider, ex_tokens, ex_state]
+                    )
+                    ex_slider.release(
+                        ex_load, [ex_dd, ex_slider], [ex_info, ex_slider, ex_tokens, ex_state]
+                    )
+                    # Two events: the fast one paints the selection and similarities
+                    # immediately, the slow one queues the AV generation behind it, so
+                    # clicking a new token never waits on the previous explanation.
+                    ex_tokens.select(ex_pick, ex_state, [ex_sel, ex_sim, ex_state]).then(
+                        lambda: "*generating…*", None, ex_expl
+                    ).then(ex_explain, ex_state, ex_expl)
+
         outs = [question, pos_md, idx_sl, arm_dd, state]
         for p in panes:
             outs += [p["title"], p["meta"], p["expl"], p["pref"], p["chat"]]
@@ -484,10 +713,13 @@ def build(store: Store) -> gr.Blocks:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data", type=Path, default=Path("data"))
+    ap.add_argument("--traces", type=Path, default=Path("data/traces"))
+    ap.add_argument("--base", default="Qwen/Qwen3-1.7B")
+    ap.add_argument("--av", type=Path, default=Path("checkpoints/av_rl_ep1"))
     ap.add_argument("--port", type=int, default=7860)
     ap.add_argument("--share", action="store_true")
     args = ap.parse_args()
-    store = Store(args.data)
+    store = Store(args.data, args.traces, args.base, args.av)
     print("sets found:")
     for name, files in store.sets.items():
         print(f"  {name}: {', '.join(sorted(files))}")

@@ -343,3 +343,57 @@ def find_marker_onsets(
         if idx is not None:
             out.append(idx)
     return out
+
+
+# Phrases that mark the model turning on itself. Used ONLY to locate positions:
+# per D33 a doubt marker is ordinary reasoning behaviour, present in 99.9% of
+# this corpus's traces, so its presence is never evidence that a trace derailed.
+DOUBT_MARKERS = (
+    "Wait",
+    "Hmm",
+    "Hold on",
+    "Actually",
+    "Alternatively",
+    "But wait",
+    "Let me reconsider",
+    "Let me double-check",
+    "Let me verify",
+    "That doesn't seem right",
+    "That can't be right",
+)
+
+
+def doubt_spans(text: str, markers: tuple[str, ...] = DOUBT_MARKERS) -> list[tuple[int, int]]:
+    """Character spans of every self-doubt marker, merged and in order."""
+    hits: list[tuple[int, int]] = []
+    for marker in markers:
+        for start in marker_matches(text, marker):
+            hits.append((start, start + len(marker)))
+    hits.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in hits:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def gold_span(text: str, gold: str) -> tuple[int, int] | None:
+    """First occurrence of the gold answer as a standalone number/word.
+
+    Word-bounded so gold "7" does not match the 7 in "70" — which would put the
+    anchor hundreds of tokens too early and silently invalidate every similarity
+    measured against it.
+
+    The right-hand guard rejects a following "." only when a digit follows it, so
+    "12.5" does not match gold 12 but a sentence-final "12." does. Rejecting "."
+    outright looks equivalent and is not: it silently skips every occurrence that
+    ends a sentence, which is most of them, and moves the anchor hundreds of
+    tokens later or loses it entirely.
+    """
+    gold = gold.strip()
+    if not gold:
+        return None
+    match = re.search(rf"(?<![\w.]){re.escape(gold)}(?!\w)(?!\.\d)", text)
+    return (match.start(), match.end()) if match else None

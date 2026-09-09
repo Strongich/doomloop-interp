@@ -84,6 +84,25 @@ def esc(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def conversation(row: dict[str, Any]) -> list[dict[str, str]]:
+    """The row's messages as chat turns, for the full-conversation panel.
+
+    Rendered raw (`render_markdown=False` on the Chatbot): a reasoning trace is
+    full of `\boxed{}`, `$...$`, `**` and stray underscores that a markdown pass
+    silently eats or turns into emphasis, and the point of this panel is to show
+    what the model actually emitted.
+    """
+    try:
+        messages = json.loads(row.get("messages") or "[]")
+    except json.JSONDecodeError:
+        return []
+    return [
+        {"role": m["role"], "content": m.get("content", "")}
+        for m in messages
+        if m.get("role") in ("system", "user", "assistant")
+    ]
+
+
 def render_prefix(row: dict[str, Any]) -> str:
     """The assistant turn's tail, with the onset token called out at the end."""
     try:
@@ -216,15 +235,41 @@ def build(store: Store) -> gr.Blocks:
                         expl = gr.HTML()
                         gr.HTML("<h3 class='sec'>context, ending at the onset</h3>")
                         pref = gr.HTML()
+                        # Closed by default: a loop-onset prefix runs to 28k
+                        # tokens, and mounting that on every arrow press would
+                        # make navigation crawl.
+                        with gr.Accordion(
+                            "full conversation (assistant turn ends at the onset)",
+                            open=False,
+                        ):
+                            # gradio 6.26: `type` and `show_copy_button` are
+                            # gone (messages format is the only one now), and
+                            # `<think>` would be swallowed into a reasoning
+                            # accordion, so reasoning_tags is cleared — the
+                            # think block IS the content here.
+                            chat = gr.Chatbot(
+                                render_markdown=False,
+                                reasoning_tags=[],
+                                height=560,
+                                show_label=False,
+                                resizable=True,
+                            )
                         panes.append(
-                            {"title": title, "meta": meta, "expl": expl, "pref": pref, "side": side}
+                            {
+                                "title": title,
+                                "meta": meta,
+                                "expl": expl,
+                                "pref": pref,
+                                "chat": chat,
+                                "side": side,
+                            }
                         )
 
             state = gr.State({"name": names[0], "dataset": "all", "arm": "correct", "i": 0})
 
         outs = [question, pos_md, idx_sl, arm_dd, state]
         for p in panes:
-            outs += [p["title"], p["meta"], p["expl"], p["pref"]]
+            outs += [p["title"], p["meta"], p["expl"], p["pref"], p["chat"]]
 
         def view(st: dict[str, Any]) -> list[Any]:
             name = st["name"]
@@ -234,7 +279,7 @@ def build(store: Store) -> gr.Blocks:
             primary = rows_by_arm[arm]
             keep = filtered(primary, st["dataset"])
             if not keep:
-                blank = ["", ""] * 4
+                blank: list[Any] = ["", "", "", "", []] * len(panes)
                 return ["", "**no rows match**", gr.update(), gr.update(visible=False), st, *blank]
             i = max(0, min(st["i"], len(keep) - 1))
             st = {**st, "i": i}
@@ -257,10 +302,16 @@ def build(store: Store) -> gr.Blocks:
             ]
             for _p, spec in zip(panes, sides, strict=True):
                 if spec is None:
-                    out += ["", "", "", ""]
+                    out += ["", "", "", "", []]
                     continue
                 head, r = spec
-                out += [f"**{head}**", render_meta(r), render_explanation(r), render_prefix(r)]
+                out += [
+                    f"**{head}**",
+                    render_meta(r),
+                    render_explanation(r),
+                    render_prefix(r),
+                    conversation(r),
+                ]
             return out
 
         def step(st: dict[str, Any], delta: int) -> list[Any]:

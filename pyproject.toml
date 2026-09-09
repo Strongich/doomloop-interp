@@ -36,6 +36,7 @@ packages = ["src/reasoning_attention"]
 
 [dependency-groups]
 dev = [
+    "gradio>=6.26.0",
     "mypy>=1.10",
     "ruff>=0.16",
 ]

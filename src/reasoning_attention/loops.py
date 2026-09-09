@@ -28,8 +28,9 @@ That is a property of the criterion, not a bug in the port.
 
 from __future__ import annotations
 
+import bisect
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 # Their published defaults, verbatim from configs/default.yaml.
@@ -154,12 +155,19 @@ class TokenSpans:
     ids: list[int]
     offsets: list[tuple[int, int]]
     text: str
+    # Token start offsets, for bisecting. A trace with 2950 markers in it would
+    # otherwise cost 2950 linear scans over ~40k tokens.
+    _starts: list[int] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_starts", [s for s, _ in self.offsets])
 
     def char_to_token(self, char_pos: int) -> int | None:
-        for idx, (start, end) in enumerate(self.offsets):
-            if start <= char_pos < end:
-                return idx
-        return None
+        idx = bisect.bisect_right(self._starts, char_pos) - 1
+        if idx < 0:
+            return None
+        start, end = self.offsets[idx]
+        return idx if start <= char_pos < end else None
 
     def key(self, idx: int) -> str:
         """Comparison key for period matching: the token's text, left-stripped.
@@ -286,3 +294,52 @@ def _fallback_onset(spans: TokenSpans, hit: RepeatHit) -> int | None:
             return idx
         idx += 1
     return None
+
+
+# The self-doubt marker the study reads at. Case-sensitive by default: the model
+# writes it capitalized when it interrupts itself, and lowercase "wait" is
+# usually ordinary prose ("wait for", "waiting"), not a restart.
+DEFAULT_MARKER = "Wait"
+
+
+def marker_matches(
+    text: str,
+    marker: str = DEFAULT_MARKER,
+    *,
+    case_sensitive: bool = True,
+) -> list[int]:
+    """Character offsets where `marker` occurs as a whole word.
+
+    Separate from `find_marker_onsets` because it needs no tokenizer: scanning
+    the corpus for candidates is then cheap, and only the traces that survive
+    get tokenized.
+    """
+    flags = 0 if case_sensitive else re.IGNORECASE
+    return [m.start() for m in re.finditer(rf"\b{re.escape(marker)}\b", text, flags)]
+
+
+def find_marker_onsets(
+    spans: TokenSpans,
+    marker: str = DEFAULT_MARKER,
+    *,
+    case_sensitive: bool = True,
+) -> list[int]:
+    """Token indices at which `marker` begins, in order.
+
+    The returned index is the token that *starts* the marker, so the context
+    ending just before it is the one whose next-token distribution chose to
+    emit the marker. With byte-level BPE that token usually carries the leading
+    space (" Wait"), and cutting at its start — not at the "W" — is what keeps
+    the prefix a clean token boundary.
+
+    Unlike `find_inner_repetition`, this is phrase matching, and per D33 a doubt
+    marker is ordinary reasoning behaviour that appears in successful traces at
+    similar density. It locates *positions to read*; it must not be used to
+    label a trace as derailed. The label comes from the outcome.
+    """
+    out = []
+    for start in marker_matches(spans.text, marker, case_sensitive=case_sensitive):
+        idx = spans.char_to_token(start)
+        if idx is not None:
+            out.append(idx)
+    return out

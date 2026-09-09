@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Gradio browser for the onset CSVs — step through explanations with arrows.
+
+    uv run --group dev python scripts/browse_onsets.py
+    uv run --group dev python scripts/browse_onsets.py --share
+
+Reads whatever `data/*_correct.csv` / `*_incorrect.csv` pairs exist (plus any
+single-file set like `loop_onsets.csv`) and offers each as a "set". For a
+*paired* set the two arms of a pair are shown side by side — same question, one
+rollout that recovered and one that did not — because that comparison is the
+whole point of the paired frame and reading the two files separately loses it.
+
+Keyboard: left/right arrows step, since clicking a button 684 times is not a
+workflow. The prefix pane shows the tail of the assistant turn, so the token
+`h_l` was read from is the last thing on screen.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+import gradio as gr
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+# How much of the assistant turn to show. The onset is at the END of the prefix,
+# so the tail is the informative part; the head is thousands of tokens of setup.
+TAIL_CHARS = 2600
+
+
+def discover(data_dir: Path) -> dict[str, dict[str, Path]]:
+    """Group the CSVs into sets: {name: {"correct": path, "incorrect": path}}."""
+    sets: dict[str, dict[str, Path]] = {}
+    for path in sorted(data_dir.glob("*.csv")):
+        stem = path.stem
+        for suffix in ("_correct", "_incorrect"):
+            if stem.endswith(suffix):
+                sets.setdefault(stem[: -len(suffix)], {})[suffix[1:]] = path
+                break
+        else:
+            sets.setdefault(stem, {})["all"] = path
+    return sets
+
+
+def load(path: Path) -> list[dict[str, Any]]:
+    with path.open(newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+class Store:
+    """Loaded CSV sets, indexed for pairing."""
+
+    def __init__(self, data_dir: Path) -> None:
+        self.sets = discover(data_dir)
+        self.cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
+
+    def rows(self, name: str) -> dict[str, list[dict[str, Any]]]:
+        if name not in self.cache:
+            self.cache[name] = {k: load(v) for k, v in self.sets[name].items()}
+        return self.cache[name]
+
+    def is_paired(self, name: str) -> bool:
+        """True when both arms exist and line up row-for-row on question_id.
+
+        Checked rather than inferred from the filename: a set sampled without
+        --paired also has both files, and showing unrelated rows side by side
+        while implying they are a pair would be actively misleading.
+        """
+        rows = self.rows(name)
+        if not {"correct", "incorrect"} <= rows.keys():
+            return False
+        a, b = rows["correct"], rows["incorrect"]
+        if len(a) != len(b):
+            return False
+        return all(x["question_id"] == y["question_id"] for x, y in zip(a, b, strict=True))
+
+
+def esc(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def render_prefix(row: dict[str, Any]) -> str:
+    """The assistant turn's tail, with the onset token called out at the end."""
+    try:
+        messages = json.loads(row.get("messages") or "[]")
+    except json.JSONDecodeError:
+        messages = []
+    assistant = next((m["content"] for m in reversed(messages) if m.get("role") == "assistant"), "")
+    if not assistant:
+        return "<div class='pane muted'>no messages column in this CSV</div>"
+    clipped = len(assistant) > TAIL_CHARS
+    tail = assistant[-TAIL_CHARS:]
+    head = "<span class='muted'>… earlier reasoning elided …</span><br><br>" if clipped else ""
+    marker = esc(row.get("onset_token") or row.get("marker") or "")
+    return (
+        f"<div class='pane'>{head}<span class='ctx'>{esc(tail)}</span>"
+        f"<span class='onset'>{marker}</span> <span class='muted'>&larr; h_l read here</span></div>"
+    )
+
+
+def render_meta(row: dict[str, Any]) -> str:
+    label = row.get("label", "")
+    outcome = row.get("outcome", "")
+    chips = [
+        f"<span class='chip {label}'>{esc(label)}</span>",
+        f"<span class='chip'>{esc(outcome)}</span>",
+        f"<span class='chip'>{esc(row.get('dataset', ''))}</span>",
+    ]
+    rank, count = row.get("marker_rank"), row.get("marker_count")
+    if rank and count:
+        chips.append(f"<span class='chip'>marker {esc(rank)}/{esc(count)}</span>")
+    if row.get("loop_period_chars"):
+        chips.append(f"<span class='chip'>loop period {esc(row['loop_period_chars'])}c</span>")
+    facts = [
+        ("rollout", f"{row.get('question_id', '')} #{row.get('rollout_index', '')}"),
+        ("prefix", f"{row.get('prefix_tokens', '')} tokens"),
+        ("‖h_l‖", row.get("h_norm", "")),
+        ("gold", row.get("gold", "")),
+        ("stop", row.get("stop_reason", "")),
+    ]
+    grid = "".join(
+        f"<div><span class='k'>{esc(k)}</span><span class='v'>{esc(str(v))}</span></div>"
+        for k, v in facts
+    )
+    return f"<div class='chips'>{''.join(chips)}</div><div class='facts'>{grid}</div>"
+
+
+def render_explanation(row: dict[str, Any]) -> str:
+    return f"<div class='pane expl'>{esc(row.get('explanation', ''))}</div>"
+
+
+def filtered(rows: list[dict[str, Any]], dataset: str) -> list[int]:
+    return [i for i, r in enumerate(rows) if dataset == "all" or r.get("dataset") == dataset]
+
+
+CSS = """
+#wrap {max-width: 1500px; margin: 0 auto}
+.pane {font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+  line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+  background: var(--block-background-fill); border: 1px solid var(--border-color-primary);
+  border-radius: 8px; padding: 12px 14px; max-height: 420px; overflow-y: auto}
+.pane.expl {font-family: inherit; font-size: 14.5px; line-height: 1.65; max-height: 300px}
+.ctx {opacity: .82}
+.onset {background: #f59e0b33; border-bottom: 2px solid #f59e0b; font-weight: 700;
+  padding: 1px 3px; border-radius: 3px}
+.muted {opacity: .5}
+.chips {display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px}
+.chip {font-size: 11.5px; padding: 2px 9px; border-radius: 999px; font-weight: 600;
+  background: var(--background-fill-secondary); border: 1px solid var(--border-color-primary)}
+.chip.correct {background: #10b98126; border-color: #10b981; color: #059669}
+.chip.incorrect {background: #ef444426; border-color: #ef4444; color: #dc2626}
+.facts {display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 4px 14px; font-size: 12px; margin-bottom: 6px}
+.facts .k {opacity: .55; margin-right: 6px}
+.facts .v {font-family: ui-monospace, monospace}
+.qbox {font-size: 13.5px; padding: 10px 12px; border-radius: 8px;
+  background: var(--background-fill-secondary); border: 1px solid var(--border-color-primary)}
+h3.sec {font-size: 12px; text-transform: uppercase; letter-spacing: .07em; opacity: .6;
+  margin: 14px 0 6px}
+"""
+
+# Gradio has no key bindings, and 684 pairs is a lot of clicking.
+JS = """
+() => {
+  document.addEventListener('keydown', (e) => {
+    if (e.target.matches('input, textarea, select')) return;
+    const id = e.key === 'ArrowLeft' ? 'btn-prev' : e.key === 'ArrowRight' ? 'btn-next' : null;
+    if (!id) return;
+    e.preventDefault();
+    document.getElementById(id)?.querySelector('button')?.click();
+  });
+}
+"""
+
+
+def build(store: Store) -> gr.Blocks:
+    names = sorted(store.sets)
+    if not names:
+        raise SystemExit("no CSVs found — run scripts/onset_verbalize.py first")
+
+    # Gradio 6 moved css/theme from Blocks() to launch(); they are passed in main().
+    with gr.Blocks(title="Onset explanations") as demo:
+        with gr.Column(elem_id="wrap"):
+            gr.Markdown(
+                "## Activation explanations at the self-doubt onset\n"
+                "`h_l` (layer 20) read at the last token before the marker, "
+                "verbalized by the trained AV. **←/→** to step."
+            )
+            with gr.Row():
+                set_dd = gr.Dropdown(names, value=names[0], label="set", scale=3)
+                ds_dd = gr.Dropdown(["all"], value="all", label="dataset", scale=2)
+                arm_dd = gr.Dropdown(
+                    ["correct", "incorrect"], value="correct", label="arm", scale=2
+                )
+            with gr.Row():
+                prev_btn = gr.Button("← previous", elem_id="btn-prev")
+                pos_md = gr.Markdown("—")
+                next_btn = gr.Button("next →", elem_id="btn-next", variant="primary")
+            idx_sl = gr.Slider(0, 1, step=1, value=0, label="index", interactive=True)
+
+            gr.HTML("<h3 class='sec'>question</h3>")
+            question = gr.HTML()
+            panes: list[dict[str, Any]] = []
+            cols = gr.Row()
+            with cols:
+                for side in ("left", "right"):
+                    with gr.Column():
+                        title = gr.Markdown()
+                        meta = gr.HTML()
+                        gr.HTML("<h3 class='sec'>AV explanation</h3>")
+                        expl = gr.HTML()
+                        gr.HTML("<h3 class='sec'>context, ending at the onset</h3>")
+                        pref = gr.HTML()
+                        panes.append(
+                            {"title": title, "meta": meta, "expl": expl, "pref": pref, "side": side}
+                        )
+
+            state = gr.State({"name": names[0], "dataset": "all", "arm": "correct", "i": 0})
+
+        outs = [question, pos_md, idx_sl, arm_dd, state]
+        for p in panes:
+            outs += [p["title"], p["meta"], p["expl"], p["pref"]]
+
+        def view(st: dict[str, Any]) -> list[Any]:
+            name = st["name"]
+            rows_by_arm = store.rows(name)
+            paired = store.is_paired(name)
+            arm = "all" if "all" in rows_by_arm else st["arm"]
+            primary = rows_by_arm[arm]
+            keep = filtered(primary, st["dataset"])
+            if not keep:
+                blank = ["", ""] * 4
+                return ["", "**no rows match**", gr.update(), gr.update(visible=False), st, *blank]
+            i = max(0, min(st["i"], len(keep) - 1))
+            st = {**st, "i": i}
+            row = primary[keep[i]]
+
+            sides: list[tuple[str, dict[str, Any]] | None] = [("this rollout", row)]
+            if paired:
+                sides = [
+                    ("✅ answered correctly", rows_by_arm["correct"][keep[i]]),
+                    ("❌ did not", rows_by_arm["incorrect"][keep[i]]),
+                ]
+            sides += [None] * (len(panes) - len(sides))
+
+            out: list[Any] = [
+                f"<div class='qbox'>{esc(row.get('question', ''))}</div>",
+                f"**{i + 1} / {len(keep)}**" + ("  · paired" if paired else ""),
+                gr.update(minimum=0, maximum=max(len(keep) - 1, 0), value=i),
+                gr.update(visible=not paired and "all" not in rows_by_arm),
+                st,
+            ]
+            for _p, spec in zip(panes, sides, strict=True):
+                if spec is None:
+                    out += ["", "", "", ""]
+                    continue
+                head, r = spec
+                out += [f"**{head}**", render_meta(r), render_explanation(r), render_prefix(r)]
+            return out
+
+        def step(st: dict[str, Any], delta: int) -> list[Any]:
+            return view({**st, "i": st["i"] + delta})
+
+        def reset(st: dict[str, Any], **kw: Any) -> list[Any]:
+            return view({**st, **kw, "i": 0})
+
+        prev_btn.click(lambda st: step(st, -1), state, outs)
+        next_btn.click(lambda st: step(st, +1), state, outs)
+        idx_sl.input(lambda st, v: view({**st, "i": int(v)}), [state, idx_sl], outs)
+        arm_dd.change(lambda st, v: reset(st, arm=v), [state, arm_dd], outs)
+        ds_dd.change(lambda st, v: reset(st, dataset=v), [state, ds_dd], outs)
+
+        def switch(st: dict[str, Any], name: str) -> list[Any]:
+            rows_by_arm = store.rows(name)
+            first = next(iter(rows_by_arm.values()))
+            datasets = ["all"] + sorted({r.get("dataset", "") for r in first} - {""})
+            return [gr.update(choices=datasets, value="all")] + reset(st, name=name, dataset="all")
+
+        set_dd.change(switch, [state, set_dd], [ds_dd] + outs)
+        demo.load(switch, [state, set_dd], [ds_dd] + outs).then(None, None, None, js=JS)
+    return demo
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--data", type=Path, default=Path("data"))
+    ap.add_argument("--port", type=int, default=7860)
+    ap.add_argument("--share", action="store_true")
+    args = ap.parse_args()
+    store = Store(args.data)
+    print("sets found:")
+    for name, files in store.sets.items():
+        print(f"  {name}: {', '.join(sorted(files))}")
+    build(store).launch(
+        server_port=args.port,
+        share=args.share,
+        inbrowser=False,
+        css=CSS,
+        theme=gr.themes.Soft(),
+    )
+
+
+if __name__ == "__main__":
+    main()

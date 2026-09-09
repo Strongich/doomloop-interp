@@ -132,12 +132,16 @@ class NLA:
         config: NLAConfig,
         tokenizer: Any,
         av_model: Any,
-        ar_model: ARModel,
+        ar_model: ARModel | None,
     ) -> None:
         self.config = config
         self.tokenizer = tokenizer
         self.av = av_model  # full causal LM — verbalizes an injected activation
-        self.ar = ar_model  # truncated transformer + affine map — reconstructs it
+        # Truncated transformer + affine map. None when only verbalization is
+        # wanted: `verbalize()` never touches the AR, and skipping it saves the
+        # 21 blocks' worth of weights — which is the difference between fitting
+        # and not fitting on a 16 GB card alongside the model being probed.
+        self.ar = ar_model
 
     @property
     def d_model(self) -> int:
@@ -231,6 +235,33 @@ class NLA:
         ar_model = ARModel(ar_backbone, d_model=d_model, bias=config.ar_affine_bias)
 
         return cls(config, tokenizer, av_model, ar_model)
+
+    @classmethod
+    def av_only(
+        cls,
+        av_path: str,
+        config: NLAConfig | None = None,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        device_map: str | dict[str, int] | None = "auto",
+        trust_remote_code: bool = True,
+    ) -> NLA:
+        """Load just the AV from a trained checkpoint, for verbalization only.
+
+        `from_pretrained` builds both halves from one `model_id`, which is right
+        for training but wrong here twice over: the AV lives in its own
+        checkpoint directory, and loading the AR alongside it costs memory that
+        `verbalize()` will never use.
+        """
+        config = config or NLAConfig()
+        tokenizer = AutoTokenizer.from_pretrained(av_path)
+        av_model = AutoModelForCausalLM.from_pretrained(
+            av_path,
+            torch_dtype=dtype,
+            device_map=device_map,
+            trust_remote_code=trust_remote_code,
+        )
+        return cls(config, tokenizer, av_model, None)
 
     @staticmethod
     def _load_truncated_backbone(

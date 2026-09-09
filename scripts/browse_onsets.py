@@ -56,6 +56,7 @@ class Store:
     """Loaded CSV sets, indexed for pairing."""
 
     def __init__(self, data_dir: Path) -> None:
+        self.data_dir = data_dir
         self.sets = discover(data_dir)
         self.cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
 
@@ -157,6 +158,112 @@ def filtered(rows: list[dict[str, Any]], dataset: str) -> list[int]:
     return [i for i, r in enumerate(rows) if dataset == "all" or r.get("dataset") == dataset]
 
 
+# --------------------------------------------------------------------------- #
+# trajectory tab
+# --------------------------------------------------------------------------- #
+
+TRAJ_METRICS = [
+    ("recurrence", "recurrence — cos to the most similar earlier state", (0.4, 1.005)),
+    ("velocity", "velocity — cos to the previous state", (0.2, 1.005)),
+    ("eff_rank", "eff_rank — directions used per 384-token window", None),
+]
+
+
+def traj_rows(data_dir: Path) -> list[dict[str, Any]]:
+    path = data_dir / "trajectories" / "summary.csv"
+    return load(path) if path.exists() else []
+
+
+def traj_key(row: dict[str, Any]) -> str:
+    return f"{row['question_id']}#{row['rollout_index']}"
+
+
+def traj_label(row: dict[str, Any]) -> str:
+    tag = f"x{row['repeats']}" if row["kind"] == "loop" else "control"
+    return f"{traj_key(row)}  [{tag}]  {row['outcome']}"
+
+
+def traj_npz(data_dir: Path, row: dict[str, Any]) -> Any:
+    import numpy as np
+
+    name = f"{row['question_id'].replace(':', '_')}_{row['rollout_index']}.npz"
+    return np.load(data_dir / "trajectories" / name)
+
+
+def traj_plot(data_dir: Path, rows: list[dict[str, Any]], label: str) -> Any:
+    """Three stacked panels, loop trace against its matched control.
+
+    Plotted together on a shared x axis because the interesting quantity is the
+    *gap*: any trace grows more self-similar as context accumulates, so a rise in
+    recurrence only means something relative to a rollout of the same question
+    that did not loop.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    chosen = next((r for r in rows if traj_label(r) == label), None)
+    if chosen is None:
+        return None
+    series = [(chosen, "#dc2626" if chosen["kind"] == "loop" else "#0ea5e9")]
+    mate = next(
+        (r for r in rows if r["question_id"] == chosen["question_id"] and r is not chosen),
+        None,
+    )
+    if mate is not None:
+        series.append((mate, "#0ea5e9" if mate["kind"] == "control" else "#dc2626"))
+
+    fig, axes = plt.subplots(3, 1, figsize=(11, 8.5), sharex=True)
+    for ax, (metric, title, ylim) in zip(axes, TRAJ_METRICS, strict=True):
+        for row, colour in series:
+            npz = traj_npz(data_dir, row)
+            y = npz[metric].astype(float)
+            x = np.arange(len(y)) * int(row["stride"])
+            tag = "loop" if row["kind"] == "loop" else "control"
+            ax.plot(x, y, lw=0.8, color=colour, alpha=0.85, label=f"{traj_key(row)} ({tag})")
+            if row["kind"] == "loop":
+                ax.axvline(
+                    int(row["onset"]) * int(row["stride"]),
+                    color="#f59e0b",
+                    lw=1.4,
+                    ls="--",
+                    label="loop onset" if metric == "recurrence" else None,
+                )
+        ax.set_title(title, fontsize=10, loc="left")
+        ax.grid(alpha=0.25, lw=0.5)
+        if ylim:
+            ax.set_ylim(*ylim)
+    axes[0].legend(fontsize=8, loc="lower right")
+    axes[-1].set_xlabel("response token position")
+    fig.tight_layout()
+    return fig
+
+
+def traj_facts(rows: list[dict[str, Any]], label: str) -> str:
+    chosen = next((r for r in rows if traj_label(r) == label), None)
+    if chosen is None:
+        return ""
+    group = [r for r in rows if r["question_id"] == chosen["question_id"]]
+    head = (
+        "<tr><th>rollout</th><th>kind</th><th>outcome</th><th>tokens</th>"
+        "<th>recurrence pre&rarr;post</th><th>velocity pre&rarr;post</th>"
+        "<th>eff_rank pre&rarr;post</th></tr>"
+    )
+    body = ""
+    for r in group:
+        strong = " class='hl'" if r is chosen else ""
+        body += (
+            f"<tr{strong}><td>{esc(traj_key(r))}</td><td>{esc(r['kind'])}</td>"
+            f"<td>{esc(r['outcome'])}</td><td>{esc(r['n_tokens'])}</td>"
+            f"<td>{float(r['recurrence_pre']):.3f} &rarr; {float(r['recurrence_post']):.3f}</td>"
+            f"<td>{float(r['velocity_pre']):.3f} &rarr; {float(r['velocity_post']):.3f}</td>"
+            f"<td>{float(r['eff_rank_pre']):.0f} &rarr; {float(r['eff_rank_post']):.0f}</td></tr>"
+        )
+    return f"<table class='tt'>{head}{body}</table>"
+
+
 CSS = """
 #wrap {max-width: 1500px; margin: 0 auto}
 .pane {font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
@@ -177,6 +284,11 @@ CSS = """
   gap: 4px 14px; font-size: 12px; margin-bottom: 6px}
 .facts .k {opacity: .55; margin-right: 6px}
 .facts .v {font-family: ui-monospace, monospace}
+table.tt {border-collapse: collapse; font-size: 12px; width: 100%}
+table.tt th {text-align: left; font-weight: 600; opacity: .6; padding: 4px 10px 4px 0;
+  border-bottom: 1px solid var(--border-color-primary)}
+table.tt td {padding: 4px 10px 4px 0; font-family: ui-monospace, monospace}
+table.tt tr.hl td {font-weight: 700; color: var(--body-text-color)}
 .qbox {font-size: 13.5px; padding: 10px 12px; border-radius: 8px;
   background: var(--background-fill-secondary); border: 1px solid var(--border-color-primary)}
 h3.sec {font-size: 12px; text-transform: uppercase; letter-spacing: .07em; opacity: .6;
@@ -203,69 +315,101 @@ def build(store: Store) -> gr.Blocks:
         raise SystemExit("no CSVs found — run scripts/onset_verbalize.py first")
 
     # Gradio 6 moved css/theme from Blocks() to launch(); they are passed in main().
-    with gr.Blocks(title="Onset explanations") as demo:
-        with gr.Column(elem_id="wrap"):
-            gr.Markdown(
-                "## Activation explanations at the self-doubt onset\n"
-                "`h_l` (layer 20) read at the last token before the marker, "
-                "verbalized by the trained AV. **←/→** to step."
-            )
-            with gr.Row():
-                set_dd = gr.Dropdown(names, value=names[0], label="set", scale=3)
-                ds_dd = gr.Dropdown(["all"], value="all", label="dataset", scale=2)
-                arm_dd = gr.Dropdown(
-                    ["correct", "incorrect"], value="correct", label="arm", scale=2
-                )
-            with gr.Row():
-                prev_btn = gr.Button("← previous", elem_id="btn-prev")
-                pos_md = gr.Markdown("—")
-                next_btn = gr.Button("next →", elem_id="btn-next", variant="primary")
-            idx_sl = gr.Slider(0, 1, step=1, value=0, label="index", interactive=True)
+    trajectories = traj_rows(store.data_dir)
 
-            gr.HTML("<h3 class='sec'>question</h3>")
-            question = gr.HTML()
-            panes: list[dict[str, Any]] = []
-            cols = gr.Row()
-            with cols:
-                for side in ("left", "right"):
-                    with gr.Column():
-                        title = gr.Markdown()
-                        meta = gr.HTML()
-                        gr.HTML("<h3 class='sec'>AV explanation</h3>")
-                        expl = gr.HTML()
-                        gr.HTML("<h3 class='sec'>context, ending at the onset</h3>")
-                        pref = gr.HTML()
-                        # Closed by default: a loop-onset prefix runs to 28k
-                        # tokens, and mounting that on every arrow press would
-                        # make navigation crawl.
-                        with gr.Accordion(
-                            "full conversation (assistant turn ends at the onset)",
-                            open=False,
-                        ):
-                            # gradio 6.26: `type` and `show_copy_button` are
-                            # gone (messages format is the only one now), and
-                            # `<think>` would be swallowed into a reasoning
-                            # accordion, so reasoning_tags is cleared — the
-                            # think block IS the content here.
-                            chat = gr.Chatbot(
-                                render_markdown=False,
-                                reasoning_tags=[],
-                                height=560,
-                                show_label=False,
-                                resizable=True,
+    with gr.Blocks(title="Onset explanations") as demo:
+        with gr.Tabs():
+            with gr.Tab("explanations"), gr.Column(elem_id="wrap"):
+                gr.Markdown(
+                    "## Activation explanations at the self-doubt onset\n"
+                    "`h_l` (layer 20) read at the last token before the marker, "
+                    "verbalized by the trained AV. **←/→** to step."
+                )
+                with gr.Row():
+                    set_dd = gr.Dropdown(names, value=names[0], label="set", scale=3)
+                    ds_dd = gr.Dropdown(["all"], value="all", label="dataset", scale=2)
+                    arm_dd = gr.Dropdown(
+                        ["correct", "incorrect"], value="correct", label="arm", scale=2
+                    )
+                with gr.Row():
+                    prev_btn = gr.Button("← previous", elem_id="btn-prev")
+                    pos_md = gr.Markdown("—")
+                    next_btn = gr.Button("next →", elem_id="btn-next", variant="primary")
+                idx_sl = gr.Slider(0, 1, step=1, value=0, label="index", interactive=True)
+
+                gr.HTML("<h3 class='sec'>question</h3>")
+                question = gr.HTML()
+                panes: list[dict[str, Any]] = []
+                cols = gr.Row()
+                with cols:
+                    for side in ("left", "right"):
+                        with gr.Column():
+                            title = gr.Markdown()
+                            meta = gr.HTML()
+                            gr.HTML("<h3 class='sec'>AV explanation</h3>")
+                            expl = gr.HTML()
+                            gr.HTML("<h3 class='sec'>context, ending at the onset</h3>")
+                            pref = gr.HTML()
+                            # Closed by default: a loop-onset prefix runs to 28k
+                            # tokens, and mounting that on every arrow press would
+                            # make navigation crawl.
+                            with gr.Accordion(
+                                "full conversation (assistant turn ends at the onset)",
+                                open=False,
+                            ):
+                                # gradio 6.26: `type` and `show_copy_button` are
+                                # gone (messages format is the only one now), and
+                                # `<think>` would be swallowed into a reasoning
+                                # accordion, so reasoning_tags is cleared — the
+                                # think block IS the content here.
+                                chat = gr.Chatbot(
+                                    render_markdown=False,
+                                    reasoning_tags=[],
+                                    height=560,
+                                    show_label=False,
+                                    resizable=True,
+                                )
+                            panes.append(
+                                {
+                                    "title": title,
+                                    "meta": meta,
+                                    "expl": expl,
+                                    "pref": pref,
+                                    "chat": chat,
+                                    "side": side,
+                                }
                             )
-                        panes.append(
-                            {
-                                "title": title,
-                                "meta": meta,
-                                "expl": expl,
-                                "pref": pref,
-                                "chat": chat,
-                                "side": side,
-                            }
+
+                state = gr.State({"name": names[0], "dataset": "all", "arm": "correct", "i": 0})
+
+            if trajectories:
+                with gr.Tab("trajectories"), gr.Column(elem_id="wrap"):
+                    gr.Markdown(
+                        "## Does the residual stream stop moving?\n"
+                        "Layer-20 state at every position. Each looping trace is drawn "
+                        "against a non-looping rollout of the **same question** — "
+                        "self-similarity rises with context in any trace, so only the "
+                        "gap between the two curves means anything."
+                    )
+                    loops_first = sorted(
+                        trajectories, key=lambda r: (r["kind"] != "loop", -int(r["repeats"] or 0))
+                    )
+                    traj_dd = gr.Dropdown(
+                        [traj_label(r) for r in loops_first],
+                        value=traj_label(loops_first[0]),
+                        label="trace (loops first, most repeats first)",
+                    )
+                    traj_tbl = gr.HTML()
+                    traj_fig = gr.Plot()
+
+                    def show_traj(label: str) -> tuple[Any, Any]:
+                        return (
+                            traj_facts(trajectories, label),
+                            traj_plot(store.data_dir, trajectories, label),
                         )
 
-            state = gr.State({"name": names[0], "dataset": "all", "arm": "correct", "i": 0})
+                    traj_dd.change(show_traj, traj_dd, [traj_tbl, traj_fig])
+                    demo.load(show_traj, traj_dd, [traj_tbl, traj_fig])
 
         outs = [question, pos_md, idx_sl, arm_dd, state]
         for p in panes:

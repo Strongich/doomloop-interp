@@ -7,11 +7,12 @@ on itself, the one where the gold answer first appears, and the last one.
 The whole trace's states come from ONE forward pass (the layer-20 hook sees the
 full `[1, S, d]` tensor), so stepping through tokens costs nothing after load.
 
-**The null matters more than the anchors.** Within-trace cosine between layer-20
-states is ~0.88 for *arbitrary* pairs, so "the pre-doubt state is similar to the
-answer state" is not a finding by itself — it is what any two states in one trace
-look like. `baseline()` samples random pairs at a matched separation so a
-similarity can be read as above or below chance rather than as a bare number.
+**The null matters more than the anchors.** Measured within one trace, arbitrary
+layer-20 pairs sit at ~0.47 cosine and pairs a few tokens apart at ~0.54, so a
+bare "0.5 between the pre-doubt and answer states" is not a finding — it is what
+any two states in that trace look like. `baseline()` samples random pairs at a
+matched separation, drawn from inside `<think>`, so a similarity reads as above
+or below chance rather than as an uninterpretable number.
 """
 
 from __future__ import annotations
@@ -26,6 +27,30 @@ from .nla.arch import inner_transformer
 
 # Random pairs drawn for the null. Enough to pin the mean to ~0.001.
 BASELINE_PAIRS = 2000
+
+
+def _think_token_range(response: str, offsets: list[tuple[int, int]]) -> tuple[int, int]:
+    """Token span of the <think> block.
+
+    A derailed trace never emits `</think>` — it ran out of budget mid-thought —
+    so an unterminated block runs to the end of the response. Treating a missing
+    close tag as an empty block would leave exactly the traces this study is
+    about with no null at all.
+    """
+    open_at = response.find("<think>")
+    start_char = open_at + len("<think>") if open_at >= 0 else 0
+    close_at = response.find("</think>", start_char)
+    end_char = close_at if close_at >= 0 else len(response)
+
+    def tok_at(char: int, default: int) -> int:
+        for i, (_a, b) in enumerate(offsets):
+            if b > char:
+                return i
+        return default
+
+    start = tok_at(start_char, 0)
+    end = tok_at(end_char, len(offsets)) if close_at >= 0 else len(offsets)
+    return (start, max(end, start + 1))
 
 
 def _chat_header(tokenizer: Any, question: str) -> str:
@@ -59,6 +84,8 @@ class TraceView:
     labels: list[str]
     anchors: list[Anchor]
     n_header: int
+    # Token range of the <think> block, the region the null is drawn from.
+    think: tuple[int, int] = (0, 0)
     states: torch.Tensor | None = field(default=None, repr=False)
 
     def piece(self, index: int) -> str:
@@ -107,6 +134,8 @@ def build_view(tokenizer: Any, question: str, response: str, gold: str) -> Trace
 
     anchors.append(Anchor("end", len(offsets) - 1, "last token"))
 
+    think = _think_token_range(response, offsets)
+
     header = _chat_header(tokenizer, question)
     n_header = len(tokenizer(header, add_special_tokens=False)["input_ids"])
     return TraceView(
@@ -118,6 +147,7 @@ def build_view(tokenizer: Any, question: str, response: str, gold: str) -> Trace
         labels=labels,
         anchors=sorted(anchors, key=lambda a: a.token_index),
         n_header=n_header,
+        think=think,
     )
 
 
@@ -162,18 +192,34 @@ def cosine(states: torch.Tensor, i: int, j: int) -> float:
 
 
 def baseline(
-    states: torch.Tensor, separation: int, pairs: int = BASELINE_PAIRS
+    states: torch.Tensor,
+    separation: int,
+    pairs: int = BASELINE_PAIRS,
+    region: tuple[int, int] | None = None,
 ) -> tuple[float, float]:
-    """Mean and sd of cosine between random pairs ~`separation` tokens apart.
+    """Mean and sd of cosine between random pairs `separation` tokens apart.
 
     Matched on separation because similarity decays with distance: comparing a
     500-token-apart anchor pair against a null of arbitrary pairs would show a
     difference that is only about distance.
+
+    `region` confines both endpoints to a token range — the `<think>` block. The
+    reasoning inside <think> and the answer written after it have different
+    statistics (the post-think text is a short committed restatement), so a null
+    spanning both is a mixture, while every anchor we care about lives inside
+    <think>. Drawing the null from the region the anchors come from makes z a
+    statement about *those positions* rather than about think-vs-answer.
     """
     n = states.shape[0]
-    sep = max(1, min(separation, n - 1))
-    lo = torch.randint(0, n - sep, (min(pairs, max(n - sep, 1)),), device=states.device)
+    lo_b, hi_b = region if region else (0, n)
+    lo_b, hi_b = max(0, lo_b), min(n, hi_b)
+    span = hi_b - lo_b
+    sep = max(1, min(separation, max(span - 1, 1)))
+    count = max(span - sep, 1)
+    lo = lo_b + torch.randint(0, count, (min(pairs, count),), device=states.device)
     hi = lo + sep
     unit = torch.nn.functional.normalize(states.float(), dim=-1)
     sims = (unit[lo] * unit[hi]).sum(-1)
+    if sims.numel() < 2:
+        return float(sims.mean()), float("nan")
     return float(sims.mean()), float(sims.std())

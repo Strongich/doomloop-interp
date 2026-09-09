@@ -373,7 +373,7 @@ def similarity_table(view: Any, index: int) -> str:
     for anchor in view.anchors:
         sim = cosine(states, index, anchor.token_index)
         sep = abs(index - anchor.token_index)
-        mu, sd = baseline(states, sep)
+        mu, sd = baseline(states, sep, region=view.think)
         z = (sim - mu) / sd if sd > 0 else float("nan")
         verdict = "above chance" if z > 2 else ("below chance" if z < -2 else "chance")
         rows += (
@@ -385,7 +385,13 @@ def similarity_table(view: Any, index: int) -> str:
         "<tr><th>anchor</th><th>token</th><th>cosine</th>"
         "<th>chance at same distance</th><th>z</th><th></th></tr>"
     )
-    return f"<table class='tt'>{head}{rows}</table>"
+    lo, hi = view.think
+    note = (
+        f"<div class='muted' style='font-size:11.5px;margin-top:6px'>null drawn from "
+        f"random pairs inside &lt;think&gt; (tokens {lo}–{hi}) at the same separation"
+        "</div>"
+    )
+    return f"<table class='tt'>{head}{rows}</table>{note}"
 
 
 CSS = """

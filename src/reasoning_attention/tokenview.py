@@ -17,6 +17,7 @@ or below chance rather than as an uninterpretable number.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,8 +30,10 @@ from .nla.arch import inner_transformer
 BASELINE_PAIRS = 2000
 
 
-def _think_token_range(response: str, offsets: list[tuple[int, int]]) -> tuple[int, int]:
-    """Token span of the <think> block.
+def _think_ranges(
+    response: str, offsets: list[tuple[int, int]]
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Token span and char span of the <think> block.
 
     A derailed trace never emits `</think>` — it ran out of budget mid-thought —
     so an unterminated block runs to the end of the response. Treating a missing
@@ -50,7 +53,52 @@ def _think_token_range(response: str, offsets: list[tuple[int, int]]) -> tuple[i
 
     start = tok_at(start_char, 0)
     end = tok_at(end_char, len(offsets)) if close_at >= 0 else len(offsets)
-    return (start, max(end, start + 1))
+    return (start, max(end, start + 1)), (start_char, end_char)
+
+
+def block_boundaries(
+    text: str,
+    region: tuple[int, int] | None = None,
+    marker: str = "wait",
+) -> list[tuple[int, int, bool]]:
+    """Char offsets of block ends that are followed by a block of self-doubt.
+
+    The model paragraphs its reasoning on blank lines, so the last token before a
+    `\n\n` is where it has finished a step and is choosing what to do next. Those
+    boundaries where the *next* block opens with a doubt marker are the decision
+    points this study wants: the model had a completed step in hand and chose to
+    second-guess it rather than conclude.
+
+    Returns (last_char_of_block, first_char_of_next_block, next_block_doubts).
+    Only the first sentence of the next block is searched, so a "wait" deep
+    inside a long block does not label a boundary hundreds of tokens earlier.
+
+    Boundaries where the next block does NOT doubt are the control this analysis
+    needs: they are the same kind of position (end of a completed reasoning
+    block), measured the same way, differing only in what the model chose to do
+    next. Comparing doubt boundaries against a null of arbitrary within-think
+    pairs instead confounds the result with absolute position, since every
+    boundary sits at a block edge and the anchor is pinned to the end of
+    thinking.
+    """
+    lo, hi = region if region else (0, len(text))
+    out: list[tuple[int, int, bool]] = []
+    pos = text.find("\n\n", lo)
+    while pos != -1 and pos < hi:
+        nxt = pos
+        while nxt < len(text) and text[nxt] == "\n":
+            nxt += 1
+        sentence = re.split(r"(?<=[.!?])\s|\n", text[nxt : nxt + 400], maxsplit=1)[0]
+        if pos - 1 >= lo:
+            out.append((pos - 1, nxt, marker.lower() in sentence.lower()))
+        pos = text.find("\n\n", pos + 2)
+    return out
+
+
+def think_close_char(text: str) -> int | None:
+    """Char offset of `</think>`, or None when the trace never closed it."""
+    at = text.find("</think>")
+    return at if at >= 0 else None
 
 
 def _chat_header(tokenizer: Any, question: str) -> str:
@@ -86,7 +134,15 @@ class TraceView:
     n_header: int
     # Token range of the <think> block, the region the null is drawn from.
     think: tuple[int, int] = (0, 0)
+    # The same block as character offsets, for text-level scanning.
+    think_chars: tuple[int, int] = (0, 0)
     states: torch.Tensor | None = field(default=None, repr=False)
+
+    def char_to_token(self, char_pos: int) -> int | None:
+        for i, (start, end) in enumerate(self.offsets):
+            if start <= char_pos < end:
+                return i
+        return None
 
     def piece(self, index: int) -> str:
         start, end = self.offsets[index]
@@ -134,7 +190,7 @@ def build_view(tokenizer: Any, question: str, response: str, gold: str) -> Trace
 
     anchors.append(Anchor("end", len(offsets) - 1, "last token"))
 
-    think = _think_token_range(response, offsets)
+    think, think_chars = _think_ranges(response, offsets)
 
     header = _chat_header(tokenizer, question)
     n_header = len(tokenizer(header, add_special_tokens=False)["input_ids"])
@@ -148,6 +204,7 @@ def build_view(tokenizer: Any, question: str, response: str, gold: str) -> Trace
         anchors=sorted(anchors, key=lambda a: a.token_index),
         n_header=n_header,
         think=think,
+        think_chars=think_chars,
     )
 
 

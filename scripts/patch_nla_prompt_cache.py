@@ -33,7 +33,7 @@ START = "    prompt_str = _TOKENIZER.apply_chat_template("
 END = "        embeds = (_EMBED(ids_tensor) * _EMBED_SCALE).float()  # [1, T, d]"
 MARKER = "_PROMPT_CACHE"
 
-REPLACEMENT = '''    # --- memoized: every RL prompt is the same template (see patch script) ---
+REPLACEMENT = """    # --- memoized: every RL prompt is the same template (see patch script) ---
     _key = tuple((m.get("role"), m.get("content")) for m in messages)
     _hit = _PROMPT_CACHE.get(_key)
     if _hit is None:
@@ -58,7 +58,7 @@ REPLACEMENT = '''    # --- memoized: every RL prompt is the same template (see p
     input_ids, ids_tensor, _base_embeds = _hit
     # Clone: the caller injects into this buffer, and the cached copy must stay
     # pristine for the next sample. ~885 KB memcpy at T=108, d=2048.
-    embeds = _base_embeds.clone()'''
+    embeds = _base_embeds.clone()"""
 
 
 def main() -> None:

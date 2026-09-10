@@ -40,7 +40,9 @@ def main() -> int:
         print(f"verify: {len(bad)}/{len(shards)} shard(s) of {repo_id} are corrupt or truncated:")
         for name, why in bad:
             print(f"  {name} — {why}")
-        print(f"\nRe-download with:\n  rm -rf {cache}\n  HF_HUB_DISABLE_XET=1 uv run hf download {repo_id} --max-workers 4")
+        print(
+            f"\nRe-download with:\n  rm -rf {cache}\n  HF_HUB_DISABLE_XET=1 uv run hf download {repo_id} --max-workers 4"
+        )
         return 1
 
     print(f"verify: {len(shards)} shard(s) of {repo_id} OK")

@@ -66,7 +66,7 @@ def main() -> int:
         return 1
 
     # Field whitelist + orjson import, placed after the last top-level import.
-    preamble = f'''
+    preamble = f"""
 # === NLA ===
 import dataclasses as _nla_dataclasses
 
@@ -74,7 +74,7 @@ import orjson as _orjson
 
 {MARKER} = {{f.name for f in _nla_dataclasses.fields(GenerateReqInput)}}
 # === end NLA ===
-'''
+"""
     anchor = re.search(r"^app = FastAPI\(", src, re.M)
     if anchor is None:
         print("ERROR: could not find `app = FastAPI(` to anchor the preamble", file=sys.stderr)

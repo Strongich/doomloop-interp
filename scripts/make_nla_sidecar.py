@@ -26,10 +26,14 @@ def main() -> None:
     e, t = meta["extraction"], meta["tokens"]
     print(f"wrote {out}")
     print(f"  injection_scale={e['injection_scale']}  mse_scale={e['mse_scale']}")
-    print(f"  placeholder {t['injection_char']!r} id={t['injection_token_id']} "
-          f"neighbors=({t['injection_left_neighbor_id']}, {t['injection_right_neighbor_id']})")
-    print(f"  critic_suffix_ids={t['critic_suffix_ids']} | critic layers="
-          f"{meta['critic']['extraction_layer_index']}")
+    print(
+        f"  placeholder {t['injection_char']!r} id={t['injection_token_id']} "
+        f"neighbors=({t['injection_left_neighbor_id']}, {t['injection_right_neighbor_id']})"
+    )
+    print(
+        f"  critic_suffix_ids={t['critic_suffix_ids']} | critic layers="
+        f"{meta['critic']['extraction_layer_index']}"
+    )
 
 
 if __name__ == "__main__":

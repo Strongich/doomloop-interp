@@ -37,9 +37,7 @@ def main() -> None:
         help="Which prepared dataset to pull a record from.",
     )
     parser.add_argument("--index", type=int, default=0, help="Record index to run.")
-    parser.add_argument(
-        "--no-thinking", action="store_true", help="Disable Qwen3 thinking mode."
-    )
+    parser.add_argument("--no-thinking", action="store_true", help="Disable Qwen3 thinking mode.")
     args = parser.parse_args()
 
     # --- one record ---
@@ -75,7 +73,7 @@ def main() -> None:
             max_new_tokens=s.max_tokens,
         )
     # Only the newly generated continuation (drop the prompt tokens).
-    new_tokens = generated[0, inputs["input_ids"].shape[1]:]
+    new_tokens = generated[0, inputs["input_ids"].shape[1] :]
     # skip_special_tokens=False so <think>…</think> and any special tokens show.
     text = tokenizer.decode(new_tokens, skip_special_tokens=False)
 

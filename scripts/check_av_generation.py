@@ -41,9 +41,9 @@ def _degeneracy(text: str) -> tuple[float, float]:
     words = re.findall(r"\w+", text.lower())
     reps = sum(1 for a, b in zip(words, words[1:]) if a == b) / max(1, len(words) - 1)
     letters = [c for c in text if c.isalpha()]
-    nonlatin = sum(
-        1 for c in letters if not unicodedata.name(c, "").startswith("LATIN")
-    ) / max(1, len(letters))
+    nonlatin = sum(1 for c in letters if not unicodedata.name(c, "").startswith("LATIN")) / max(
+        1, len(letters)
+    )
     return reps, nonlatin
 
 
@@ -71,8 +71,10 @@ def main() -> None:
     batch = next(pf.iter_batches(batch_size=args.n, columns=["activation_vector"]))
     flat = batch.column("activation_vector").flatten().to_numpy(zero_copy_only=False)
     vecs = flat.astype(np.float32).reshape(len(batch), -1)[: args.n]
-    print(f"{len(vecs)} activations, norms {vecs.__abs__().max():.0f} max, "
-          f"L2 {np.linalg.norm(vecs, axis=1).mean():.0f} mean\n")
+    print(
+        f"{len(vecs)} activations, norms {vecs.__abs__().max():.0f} max, "
+        f"L2 {np.linalg.norm(vecs, axis=1).mean():.0f} mean\n"
+    )
 
     # Explicit sampling, NOT the checkpoint's generation_config.json. Qwen3 ships
     # temperature=0.6/top_k=20/top_p=0.95 there, so a bare do_sample=True silently
@@ -80,8 +82,14 @@ def main() -> None:
     # does (miles defaults: T=1.0, top_p=1.0, top_k=-1).
     regimes = [
         ("greedy", {"do_sample": False}),
-        ("rollout T=1.0/top_p=1.0/top_k=off", {"do_sample": True, "temperature": 1.0, "top_p": 1.0, "top_k": 0}),
-        ("qwen3 rec T=0.7/top_p=0.8/top_k=20", {"do_sample": True, "temperature": 0.7, "top_p": 0.8, "top_k": 20}),
+        (
+            "rollout T=1.0/top_p=1.0/top_k=off",
+            {"do_sample": True, "temperature": 1.0, "top_p": 1.0, "top_k": 0},
+        ),
+        (
+            "qwen3 rec T=0.7/top_p=0.8/top_k=20",
+            {"do_sample": True, "temperature": 0.7, "top_p": 0.8, "top_k": 20},
+        ),
     ]
     for label, gen_kwargs in regimes:
         closed = 0
@@ -101,8 +109,10 @@ def main() -> None:
             nl_all.append(nl)
             print(f"--- {i} closed={ok} rep={reps:.2f} nonlatin={nl:.2f} ---")
             print(text.strip()[:400])
-        print(f"\n{label}: closed {closed}/{len(vecs)}, "
-              f"mean rep {np.mean(reps_all):.3f}, mean nonlatin {np.mean(nl_all):.3f}\n")
+        print(
+            f"\n{label}: closed {closed}/{len(vecs)}, "
+            f"mean rep {np.mean(reps_all):.3f}, mean nonlatin {np.mean(nl_all):.3f}\n"
+        )
 
 
 if __name__ == "__main__":

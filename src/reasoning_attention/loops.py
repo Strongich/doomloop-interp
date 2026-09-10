@@ -354,13 +354,18 @@ DOUBT_MARKERS = (
     "Hold on",
     "Actually",
     "Alternatively",
-    "But wait",
+    "But",
+    "Maybe",
+    "However",
     "Let me reconsider",
     "Let me double-check",
     "Let me verify",
     "That doesn't seem right",
     "That can't be right",
 )
+# Everything above except the one word, for testing whether a result about
+# "Wait" is about self-doubt or about that specific token.
+DOUBT_MARKERS_NON_WAIT = tuple(m for m in DOUBT_MARKERS if m.lower() != "wait")
 
 
 def doubt_spans(text: str, markers: tuple[str, ...] = DOUBT_MARKERS) -> list[tuple[int, int]]:

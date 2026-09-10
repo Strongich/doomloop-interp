@@ -18,6 +18,7 @@ or below chance rather than as an uninterpretable number.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -59,8 +60,8 @@ def _think_ranges(
 def block_boundaries(
     text: str,
     region: tuple[int, int] | None = None,
-    marker: str = "wait",
-) -> list[tuple[int, int, bool]]:
+    markers: Sequence[str] = ("wait",),
+) -> list[tuple[int, int, str | None]]:
     """Char offsets of block ends that are followed by a block of self-doubt.
 
     The model paragraphs its reasoning on blank lines, so the last token before a
@@ -69,9 +70,10 @@ def block_boundaries(
     points this study wants: the model had a completed step in hand and chose to
     second-guess it rather than conclude.
 
-    Returns (last_char_of_block, first_char_of_next_block, next_block_doubts).
-    Only the first sentence of the next block is searched, so a "wait" deep
-    inside a long block does not label a boundary hundreds of tokens earlier.
+    Returns (last_char_of_block, first_char_of_next_block, matched_marker), the
+    marker being None when the next block opens with none of them. Only the
+    first sentence of the next block is searched, so a marker deep inside a long
+    block does not label a boundary hundreds of tokens earlier.
 
     Boundaries where the next block does NOT doubt are the control this analysis
     needs: they are the same kind of position (end of a completed reasoning
@@ -82,15 +84,16 @@ def block_boundaries(
     thinking.
     """
     lo, hi = region if region else (0, len(text))
-    out: list[tuple[int, int, bool]] = []
+    out: list[tuple[int, int, str | None]] = []
     pos = text.find("\n\n", lo)
     while pos != -1 and pos < hi:
         nxt = pos
         while nxt < len(text) and text[nxt] == "\n":
             nxt += 1
-        sentence = re.split(r"(?<=[.!?])\s|\n", text[nxt : nxt + 400], maxsplit=1)[0]
+        sentence = re.split(r"(?<=[.!?])\s|\n", text[nxt : nxt + 400], maxsplit=1)[0].lower()
         if pos - 1 >= lo:
-            out.append((pos - 1, nxt, marker.lower() in sentence.lower()))
+            hit = next((m for m in markers if m.lower() in sentence), None)
+            out.append((pos - 1, nxt, hit))
         pos = text.find("\n\n", pos + 2)
     return out
 

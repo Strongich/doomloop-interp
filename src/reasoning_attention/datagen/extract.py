@@ -44,6 +44,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from reasoning_attention.config import D_MODEL, NLAConfig, WarmStartDataConfig, load_project_env
 from reasoning_attention.datagen.sidecar import DatasetMeta, ExtractionMeta, write_sidecar
 
+from ..nla.arch import inner_transformer
+
 
 def render_chat(conversation: Any, tokenizer: Any) -> str:
     """Flatten a WildChat conversation into one string via the chat template.
@@ -67,10 +69,73 @@ def render_chat(conversation: Any, tokenizer: Any) -> str:
     return rendered
 
 
+# open-r1's traces were produced by an R1-family model and carry its markers.
+# `<|begin_of_thought|>` maps onto Qwen3's `<think>`, but the solution markers
+# have NO Qwen equivalent — Qwen3 writes the answer plainly after `</think>` —
+# so they are deleted rather than mapped. Mapping them would teach the NLA to
+# explain a token our target model never emits.
+R1_MARKERS = {
+    "<|begin_of_thought|>": "<think>",
+    "<|end_of_thought|>": "</think>",
+    "<|begin_of_solution|>": "",
+    "<|end_of_solution|>": "",
+}
+
+
+def rewrite_r1_markers(text: str) -> str:
+    for src, dst in R1_MARKERS.items():
+        text = text.replace(src, dst)
+    return text.strip()
+
+
+def render_reasoning(conversation: Any, tokenizer: Any) -> str:
+    """open-r1 `conversations` ([{from, value}, ...]) as Qwen3 sees a trace.
+
+    The dataset's own `system` field is an R1-style prompt and is deliberately
+    dropped: our rollouts were generated with no system turn, so including one
+    would put the training activations in a context the study never probes.
+    """
+    turns = [t for t in (conversation or []) if t.get("value")]
+    user = next((t["value"] for t in turns if t.get("from") == "user"), None)
+    assistant = next((t["value"] for t in turns if t.get("from") != "user"), None)
+    if not user or not assistant:
+        return ""
+    header: str = tokenizer.apply_chat_template(
+        [{"role": "user", "content": str(user)}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=True,
+    )
+    return header + rewrite_r1_markers(str(assistant))
+
+
+def render_trace(row: dict[str, Any], tokenizer: Any) -> str:
+    """One of our own rollouts, rebuilt exactly as the model emitted it.
+
+    Same construction as `scripts/onset_verbalize.py` and the study's probes:
+    chat template with `add_generation_prompt=True`, then the raw response. The
+    template does not emit `<think>` — the model does.
+    """
+    question, response = row.get("question"), row.get("response")
+    if not question or not response:
+        return ""
+    header: str = tokenizer.apply_chat_template(
+        [{"role": "user", "content": str(question)}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=True,
+    )
+    return header + str(response)
+
+
 def document_text(row: dict[str, Any], column: str, kind: str, tokenizer: Any) -> str:
     """Extract one document's text, per corpus kind."""
     if kind == "chat":
         return render_chat(row[column], tokenizer)
+    if kind == "reasoning":
+        return render_reasoning(row[column], tokenizer)
+    if kind == "trace":
+        return render_trace(row, tokenizer)
     return str(row[column])
 
 
@@ -127,6 +192,24 @@ def sample_positions(
     return rng.sample(candidates, k=min(n_positions, len(candidates)))
 
 
+# Byte-level BPE writes "\n" as "Ċ", so a token whose piece contains "ĊĊ" spans a
+# blank line. Checked against the vocab rather than by decoding every token,
+# which would cost a string op per token per document.
+_BLANK_LINE_PIECE = "ĊĊ"
+
+
+def block_boundary_positions(token_ids: list[int], tokenizer: Any, min_position: int) -> list[int]:
+    """Positions whose token spans a blank line — the end of a reasoning block.
+
+    Qwen3 merges the preceding punctuation into the break, so ".\n\n" is ONE
+    token: the block's last token and the break are the same position. That is
+    the same position `tokenview.block_boundaries` probes, so training and
+    measurement land on the same states.
+    """
+    pieces = tokenizer.convert_ids_to_tokens(token_ids)
+    return [i for i, piece in enumerate(pieces) if i >= min_position and _BLANK_LINE_PIECE in piece]
+
+
 class Extractor:
     """Runs the target model and captures one layer's output via a forward hook."""
 
@@ -151,6 +234,11 @@ class Extractor:
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id, dtype=dtype, device_map=device_map
         ).eval()
+        # Forward the INNER transformer, never the causal-LM wrapper: the wrapper
+        # runs lm_head over every position, and at the 32k context the reasoning
+        # corpora need that is a batch x 32768 x 151936 logit tensor (~79 GB at
+        # batch 8) thrown away immediately. The layer hook fires either way.
+        self.trunk: Any = inner_transformer(self.model)
         self.layer_index = layer_index
         self.max_context_tokens = max_context_tokens
         self.batch_size = batch_size
@@ -184,7 +272,7 @@ class Extractor:
                 )
                 enc = {k: v.to(self.model.device) for k, v in enc.items()}
                 self._captured = None
-                self.model(**enc)
+                self.trunk(**enc)
                 assert self._captured is not None, "forward hook did not fire"
                 hidden = self._captured.float().cpu()
                 lengths = enc["attention_mask"].sum(dim=1).tolist()
@@ -219,12 +307,33 @@ def main() -> None:
     parser.add_argument(
         "--corpus-kind",
         default="plain",
-        choices=["plain", "chat"],
+        choices=["plain", "chat", "reasoning", "trace"],
         help="'plain' reads a text column; 'chat' renders a conversation list "
-        "through the target model's chat template (WildChat)",
+        "through the chat template (WildChat); 'reasoning' does the same for "
+        "open-r1 conversations with R1 markers rewritten; 'trace' rebuilds one "
+        "of our own rollouts from its question + response",
     )
     parser.add_argument(
         "--source-tag", default=None, help="value for the `source` column (default: corpus id)"
+    )
+    parser.add_argument(
+        "--corpus-file",
+        default=None,
+        help="read documents from a local jsonl instead of the Hub",
+    )
+    parser.add_argument(
+        "--position-mode",
+        default="random",
+        choices=["random", "block"],
+        help="'random' samples positions uniformly (the reference recipe); "
+        "'block' samples only block boundaries, the positions this study probes "
+        "and where reconstruction is measurably worst",
+    )
+    parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=None,
+        help="truncate documents to this length (default: DataGenConfig)",
     )
     args = parser.parse_args()
 
@@ -253,7 +362,12 @@ def main() -> None:
     schema = build_schema(extractor.d_model)
     special_ids = set(extractor.tokenizer.all_special_ids)
 
-    dataset = load_dataset(corpus, name=corpus_config, split=corpus_split, streaming=True)
+    if args.corpus_file:
+        # Our own rollouts live in a local jsonl, not on the Hub. Streaming a
+        # file keeps the rest of the loop identical.
+        dataset = load_dataset("json", data_files=args.corpus_file, split="train", streaming=True)
+    else:
+        dataset = load_dataset(corpus, name=corpus_config, split=corpus_split, streaming=True)
     # IterableDataset has no .select(): skip/take bound the slice, and the docs
     # arrive as an iterator we consume in chunks.
     if corpus_start:
@@ -288,14 +402,25 @@ def main() -> None:
             for result_index, res in enumerate(results):
                 doc_index = corpus_start + n_docs_seen + keep[result_index]
                 doc_id = f"{corpus}:{corpus_split}:{doc_index}"
-                positions = sample_positions(
-                    res.token_ids,
-                    positions_per_doc,
-                    special_ids,
-                    doc_id,
-                    seed,
-                    data_cfg.min_position,
-                )
+                if args.position_mode == "block":
+                    cands = block_boundary_positions(
+                        res.token_ids, extractor.tokenizer, data_cfg.min_position
+                    )
+                    # Deterministic in (seed, doc_id) like the random sampler, so
+                    # a re-slice of the corpus yields the same positions.
+                    rng = random.Random(hashlib.sha256(f"{seed}|{doc_id}|block".encode()).digest())
+                    positions = (
+                        rng.sample(cands, k=min(positions_per_doc, len(cands))) if cands else []
+                    )
+                else:
+                    positions = sample_positions(
+                        res.token_ids,
+                        positions_per_doc,
+                        special_ids,
+                        doc_id,
+                        seed,
+                        data_cfg.min_position,
+                    )
                 if not positions:
                     n_skipped += 1
                     continue
@@ -339,7 +464,7 @@ def main() -> None:
             corpus_start=corpus_start,
             n_documents=n_documents,
             positions_per_doc=positions_per_doc,
-            max_context_tokens=data_cfg.max_context_tokens,
+            max_context_tokens=args.max_context_tokens or data_cfg.max_context_tokens,
             min_position=data_cfg.min_position,
         ),
         created_by="reasoning_attention.datagen.extract",

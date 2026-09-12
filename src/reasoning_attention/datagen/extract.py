@@ -35,7 +35,7 @@ import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -222,6 +222,7 @@ class Extractor:
         layer_index: int,
         max_context_tokens: int,
         batch_size: int = 8,
+        token_budget: int | None = None,
         dtype: torch.dtype = torch.bfloat16,
         device_map: str = "auto",
     ) -> None:
@@ -245,6 +246,7 @@ class Extractor:
         self.layer_index = layer_index
         self.max_context_tokens = max_context_tokens
         self.batch_size = batch_size
+        self.token_budget = token_budget
         self.d_model = int(self.model.config.hidden_size)
         self._captured: torch.Tensor | None = None
 
@@ -255,6 +257,44 @@ class Extractor:
         h = output[0] if isinstance(output, tuple) else output
         self._captured = h.detach().clone()
 
+    def _batches(self, texts: list[str]) -> list[list[int]]:
+        """Group document indices into forward passes.
+
+        A fixed document count starves the GPU on long corpora and overruns it on
+        short ones: open-r1 averages ~7.1k tokens against Ultra-FineWeb's ~180, so
+        `--batch-size 2` there ran ~14k tokens per forward at ~37 TFLOPS on a card
+        that does 150-200. Packing to a TOKEN budget keeps every forward the same
+        size in the thing that actually costs.
+
+        Sorting by length first is the other half: a batch pads to its longest
+        member, so pairing a 28k document with a 2k one wastes 26k positions.
+        Descending order means the first index in a batch is its longest, so the
+        padded cost is exactly `len(batch) * lengths[batch[0]]`.
+
+        `batch_size` stays a hard cap on the count so a run of tiny documents
+        cannot assemble a batch of thousands.
+        """
+        if self.token_budget is None:
+            return [
+                list(range(i, min(i + self.batch_size, len(texts))))
+                for i in range(0, len(texts), self.batch_size)
+            ]
+        encoded = self.tokenizer(texts, add_special_tokens=True)["input_ids"]
+        lengths = [min(len(ids), self.max_context_tokens) for ids in encoded]
+        order = sorted(range(len(texts)), key=lambda i: lengths[i], reverse=True)
+
+        batches: list[list[int]] = []
+        batch: list[int] = []
+        for i in order:
+            padded = (len(batch) + 1) * lengths[batch[0]] if batch else lengths[i]
+            if batch and (padded > self.token_budget or len(batch) >= self.batch_size):
+                batches.append(batch)
+                batch = []
+            batch.append(i)
+        if batch:
+            batches.append(batch)
+        return batches
+
     @torch.no_grad()
     def extract(self, texts: list[str]) -> list[ExtractionResult]:
         layers = self.model.model.layers
@@ -263,11 +303,12 @@ class Extractor:
         )
         handle = layers[self.layer_index].register_forward_hook(self._hook)
         try:
-            out: list[ExtractionResult] = []
-            for start in range(0, len(texts), self.batch_size):
-                batch = texts[start : start + self.batch_size]
+            # Indexed, not appended: length-sorted batches come back out of order
+            # and the caller maps results to documents positionally.
+            out: list[ExtractionResult | None] = [None] * len(texts)
+            for index_batch in self._batches(texts):
                 enc = self.tokenizer(
-                    batch,
+                    [texts[i] for i in index_batch],
                     return_tensors="pt",
                     padding=True,
                     truncation=True,
@@ -281,13 +322,12 @@ class Extractor:
                 lengths = enc["attention_mask"].sum(dim=1).tolist()
                 ids = enc["input_ids"].cpu().tolist()
                 for row, seq_len in enumerate(lengths):
-                    out.append(
-                        ExtractionResult(
-                            hidden_states=hidden[row, :seq_len],
-                            token_ids=ids[row][:seq_len],
-                        )
+                    out[index_batch[row]] = ExtractionResult(
+                        hidden_states=hidden[row, :seq_len],
+                        token_ids=ids[row][:seq_len],
                     )
-            return out
+            assert all(r is not None for r in out), "a document produced no result"
+            return cast(list[ExtractionResult], out)
         finally:
             # Without this a mid-batch exception leaks the hook and the next
             # call double-registers, capturing the wrong layer.
@@ -333,6 +373,12 @@ def main() -> None:
         "and where reconstruction is measurably worst",
     )
     parser.add_argument(
+        "--token-budget",
+        type=int,
+        default=None,
+        help="pack each forward to this many padded tokens instead of a fixed count",
+    )
+    parser.add_argument(
         "--max-document-tokens",
         type=int,
         default=None,
@@ -369,6 +415,7 @@ def main() -> None:
         layer_index=nla_cfg.extraction_layer,
         max_context_tokens=max_context_tokens,
         batch_size=args.batch_size,
+        token_budget=args.token_budget,
     )
     assert extractor.d_model == D_MODEL, (
         f"model reports d_model={extractor.d_model}, config says {D_MODEL}"

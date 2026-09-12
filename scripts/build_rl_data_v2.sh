@@ -76,14 +76,13 @@ WEB_START="${WEB_START:-100000}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 CHUNK_SIZE="${CHUNK_SIZE:-256}"
 SEED="${SEED:-44}"
-# Reasoning traces run far longer than web snippets: open-r1's median is ~4.8k
-# tokens and p90 ~14k, so the 4096 default would cut most of them and confine
-# positions to the opening. 32768 matches the generation budget.
-REASONING_CONTEXT="${REASONING_CONTEXT:-32768}"
-# A 32k-token document is 8x the web default, so the per-forward batch has to
-# shrink by about as much to keep activation memory flat. open-r1 keeps this:
-# its p90 is ~14k, so its tail is genuinely long.
-REASONING_BATCH="${REASONING_BATCH:-2}"
+# open-r1 is long: measured over 3,000 streamed rows, p50 5,658, p90 14,476,
+# p95 17,480, mean 7,123, max 28,895. It is TRUNCATED to 8,192 rather than
+# dropped, unlike our own rollouts below — dropping >8,192 would discard 32.5% of
+# it, and long reasoning text is precisely the domain coverage this source exists
+# to provide. The cost is that its random positions come from each trace's first
+# 8,192 tokens only, which is acceptable for a breadth source.
+REASONING_CONTEXT="${REASONING_CONTEXT:-8192}"
 
 # OUR rollouts are a different distribution. Measured over all 35,728
 # (chat-template tokens): p50 1,722,
@@ -93,11 +92,27 @@ REASONING_BATCH="${REASONING_BATCH:-2}"
 # a prefix that is not the document the rest of the corpus represents.
 #
 # With the tail gone the worst case is 8,192 rather than 32,768, so the batch can
-# come up 4x. It stays a constant rather than a token budget because a constant
-# is what the OOM risk is actually bounded by here: 8 x 8,192 is the same token
-# count the web stage already runs at batch 8 x 4,096 x2.
+# come up 4x: 8 x 8,192 = 65k tokens per forward, 2x the web stage's 8 x 4,096.
+# Safe here because extract hooks ONE layer and never asks for
+# output_hidden_states, so activations are freed per block and the resident cost
+# is the model plus one [B,S,2048] capture — the lm_head OOM this repo hit twice
+# came from the causal-LM wrapper's [B,S,151936] logits, which inner_transformer
+# avoids entirely.
+#
+# NOTE traces_all.jsonl is ordered by dataset, not shuffled: its first 2,000 rows
+# drop 19% at this cap against 3.0% corpus-wide. That only matters for a capped
+# N_TRACE_DOCS run, which samples the head rather than the corpus.
 TRACE_MAX_TOKENS="${TRACE_MAX_TOKENS:-8192}"
-TRACE_BATCH="${TRACE_BATCH:-8}"
+
+# Pack every forward to a token budget instead of a document count. A fixed count
+# starves the GPU on long corpora and wastes it on short ones: open-r1 at
+# --batch-size 2 ran ~14k tokens per forward at ~37 TFLOPS on an A100 that does
+# 150-200, projecting 16h for that stage alone. The extractor also sorts by
+# length before packing, so a batch no longer pads a 2k document out to a 28k one.
+# BATCH_CAP bounds the count so a run of short documents cannot build a batch of
+# thousands. 64k padded tokens is 2x what the web stage already ran at batch 8.
+TOKEN_BUDGET="${TOKEN_BUDGET:-65536}"
+BATCH_CAP="${BATCH_CAP:-32}"
 mkdir -p "$DATA_DIR"
 
 if [[ ! -f "$TRACES" ]]; then
@@ -115,7 +130,8 @@ run_extract "$DATA_DIR/web_base.parquet" \
 echo "=== 2/5 open-r1: $N_R1_DOCS reasoning traces (random positions) ==="
 run_extract "$DATA_DIR/openr1_base.parquet" \
     --n-documents "$N_R1_DOCS" --corpus-start 0 \
-    --batch-size "$REASONING_BATCH" --chunk-size "$CHUNK_SIZE" --seed "$SEED" \
+    --batch-size "$BATCH_CAP" --token-budget "$TOKEN_BUDGET" \
+    --chunk-size "$CHUNK_SIZE" --seed "$SEED" \
     --corpus open-r1/OpenThoughts-114k-math --corpus-config default \
     --corpus-split train --text-column conversations \
     --corpus-kind reasoning --source-tag openr1 \
@@ -124,9 +140,10 @@ run_extract "$DATA_DIR/openr1_base.parquet" \
 echo "=== 3/5 our rollouts: $TRACES (BLOCK-boundary positions) ==="
 run_extract "$DATA_DIR/traces_base.parquet" \
     --n-documents "$N_TRACE_DOCS" --corpus-file "$TRACES" \
-    --batch-size "$TRACE_BATCH" --chunk-size "$CHUNK_SIZE" --seed "$SEED" \
+    --batch-size "$BATCH_CAP" --token-budget "$TOKEN_BUDGET" \
+    --chunk-size "$CHUNK_SIZE" --seed "$SEED" \
     --corpus-kind trace --source-tag qwen3_rollouts \
-    --position-mode block --max-context-tokens "$REASONING_CONTEXT" \
+    --position-mode block --max-context-tokens "$TRACE_MAX_TOKENS" \
     --max-document-tokens "$TRACE_MAX_TOKENS"
 
 set -e

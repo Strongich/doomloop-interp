@@ -333,6 +333,12 @@ def main() -> None:
         "and where reconstruction is measurably worst",
     )
     parser.add_argument(
+        "--max-document-tokens",
+        type=int,
+        default=None,
+        help="skip documents longer than this (measured, not truncated)",
+    )
+    parser.add_argument(
         "--max-context-tokens",
         type=int,
         default=None,
@@ -388,6 +394,7 @@ def main() -> None:
 
     row_count = 0
     n_skipped = 0
+    n_too_long = 0
     n_short = 0
     n_docs_seen = 0
     n_chunks = -(-n_documents // args.chunk_size)  # ceil, for the progress bar
@@ -401,6 +408,22 @@ def main() -> None:
             # forward rather than feeding the model a zero-length sequence.
             keep = [i for i, t in enumerate(texts) if t.strip()]
             n_skipped += len(texts) - len(keep)
+            if args.max_document_tokens is not None:
+                # DROP the over-long ones rather than truncating them. Truncation
+                # would keep the document at a length the batch must still be
+                # sized for, and would sample positions from a prefix that is not
+                # the document the rest of the corpus represents. Measured on the
+                # raw text, so the count is the same one the percentiles report.
+                measured = extractor.tokenizer([texts[i] for i in keep], add_special_tokens=True)[
+                    "input_ids"
+                ]
+                kept = [
+                    i
+                    for i, ids in zip(keep, measured, strict=True)
+                    if len(ids) <= args.max_document_tokens
+                ]
+                n_too_long += len(keep) - len(kept)
+                keep = kept
             if not keep:
                 n_docs_seen += len(chunk)
                 continue
@@ -480,6 +503,8 @@ def main() -> None:
     print(f"wrote {row_count} rows -> {args.output}")
     print(f"  skipped {n_skipped} docs (no valid position past {data_cfg.min_position})")
     print(f"  short-sampled {n_short} docs (< {positions_per_doc} valid positions)")
+    if args.max_document_tokens is not None:
+        print(f"  dropped {n_too_long} docs over {args.max_document_tokens} tokens")
     print(f"sidecar -> {write_sidecar(args.output, meta)}")
 
 

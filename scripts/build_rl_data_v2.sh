@@ -29,17 +29,33 @@ cd "$(dirname "$0")/.."
 # AFTER the parquet and sidecar are written (noted in CLAUDE.md). Under `set -e`
 # that non-zero exit aborts the whole build even though the output is complete.
 # So: run it, ignore the exit code, and verify the parquet instead.
-run_extract () {
-  local out="$1"; shift
-  uv run python -m reasoning_attention.datagen.extract --output "$out" "$@"
-  local rows
-  rows=$(uv run python -c "
+count_rows () {
+  uv run python -c "
 import sys, pyarrow.parquet as pq
 try:
     print(pq.read_metadata(sys.argv[1]).num_rows)
 except Exception:
     print(0)
-" "$out" 2>/dev/null)
+" "$1" 2>/dev/null
+}
+
+run_extract () {
+  local out="$1"; shift
+  # Resume: a complete parquet (readable footer, >0 rows) is left alone. This is
+  # an ~8h build over three sources, and redoing a finished stage after an
+  # interruption is hours. A half-written file has no footer, so count_rows
+  # returns 0 and it is rebuilt — the footer IS the completion marker.
+  if [[ -f "$out" ]]; then
+    local have
+    have=$(count_rows "$out")
+    if [[ "${have:-0}" -ge 1 ]]; then
+      echo "  -> $out: $have rows (exists, skipping — rm it to rebuild)"
+      return 0
+    fi
+  fi
+  uv run python -m reasoning_attention.datagen.extract --output "$out" "$@"
+  local rows
+  rows=$(count_rows "$out")
   if [[ "${rows:-0}" -lt 1 ]]; then
     echo "ERROR: $out has no rows — extraction genuinely failed" >&2
     exit 1
@@ -65,8 +81,23 @@ SEED="${SEED:-44}"
 # positions to the opening. 32768 matches the generation budget.
 REASONING_CONTEXT="${REASONING_CONTEXT:-32768}"
 # A 32k-token document is 8x the web default, so the per-forward batch has to
-# shrink by about as much to keep activation memory flat.
+# shrink by about as much to keep activation memory flat. open-r1 keeps this:
+# its p90 is ~14k, so its tail is genuinely long.
 REASONING_BATCH="${REASONING_BATCH:-2}"
+
+# OUR rollouts are a different distribution. Measured over all 35,728
+# (chat-template tokens): p50 1,722,
+# p90 4,608, p95 6,607, p99 12,937, max 32,768. Capping at 8,192 DROPS the 3.0%
+# that run longer rather than truncating them — a truncated trace still forces
+# the batch to be sized for its length, and its block positions would come from
+# a prefix that is not the document the rest of the corpus represents.
+#
+# With the tail gone the worst case is 8,192 rather than 32,768, so the batch can
+# come up 4x. It stays a constant rather than a token budget because a constant
+# is what the OOM risk is actually bounded by here: 8 x 8,192 is the same token
+# count the web stage already runs at batch 8 x 4,096 x2.
+TRACE_MAX_TOKENS="${TRACE_MAX_TOKENS:-8192}"
+TRACE_BATCH="${TRACE_BATCH:-8}"
 mkdir -p "$DATA_DIR"
 
 if [[ ! -f "$TRACES" ]]; then
@@ -93,9 +124,10 @@ run_extract "$DATA_DIR/openr1_base.parquet" \
 echo "=== 3/5 our rollouts: $TRACES (BLOCK-boundary positions) ==="
 run_extract "$DATA_DIR/traces_base.parquet" \
     --n-documents "$N_TRACE_DOCS" --corpus-file "$TRACES" \
-    --batch-size "$REASONING_BATCH" --chunk-size "$CHUNK_SIZE" --seed "$SEED" \
+    --batch-size "$TRACE_BATCH" --chunk-size "$CHUNK_SIZE" --seed "$SEED" \
     --corpus-kind trace --source-tag qwen3_rollouts \
-    --position-mode block --max-context-tokens "$REASONING_CONTEXT"
+    --position-mode block --max-context-tokens "$REASONING_CONTEXT" \
+    --max-document-tokens "$TRACE_MAX_TOKENS"
 
 set -e
 echo "=== 4/5 merge + shuffle ==="

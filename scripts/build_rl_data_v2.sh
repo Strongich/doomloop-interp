@@ -2,7 +2,7 @@
 # Build the Stage-2 RL prompt set, v2: web + open-r1 reasoning + our own rollouts.
 #
 #   scripts/build_rl_data_v2.sh                     # full build
-#   N_WEB_DOCS=200 N_R1_DOCS=200 scripts/build_rl_data_v2.sh   # shakeout
+#   N_WEB_DOCS=200 N_R1_DOCS=200 N_TRACE_DOCS=200 scripts/build_rl_data_v2.sh   # shakeout
 #   DATA_DIR=/workspace/data/rl2 scripts/build_rl_data_v2.sh
 #
 # Replaces WildChat with reasoning text, because the NLA measured at 0.905 cosine
@@ -21,12 +21,39 @@
 #
 # Still no API spend: RL needs no summaries — the AV generates the explanation
 # during rollout and the AR scores it.
-set -euo pipefail
+set -uo pipefail   # NOT -e: see run_extract
 cd "$(dirname "$0")/.."
+
+# `datagen.extract` regularly dies with a PyGILState_Release fatal error at
+# interpreter shutdown — the streaming dataset's aiohttp threads at teardown,
+# AFTER the parquet and sidecar are written (noted in CLAUDE.md). Under `set -e`
+# that non-zero exit aborts the whole build even though the output is complete.
+# So: run it, ignore the exit code, and verify the parquet instead.
+run_extract () {
+  local out="$1"; shift
+  uv run python -m reasoning_attention.datagen.extract --output "$out" "$@"
+  local rows
+  rows=$(uv run python -c "
+import sys, pyarrow.parquet as pq
+try:
+    print(pq.read_metadata(sys.argv[1]).num_rows)
+except Exception:
+    print(0)
+" "$out" 2>/dev/null)
+  if [[ "${rows:-0}" -lt 1 ]]; then
+    echo "ERROR: $out has no rows — extraction genuinely failed" >&2
+    exit 1
+  fi
+  echo "  -> $out: $rows rows"
+}
 
 DATA_DIR="${DATA_DIR:-data/rl2}"
 N_WEB_DOCS="${N_WEB_DOCS:-100000}"
 N_R1_DOCS="${N_R1_DOCS:-100000}"      # open-r1 has ~89k; take() stops early
+# Our rollout corpus is a local file with no natural cap, so the default is a
+# ceiling above its 35.7k lines. Lower it to keep a shakeout short — otherwise
+# N_WEB_DOCS/N_R1_DOCS shrink stages 1-2 while stage 3 still runs in full.
+N_TRACE_DOCS="${N_TRACE_DOCS:-10000000}"
 TRACES="${TRACES:-data/traces_all.jsonl}"
 # Web documents the SFT warm-start never saw. The warm-start used 0..99,999.
 WEB_START="${WEB_START:-100000}"
@@ -49,15 +76,13 @@ if [[ ! -f "$TRACES" ]]; then
 fi
 
 echo "=== 1/5 web: $N_WEB_DOCS Ultra-FineWeb documents from $WEB_START (random positions) ==="
-uv run python -m reasoning_attention.datagen.extract \
-    --output "$DATA_DIR/web_base.parquet" \
+run_extract "$DATA_DIR/web_base.parquet" \
     --n-documents "$N_WEB_DOCS" --corpus-start "$WEB_START" \
     --batch-size "$BATCH_SIZE" --chunk-size "$CHUNK_SIZE" --seed "$SEED" \
     --source-tag ultrafineweb
 
 echo "=== 2/5 open-r1: $N_R1_DOCS reasoning traces (random positions) ==="
-uv run python -m reasoning_attention.datagen.extract \
-    --output "$DATA_DIR/openr1_base.parquet" \
+run_extract "$DATA_DIR/openr1_base.parquet" \
     --n-documents "$N_R1_DOCS" --corpus-start 0 \
     --batch-size "$REASONING_BATCH" --chunk-size "$CHUNK_SIZE" --seed "$SEED" \
     --corpus open-r1/OpenThoughts-114k-math --corpus-config default \
@@ -66,13 +91,13 @@ uv run python -m reasoning_attention.datagen.extract \
     --max-context-tokens "$REASONING_CONTEXT"
 
 echo "=== 3/5 our rollouts: $TRACES (BLOCK-boundary positions) ==="
-uv run python -m reasoning_attention.datagen.extract \
-    --output "$DATA_DIR/traces_base.parquet" \
-    --n-documents 10000000 --corpus-file "$TRACES" \
+run_extract "$DATA_DIR/traces_base.parquet" \
+    --n-documents "$N_TRACE_DOCS" --corpus-file "$TRACES" \
     --batch-size "$REASONING_BATCH" --chunk-size "$CHUNK_SIZE" --seed "$SEED" \
     --corpus-kind trace --source-tag qwen3_rollouts \
     --position-mode block --max-context-tokens "$REASONING_CONTEXT"
 
+set -e
 echo "=== 4/5 merge + shuffle ==="
 # Shuffled so training does not see one source then the next — with a constant-LR
 # RL schedule that ordering is an unintended curriculum.

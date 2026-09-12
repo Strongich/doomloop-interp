@@ -29,9 +29,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import itertools
+import os
 import random
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
@@ -345,7 +348,12 @@ def main() -> None:
     corpus_split = args.corpus_split or data_cfg.corpus_split
     text_column = args.text_column or data_cfg.text_column
     source_tag = args.source_tag or corpus
+    # A local corpus is not the Hub default: naming it "openbmb/Ultra-FineWeb"
+    # would collide doc_ids with the web half of the same merged corpus.
+    doc_namespace = f"file:{Path(args.corpus_file).name}" if args.corpus_file else corpus
+    doc_split = "-" if args.corpus_file else corpus_split
     n_documents = args.n_documents or data_cfg.n_documents
+    max_context_tokens = args.max_context_tokens or data_cfg.max_context_tokens
     corpus_start = data_cfg.corpus_start if args.corpus_start is None else args.corpus_start
     positions_per_doc = args.positions_per_doc or data_cfg.positions_per_doc
     seed = data_cfg.seed if args.seed is None else args.seed
@@ -353,7 +361,7 @@ def main() -> None:
     extractor = Extractor(
         model_id=nla_cfg.model_id,
         layer_index=nla_cfg.extraction_layer,
-        max_context_tokens=data_cfg.max_context_tokens,
+        max_context_tokens=max_context_tokens,
         batch_size=args.batch_size,
     )
     assert extractor.d_model == D_MODEL, (
@@ -401,7 +409,7 @@ def main() -> None:
             rows: dict[str, list[Any]] = {name: [] for name in schema.names}
             for result_index, res in enumerate(results):
                 doc_index = corpus_start + n_docs_seen + keep[result_index]
-                doc_id = f"{corpus}:{corpus_split}:{doc_index}"
+                doc_id = f"{doc_namespace}:{doc_split}:{doc_index}"
                 if args.position_mode == "block":
                     cands = block_boundary_positions(
                         res.token_ids, extractor.tokenizer, data_cfg.min_position
@@ -458,13 +466,13 @@ def main() -> None:
             d_model=extractor.d_model,
             layer_index=nla_cfg.extraction_layer,
             hidden_states_index=nla_cfg.hidden_states_index,
-            corpus=corpus,
+            corpus=doc_namespace,
             corpus_config=corpus_config,
             corpus_split=corpus_split,
             corpus_start=corpus_start,
             n_documents=n_documents,
             positions_per_doc=positions_per_doc,
-            max_context_tokens=args.max_context_tokens or data_cfg.max_context_tokens,
+            max_context_tokens=max_context_tokens,
             min_position=data_cfg.min_position,
         ),
         created_by="reasoning_attention.datagen.extract",
@@ -477,3 +485,14 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    # Hard exit rather than returning into interpreter finalization.
+    #
+    # The streaming dataset's aiohttp worker threads do not shut down cleanly:
+    # finalization either raises `PyGILState_Release: ... no thread-state for
+    # this thread` or, worse, HANGS — the process sits holding the GPU with the
+    # parquet already written, so a chained build waits on it forever. Everything
+    # is flushed by this point (the ParquetWriter closed with its `with` block
+    # and the sidecar is on disk), so there is nothing for finalization to do.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

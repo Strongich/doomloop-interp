@@ -257,7 +257,32 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-100}"
 # is ~55h on 2 GPUs. Their own LR scan shows most of the gain arrives early — 30
 # steps moved fve_nrm from a 0.375 warm-start to 0.377-0.483 — so default to a
 # short run and extend if FVE is still climbing.
+# Captured before the default is applied, so the EPOCHS guard can tell an explicit
+# NUM_ROLLOUT from the fallback.
+_num_rollout_explicit="${NUM_ROLLOUT:-}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-400}"
+# EPOCHS is the friendlier knob: one epoch is rows/ROLLOUT_BATCH rollouts, because
+# miles draws ROLLOUT_BATCH prompts per step and the DCP resume restores the
+# dataset iterator position, so a step count really does map to corpus coverage.
+# Deriving it from the parquet beats hand-arithmetic — the v2 corpus row count is
+# not round, and getting it wrong silently trains a different fraction than
+# intended. An explicit NUM_ROLLOUT still wins, so old invocations are unchanged.
+if [[ -n "${EPOCHS:-}" ]]; then
+  if [[ -n "$_num_rollout_explicit" ]]; then
+    echo "ERROR: set either EPOCHS or NUM_ROLLOUT, not both." >&2
+    exit 1
+  fi
+  _rows="$("$RL_PYTHON" -c "
+import pyarrow.parquet as pq, sys
+print(pq.read_metadata(sys.argv[1]).num_rows)
+" "$RL_PARQUET")"
+  NUM_ROLLOUT="$("$RL_PYTHON" -c "
+import math, sys
+rows, epochs, batch = int(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])
+print(math.ceil(rows * epochs / batch))
+" "$_rows" "$EPOCHS" "$ROLLOUT_BATCH")"
+  echo "EPOCHS=$EPOCHS over $_rows rows at $ROLLOUT_BATCH prompts/step -> --num-rollout $NUM_ROLLOUT" >&2
+fi
 # Must match what the AV was trained with. 1000 for us (D29): the rule is "a round
 # number just above the dataset's mean activation norm" (~900 here), NOT sqrt(d).
 # The reference has no default for this — absent means train_actor asserts — and a
@@ -395,7 +420,7 @@ cat <<EOM
    lr            actor $ACTOR_LR / critic $CRITIC_LR  (1.41e-5 x sqrt($GLOBAL_BATCH/1024))
    kl coef       $KL_LOSS_COEF
    response cap  $MAX_RESPONSE_LEN
-   rollouts      $NUM_ROLLOUT  (theirs: 4199 ~= 55h on 2 GPUs)
+   rollouts      $NUM_ROLLOUT${EPOCHS:+  (= $EPOCHS epoch)}  (theirs: 4199 ~= 55h on 2 GPUs)
    inj scale     $INJECTION_SCALE  (mse_scale comes from the checkpoint sidecar)
    embeds        $([[ "${BF16_EMBEDS:-0}" == "1" ]] && echo "bf16-base64 (~2.8MB/req, FORCED past the scale<1000 gate)" || echo "fp32 JSON (~12MB/req — the default at scale $INJECTION_SCALE)")
    post fan-out  $([[ "${DISTRIBUTED_POST:-0}" == "1" ]] && echo "on — $NUM_GPUS_PER_NODE Ray POST actors (watch perf/train_wait_time)" || echo "off — all 512 requests encoded on one event loop")

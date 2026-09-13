@@ -314,7 +314,15 @@ def main() -> None:
         unit, stats = build_direction(args)
         args.direction.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"unit": unit, "stats": stats, "edit": args.edit}, args.direction)
-    print(f"direction ({args.edit}): " + "  ".join(f"{k}={v:.4g}" for k, v in stats.items()))
+    # stats may carry non-numeric provenance (e.g. which depths went into the
+    # pool), so format defensively rather than assuming every value is a float.
+    print(
+        f"direction ({args.edit}): "
+        + "  ".join(
+            f"{k}={v:.4g}" if isinstance(v, (int, float)) else f"{k}={v}"
+            for k, v in stats.items()
+        )
+    )
 
     traces = [json.loads(line) for line in args.traces.open()]
     traces = [t for t in traces if len(t["question"]) <= args.max_question_chars]

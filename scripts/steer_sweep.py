@@ -98,12 +98,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--delta",
         default="per_probe",
-        choices=("per_probe", "mean"),
         help="per_probe is Finding 3's recipe: Δ from THIS probe's own "
         "explanation. `mean` substitutes one direction averaged over the whole "
         "probe set — the cheap approximation a whole-trace intervention has to "
-        "use, measured here against the thing it approximates.",
+        "use, measured here against the thing it approximates. "
+        "`file:<path>` loads a fixed direction from derive_direction.py, to test "
+        "whether a vector built elsewhere transfers to these probes.",
     )
+    p.add_argument(
+        "--exclude-trace",
+        default=None,
+        help="question_id to drop from the probe set — use it to hold out the "
+        "trace a `file:` direction was derived from. Steering the trace you "
+        "derived from is not a test.",
+    )
+    p.add_argument("--datasets", default=None, help="comma-separated dataset filter")
     return p.parse_args()
 
 
@@ -187,6 +196,13 @@ def main() -> None:
         for r in csv.DictReader(args.explanations.open())
         if r["kind"] == args.kind and r["explanation"].count("\n\n") >= 1
     ]
+    if args.exclude_trace:
+        n0 = len(probes)
+        probes = [r for r in probes if r["question_id"] != args.exclude_trace]
+        print(f"held out {n0 - len(probes)} probe(s) from {args.exclude_trace}")
+    if args.datasets:
+        keep = {d.strip() for d in args.datasets.split(",")}
+        probes = [r for r in probes if r["dataset"] in keep]
     traces = {json.loads(line)["question_id"]: json.loads(line) for line in args.traces.open()}
     print(f"{len(probes)} {args.kind} probes available  (mode={args.mode})")
 
@@ -216,7 +232,20 @@ def main() -> None:
     trunk.layers[cfg.extraction_layer].register_forward_hook(hook)
 
     mean_dirs: dict[str, torch.Tensor] = {}
-    if args.delta == "mean":
+    if args.delta.startswith("file:"):
+        payload = torch.load(args.delta[5:], map_location="cpu", weights_only=False)
+        src = payload.get("source", {})
+        print(f"direction from {args.delta[5:]}: {src}")
+        for name in ("doubt", "continue"):
+            if name in payload:
+                # Stored as a UNIT vector; the injection rescales by alpha*||h||
+                # anyway, so magnitude here is irrelevant.
+                mean_dirs[name] = payload[name]["unit"].float()
+            elif name == "continue" and "unit" in payload:
+                mean_dirs[name] = payload["unit"].float()   # delta_suppress_mean.pt layout
+        if "doubt" not in mean_dirs:
+            mean_dirs["doubt"] = -mean_dirs["continue"]
+    elif args.delta == "mean":
         acc: dict[str, list[torch.Tensor]] = {"doubt": [], "continue": []}
         with torch.no_grad():
             for probe in probes:
@@ -273,7 +302,7 @@ def main() -> None:
             continue
         state["site"] = n_header + token
 
-        if args.delta == "mean":
+        if mean_dirs:
             d_doubt, d_cont = mean_dirs["doubt"], mean_dirs["continue"]
         else:
             with torch.no_grad():

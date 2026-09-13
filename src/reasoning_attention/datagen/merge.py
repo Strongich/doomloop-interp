@@ -28,16 +28,38 @@ from reasoning_attention.datagen.sidecar import (
 )
 
 
+def _widen_strings(table: pa.Table) -> pa.Table:
+    """Cast `string`/`binary` columns to their 64-bit-offset variants.
+
+    Arrow's `string` addresses its data with int32 offsets, so one array caps at
+    2 GB. `context_text` holds whole source documents, and concatenating ~1.1M of
+    them overflows that — `pa.concat_tables` then dies with "offset overflow while
+    concatenating arrays". Widening first is the fix Arrow's own error recommends,
+    and it is free: the on-disk parquet encoding is unchanged either way.
+    """
+    fields = []
+    for field in table.schema:
+        if pa.types.is_string(field.type):
+            fields.append(field.with_type(pa.large_string()))
+        elif pa.types.is_binary(field.type):
+            fields.append(field.with_type(pa.large_binary()))
+        else:
+            fields.append(field)
+    target = pa.schema(fields)
+    return table.cast(target) if target != table.schema else table
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inputs", nargs="+", required=True, help="base parquets to merge")
     parser.add_argument("--output", required=True)
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument("--no-shuffle", action="store_true")
+    parser.add_argument("--block-size", type=int, default=50_000)
     args = parser.parse_args()
 
     load_project_env()
-    tables = [pq.read_table(path) for path in args.inputs]
+    tables = [_widen_strings(pq.read_table(path)) for path in args.inputs]
     schemas = {tuple(t.schema.names) for t in tables}
     assert len(schemas) == 1, (
         f"inputs have different schemas and cannot be concatenated: {schemas}. "
@@ -45,11 +67,18 @@ def main() -> None:
     )
     merged = pa.concat_tables(tables)
 
-    if not args.no_shuffle:
-        order = np.random.default_rng(args.seed).permutation(merged.num_rows)
-        merged = merged.take(pa.array(order))
-
-    pq.write_table(merged, args.output)
+    order = (
+        np.arange(merged.num_rows)
+        if args.no_shuffle
+        else np.random.default_rng(args.seed).permutation(merged.num_rows)
+    )
+    # Take and write in blocks. A single take() over ~1.1M rows materialises every
+    # column at once — with a 2048-float vector and the document text per row that
+    # is tens of GB, on top of the tables already in memory. Blocks bound it.
+    with pq.ParquetWriter(args.output, merged.schema) as writer:
+        for start in range(0, len(order), args.block_size):
+            block = merged.take(pa.array(order[start : start + args.block_size]))
+            writer.write_table(block)
 
     metas = [read_sidecar(path) for path in args.inputs]
     per_source = {}

@@ -75,7 +75,10 @@ def main() -> None:
             f"{100*an/m:>8.0f}% {100*cp/m:>7.0f}%"
         )
 
-    hdr = f"{'condition':<30} {'acc':>8} {'med think':>10} {'doubt blk':>10} {'answered':>9} {'capped':>8}"
+    hdr = (
+        f"{'condition':<30} {'acc':>8} {'med think':>10} "
+        f"{'doubt blk':>10} {'answered':>9} {'capped':>8}"
+    )
     print(hdr)
     print("-" * len(hdr))
     block(base, "none", "baseline (no push)")

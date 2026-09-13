@@ -113,6 +113,14 @@ def parse_args() -> argparse.Namespace:
         "derived from is not a test.",
     )
     p.add_argument("--datasets", default=None, help="comma-separated dataset filter")
+    p.add_argument(
+        "--only-traces",
+        type=Path,
+        default=None,
+        help="json list of question_ids to keep — the held-out eval split for a "
+        "direction built from other probes. Without it a pooled direction would "
+        "be scored partly on the probes it was built from.",
+    )
     return p.parse_args()
 
 
@@ -203,6 +211,10 @@ def main() -> None:
     if args.datasets:
         keep = {d.strip() for d in args.datasets.split(",")}
         probes = [r for r in probes if r["dataset"] in keep]
+    if args.only_traces:
+        keep_ids = set(json.loads(args.only_traces.read_text()))
+        probes = [r for r in probes if r["question_id"] in keep_ids]
+        print(f"restricted to {len(probes)} held-out probes")
     traces = {json.loads(line)["question_id"]: json.loads(line) for line in args.traces.open()}
     print(f"{len(probes)} {args.kind} probes available  (mode={args.mode})")
 

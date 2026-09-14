@@ -56,8 +56,10 @@ exact rather than off-by-one.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -372,12 +374,39 @@ def main() -> None:
     trunk.layers[cfg.extraction_layer].register_forward_hook(hook)
 
     unit = unit.to(model.device, torch.float32)
+
+    # --- crash-safe, resumable output ----------------------------------------
+    # Rows are appended to <out>.partial the moment each batch finishes, and the
+    # file is renamed to <out> only on success. A killed run therefore loses at
+    # most one batch, and re-running the same command picks up where it stopped.
+    # run_tier2.sh's "skip this arm if its CSV exists" test stays correct because
+    # the final name never appears until the arm is complete.
+    #
+    # The resume is exact, not approximate: the trace order is a seeded shuffle
+    # followed by a length sort, and each batch reseeds with args.seed + start, so
+    # the batches that still have to run sample exactly as they would have in an
+    # uninterrupted run.
+    partial = Path(str(args.out) + ".partial")
+    partial.parent.mkdir(parents=True, exist_ok=True)
+    str_cols = {"question_id", "dataset", "gold"}
     rows: list[dict[str, Any]] = []
-    dump = args.dump.open("w")
+    if partial.exists():
+        rows = [
+            {k: v if k in str_cols or k.endswith("_status") else int(v) for k, v in r.items()}
+            for r in csv.DictReader(partial.open())
+        ]
+        print(f"resuming from {partial}: {len(rows)} traces already done", flush=True)
+    done_ids = {r["question_id"] for r in rows}
+    dump = args.dump.open("a" if rows else "w")
+    pf = partial.open("a" if rows else "w", newline="")
+    pw = csv.DictWriter(pf, fieldnames=list(rows[0])) if rows else None
     t0 = time.time()
 
     for start in range(0, len(traces), args.batch):
         chunk = traces[start : start + args.batch]
+        if done_ids and all(t["question_id"] in done_ids for t in chunk):
+            continue
+        n_before = len(rows)
         prompts = [_chat_header(tokenizer, t["question"]) for t in chunk]
         rand_dirs = torch.randn(len(chunk), unit.shape[0], device=model.device)
         rand_dirs = rand_dirs / rand_dirs.norm(dim=-1, keepdim=True)
@@ -433,6 +462,12 @@ def main() -> None:
             rows.append(row)
             dump.write(json.dumps(rec) + "\n")
         dump.flush()
+        if pw is None:
+            pw = csv.DictWriter(pf, fieldnames=list(rows[0]))
+            pw.writeheader()
+        pw.writerows(rows[n_before:])
+        pf.flush()
+        os.fsync(pf.fileno())
         done = len(rows)
         rate = (time.time() - t0) / done
         print(
@@ -444,13 +479,9 @@ def main() -> None:
         )
 
     dump.close()
-    import csv
-
+    pf.close()
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    with args.out.open("w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
-        w.writeheader()
-        w.writerows(rows)
+    os.replace(partial, args.out)
 
     n = len(rows)
     print(f"\nwrote {args.out} ({n} traces)  alpha = {args.alpha}\n")

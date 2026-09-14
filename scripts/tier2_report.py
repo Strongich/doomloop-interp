@@ -24,8 +24,10 @@ import statistics as st
 from pathlib import Path
 
 ARMS = {
-    "A_1trace": "A: 35 deltas, 1 rollout",
-    "G_global297": "G: 297 deltas, 297 rollouts",
+    "A_1trace": "A: 35 deltas, 1 CORRECT rollout",
+    "G_global297": "G: 297 deltas, 297 CORRECT rollouts",
+    "W_wrong1": "W: 35 deltas, 1 WRONG rollout",
+    "WP_wrong30": "WP: all deltas, 30 WRONG rollouts",
 }
 
 
@@ -150,6 +152,10 @@ def main() -> None:
     print("  accuracy rises -> the doubt actively hurts. Strongest outcome.")
     print("  Always check `capped`: if suppression caps far less than baseline, part of")
     print("     any gain is budget, not reasoning.")
+    print("  W/WP vs A/G: the vectors differ only in whether the traces they were read")
+    print("     off were answered correctly. Same numbers -> the doubt direction does not")
+    print("     depend on the outcome, and every earlier finding generalises. Different")
+    print("     numbers -> it does, and `correct-only derivation` becomes a real caveat.")
 
 
 if __name__ == "__main__":

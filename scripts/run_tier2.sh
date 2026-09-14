@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TIER 2 — does suppressing self-doubt still hold up on questions the model gets WRONG?
 #
-#   bash scripts/run_tier2.sh              # ~5-7h on one 16GB GPU
+#   bash scripts/run_tier2.sh              # ~9-12h on one 16GB GPU (6 generation passes)
 #   LIMIT=60 bash scripts/run_tier2.sh     # quick shakeout first
 #
 # Every stage is skipped if its output exists, so an interrupted run resumes.
@@ -52,6 +52,21 @@
 #            G  data/delta_suppress_mean.pt  the 297-probe global vector from
 #               Finding 5, for continuity -- if A and G disagree HERE but agreed
 #               on easy questions, that is itself a finding.
+#            W  data/pool_wrong/dir_W_wrong1trace.pt   ~35 deltas from ONE rollout
+#               the model got WRONG. Built exactly like A, so the only difference
+#               is the outcome of the trace it was read off.
+#            WP data/pool_wrong/dir_WP_wrong30traces.pt  all deltas from 30 wrong
+#               rollouts, built exactly like Finding 5b's arm E. W on its own
+#               cannot separate "derived from a failure" from "derived from that
+#               one rollout"; WP is what makes the comparison interpretable.
+#
+#            A and G are read off traces the model got RIGHT -- as was every
+#            direction in the study so far. If self-doubt represents something
+#            different when the model is genuinely lost, a direction derived from
+#            failures could point somewhere else, and nothing so far would have
+#            caught it. The derivation stage prints the cosines between the two
+#            families before any generation runs: that number alone answers the
+#            cheap half of the question.
 #
 # Conditions none / suppress / random, all three. The baseline cannot be reused
 #            from Finding 5 because this is a different test set, and sampling is
@@ -85,8 +100,6 @@
 #            detect a drop.
 #
 # WHAT THIS STILL WILL NOT ANSWER
-#   - Whether a direction derived from WRONG rollouts differs from one derived
-#     from correct ones. Both vectors here come from correct traces.
 #   - Whether suppression helps if applied only at SOME boundaries. It is all or
 #     nothing at every break, as in Finding 5.
 #   - Anything about a prompt baseline, which remains unrun.
@@ -121,10 +134,24 @@ run_arm () {
       2>&1 | tee "logs/tier2_${tag}.log" | grep -E "correct|median|doubt|capped|ERROR" || true
 }
 
+# --- derive the wrong-trace directions (GPU, ~1h, skipped if already built) ---
+if [[ ! -s data/pool_wrong/dir_W_wrong1trace.pt ]]; then
+  say "deriving directions from WRONG rollouts"
+  [[ -s data/wrong_sample.jsonl ]] || \
+    uv run python scripts/build_wrong_sample.py 2>&1 | tee logs/wrong_sample.log
+  [[ -s data/pool_wrong/raw.pt ]] || \
+    uv run python scripts/derive_pool.py --traces data/wrong_sample.jsonl \
+        --out data/pool_wrong/raw.pt --n-per-dataset 14 2>&1 | tee logs/derive_pool_wrong.log
+  uv run python scripts/build_wrong_variants.py 2>&1 | tee logs/build_wrong_variants.log
+fi
+
 # Arm A carries none + random; they are identical across arms given the same test
-# set and seed, so arm G runs suppress-only. Saves roughly two hours.
-run_arm A_1trace    data/pool/dir_A_1trace.pt   --conditions none suppress random
-run_arm G_global297 data/delta_suppress_mean.pt --conditions suppress
+# set and seed, so every other arm runs suppress-only. Saves roughly two hours
+# per arm.
+run_arm A_1trace     data/pool/dir_A_1trace.pt              --conditions none suppress random
+run_arm G_global297  data/delta_suppress_mean.pt            --conditions suppress
+run_arm W_wrong1     data/pool_wrong/dir_W_wrong1trace.pt   --conditions suppress
+run_arm WP_wrong30   data/pool_wrong/dir_WP_wrong30traces.pt --conditions suppress
 
 say "scoring"
 uv run python scripts/tier2_report.py 2>&1 | tee logs/tier2_report.log

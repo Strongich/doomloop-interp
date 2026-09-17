@@ -54,7 +54,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--direction", type=Path, default=Path("data/pool/dir_A_1trace.pt"))
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--limit", type=int, default=100)
-    p.add_argument("--max-tokens", type=int, default=4096)
+    p.add_argument("--max-tokens", type=int, default=16384)  # effectively uncapped
+    p.add_argument("--chunk", type=int, default=256)
     p.add_argument("--out", type=Path, default=Path("data/logprob_ratio.pt"))
     return p.parse_args()
 
@@ -123,19 +124,36 @@ def main() -> None:
             if is_break[int(c_ids[j])]:
                 edited[len(h_ids) + j] = True
 
-        with torch.no_grad():
-            state["mask"] = None
-            lg = model(input_ids=ids[None]).logits[0].float()
-            state["mask"] = edited.to(model.device)
-            lg2 = model(input_ids=ids[None]).logits[0].float()
-        state["mask"] = None
-
+        # Never materialise [T, vocab] logits in fp32 -- at 12k tokens that is
+        # 7.6GB per pass, and we need two. Take the final hidden states (T x 2048)
+        # and apply lm_head + log_softmax in row chunks instead, keeping only the
+        # gathered target logprobs. This is what removes the length cap.
         tgt = ids[1:]
-        lp = torch.log_softmax(lg[:-1], -1).gather(1, tgt[:, None])[:, 0]
-        lp2 = torch.log_softmax(lg2[:-1], -1).gather(1, tgt[:, None])[:, 0]
+
+        def target_logprobs(mask: torch.Tensor | None) -> torch.Tensor:
+            state["mask"] = mask
+            with torch.no_grad():
+                h = model.model(input_ids=ids[None]).last_hidden_state[0][:-1]
+                outp = torch.empty(h.shape[0], device=h.device, dtype=torch.float32)
+                for a in range(0, h.shape[0], args.chunk):
+                    b_ = min(a + args.chunk, h.shape[0])
+                    lg = model.lm_head(h[a:b_]).float()
+                    outp[a:b_] = torch.log_softmax(lg, -1).gather(
+                        1, tgt[a:b_, None]
+                    )[:, 0]
+                    del lg
+            state["mask"] = None
+            return outp
+
+        lp = target_logprobs(None)
+        lp2 = target_logprobs(edited.to(model.device))
+        # Alignment: lp[i] is the logprob of token ids[i+1], produced by the
+        # hidden state at position i. So the mask entry that belongs with lp[i] is
+        # edited[i] -- edited[:-1], NOT edited[1:]. Getting this wrong labels the
+        # position *after* each edit as the edited one and hides the direct effect.
         keep = slice(len(h_ids) - 1, None)          # completion tokens only
         all_log_ratio.append((lp2 - lp)[keep].cpu())
-        all_edited.append(edited[1:][keep].cpu())
+        all_edited.append(edited[:-1][keep].cpu())
         if i % 25 == 0:
             print(f"  [{i}/{len(recs)}]", flush=True)
 
@@ -156,6 +174,20 @@ def main() -> None:
         for t in (0.01, 0.05, 0.2):
             frac = (x.abs() < t).float().mean()
             print(f"{'':<22}  |log ratio| < {t:<5} : {100*frac:>5.1f}% of tokens")
+        # The tail is what decides whether importance weighting is safe: a ratio
+        # far from 1 on a low-probability token still enters the update.
+        out_clip = ((r < 0.8) | (r > 1.2)).float().mean()
+        out_wide = ((r < 0.5) | (r > 2.0)).float().mean()
+        print(f"{'':<22}  outside 0.8-1.2 : {100*out_clip:>5.2f}%   "
+              f"outside 0.5-2.0 : {100*out_wide:>5.2f}%")
+        # A ratio of 1e17 means pi gave the token ~e-40 while pi' gave it normal
+        # mass. Those are real but rare; count them rather than quote a max that
+        # one token owns.
+        for t in (10.0, 100.0, 1e4):
+            n_hi = int((r > t).sum())
+            print(f"{'':<22}  ratio > {t:<7g}: {n_hi:>6} tokens "
+                  f"({100*n_hi/len(r):.4f}%)")
+        print(f"{'':<22}  max log ratio {x.max():.1f} nats, min {x.min():.1f}")
 
     describe(lr, "all tokens")
     describe(lr[~ed], "unedited positions")

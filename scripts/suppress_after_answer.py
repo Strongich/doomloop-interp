@@ -100,6 +100,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch", type=int, default=4)
     p.add_argument("--max-new-tokens", type=int, default=12288)
     p.add_argument("--seed", type=int, default=0)
+    # Injecting AT the trigger token would add a mid-paragraph intervention site
+    # that Findings 5/6 never had, so "only the start condition changed" would
+    # stop being true. Default keeps the site rule identical: paragraph breaks
+    # only, just starting later.
+    p.add_argument("--inject-at-trigger", action="store_true",
+                   help="also inject on the trigger token itself (off by default)")
     return p.parse_args()
 
 
@@ -216,7 +222,8 @@ def main() -> None:
                     just[i] = True
                     trig_at[i] = len(out[i])
 
-            inject = alive & in_think & trig & (break_mask[nxt] | just)
+            sites = break_mask[nxt] | just if args.inject_at_trigger else break_mask[nxt]
+            inject = alive & in_think & trig & sites
             n_inj += inject.long()
             in_think &= ~closing
             for e in eos_ids:

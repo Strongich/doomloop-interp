@@ -31,6 +31,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -48,7 +49,43 @@ from reasoning_attention.loops import gold_span  # noqa: E402
 from reasoning_attention.nla.arch import inner_transformer  # noqa: E402
 from reasoning_attention.tokenview import _chat_header  # noqa: E402
 
-WINDOW = 24  # tokens of rolling context searched for the gold value
+WINDOW = 48  # tokens of rolling context searched for the gold value
+
+# A number is only an answer claim if something in front of it says so. Without
+# this, the trigger fires on premises ("a test of 100 questions") and on
+# intermediate quantities, neither of which is the model stating its answer.
+ANSWER_CUE = re.compile(
+    r"(?:=|\bis\b|\bare\b|\bwas\b|\bwere\b|\bequals?\b|\bgives?\b|\bgets?\b|"
+    r"\btotal\b|\banswer\b|\bso\b|\btherefore\b|\bthus\b|\bleft\b)"
+    r"[^0-9A-Za-z]{0,12}$",
+    re.IGNORECASE,
+)
+
+
+def gold_occurrences(text: str, gold: str) -> list[tuple[int, int]]:
+    """Every standalone occurrence, using gold_span's own boundary rules."""
+    g = str(gold).strip()
+    if not g:
+        return []
+    return [m.span() for m in
+            re.finditer(rf"(?<![\w.]){re.escape(g)}(?!\w)(?!\.\d)", text)]
+
+
+def answer_claim_span(text: str, gold: str, *, require_complete: bool = False
+                      ) -> tuple[int, int] | None:
+    """First occurrence of `gold` that reads as an answer claim.
+
+    `require_complete` is for STREAMING use: at the end of a partial buffer every
+    number looks word-final, so "the limit is 100" matches gold 100 one token
+    before the model writes "1000". Requiring at least one decoded character
+    after the match lets gold_span's own `(?!\w)` guard do its job.
+    """
+    for a, b in gold_occurrences(text, gold):
+        if require_complete and b >= len(text):
+            continue
+        if ANSWER_CUE.search(text[max(0, a - 40):a]):
+            return (a, b)
+    return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -174,7 +211,7 @@ def main() -> None:
                 if not alive[i] or trig[i] or not in_think[i]:
                     continue
                 tail = tok.decode(out[i][-WINDOW:], skip_special_tokens=True)
-                if gold_span(tail, golds[i]):
+                if answer_claim_span(tail, golds[i], require_complete=True):
                     trig[i] = True
                     just[i] = True
                     trig_at[i] = len(out[i])
@@ -196,7 +233,18 @@ def main() -> None:
             g = grade(texts[i], t["gold"])
             nm, nb, nd = doubt_stats(texts[i])
             total = len(out[i])
-            post = (total - trig_at[i]) / total if trig_at[i] >= 0 and total else -1.0
+            # Two different quantities, kept apart because they are not
+            # comparable: `post_share` is the CHARACTER share of the <think>
+            # body after the gold value first appears -- the same definition
+            # loop_metrics.py uses for its 69% baseline. `post_tok_share` is the
+            # TOKEN share of the whole completion after the trigger fired, which
+            # includes the post-</think> answer text and so reads lower.
+            body = texts[i].split("</think>")[0]
+            sp = gold_span(body, str(t["gold"]))
+            post = 1.0 - sp[0] / max(len(body), 1) if sp else -1.0
+            post_tok = (total - trig_at[i]) / total if trig_at[i] >= 0 and total else -1.0
+            qtext = t["question"]
+            first = gold_occurrences(body, str(t["gold"]))
             rows.append({
                 "question_id": t["question_id"], "dataset": t["dataset"],
                 "gold": str(t["gold"]), "band": t["band"],
@@ -204,7 +252,10 @@ def main() -> None:
                 "status": g.status, "tokens": total,
                 "think_tokens": think_len[i], "capped": int(not bool(fin[i])),
                 "triggered": int(trig_at[i] >= 0), "trigger_at": trig_at[i],
-                "post_share": round(post, 4), "injections": int(n_inj[i]),
+                "post_share": round(post, 4), "post_tok_share": round(post_tok, 4),
+                "gold_in_question": int(bool(gold_occurrences(qtext, str(t["gold"])))),
+                "gold_occurrences": len(first),
+                "injections": int(n_inj[i]),
                 "markers": nm, "blocks": nb, "doubt_blocks": nd,
             })
             dump.write(json.dumps({"question_id": t["question_id"], "gold": t["gold"],

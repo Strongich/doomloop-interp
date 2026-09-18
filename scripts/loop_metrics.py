@@ -35,6 +35,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from reasoning_attention.loops import gold_span  # noqa: E402
+
 SRCS = {
     "baseline": ("data/tier3/step1_A_texts.jsonl", "none"),
     "N (NLA)": ("data/dom/A_ref_texts.jsonl", "suppress"),
@@ -86,22 +88,23 @@ def dup_blocks(body: str) -> float:
 
 
 def post_answer(body: str, gold: str) -> float | None:
-    """Share of the reasoning that happens after the gold value first appears."""
-    g = str(gold).strip()
-    if not g:
+    """Share of the reasoning that happens after the gold value first appears.
+
+    Uses the project's own `gold_span`, not a local regex: it is word-bounded so
+    gold "7" does not match inside "70", and it rejects "12.5" for gold 12 while
+    still accepting a sentence-final "12.".
+    """
+    span = gold_span(body, str(gold).strip())
+    if not span:
         return None
-    m = re.search(rf"(?<![\d.]){re.escape(g)}(?![\d])", body)
-    if not m:
-        return None
-    return 1.0 - m.start() / max(len(body), 1)
+    return 1.0 - span[0] / max(len(body), 1)
 
 
 def main() -> None:
     args = parse_args()
     meta = {json.loads(x)["question_id"]: json.loads(x) for x in args.traces.open()}
-    print(f"{'arm':<17}{'rep20':>9}{'dupblk':>9}{'post-ans':>10}{'gzip':>8}"
-          f"{'blocks':>9}{'think tok':>11}")
-    print("-" * 73)
+    print(f"{'arm':<17}{'rep20':>9}{'dupblk':>9}{'post-ans':>10}{'gzip':>8}{'blocks':>9}")
+    print("-" * 62)
     for lab, (path, key) in SRCS.items():
         r20: list[float] = []
         dbk: list[float] = []
@@ -129,8 +132,8 @@ def main() -> None:
             gz.append(len(gzip.compress(raw)) / max(len(raw), 1))
             nb.append(len([b for b in body.split("\n\n") if b.strip()]))
         print(f"{lab:<17}{100*st.mean(r20):>8.1f}%{100*st.mean(dbk):>8.0f}%"
-              f"{100*st.mean(pa):>9.0f}%{st.mean(gz):>8.3f}{st.mean(nb):>9.1f}"
-              f"{st.mean(len(x.split()) for x in ['']) if False else '':>11}")
+              f"{100*st.mean(pa):>9.0f}%{st.mean(gz):>8.3f}{st.mean(nb):>9.1f}")
+              
     print("\nlower is better on all four. `post-ans` is the share of the reasoning")
     print("that happens after the model has already written the correct value.")
 

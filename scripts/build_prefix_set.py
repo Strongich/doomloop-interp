@@ -21,12 +21,21 @@ candidate should equal the gold answer. Measured over 400 traces:
     run >= 6       84%       382 tok        91%
     terminal       90%       518 tok        98%
 
-`run >= 4` is the default: it is the strictest rule that is still ONLINE (it
-decides using only boundaries already generated), keeps 96% coverage, and puts
-the freeze at 13% of the thinking body -- early enough that a large majority of
-the trace is still ahead of the intervention. The `terminal` rule scores better
-but needs to see the whole trace, so it could not be deployed; its boundary is
-recorded alongside for a sensitivity check that needs no new probing.
+`run >= 4` is the default, at 96% coverage.
+
+**Where the freeze lands is a separate choice from when the rule fires, and
+getting it wrong costs the online claim.** A run of four agreements is only
+*known* at the fourth probe. Freezing at the first one -- which Finding 10 did --
+uses the three later probes to select a point before them, so the prefix is
+chosen with hindsight. `run4` therefore freezes at the fourth agreeing probe
+(median 546 think tokens); `run4@first` reproduces the retrospective version
+(median 321). The detected candidate is identical either way, in 385 of 385
+questions, since agreement is what defines the run -- so the validation column
+above is unchanged and only the freeze position moves.
+
+The `terminal` rule scores better still but needs to see the whole trace, so it
+could not be deployed; its boundary is recorded alongside for a sensitivity
+check that needs no new probing.
 
 ## Ordering
 
@@ -70,10 +79,24 @@ def runs(probes: list[dict[str, Any]]) -> list[tuple[int, int]]:
 
 
 def pick(probes: list[dict[str, Any]], rule: str) -> int | None:
+    """Index of the boundary to freeze at, or None if the rule never fires.
+
+    `run4` freezes at the FOURTH agreeing probe -- the first boundary at which
+    four agreements have actually been observed. `run4@first` freezes at the
+    first probe of that run, which is what Finding 10 shipped: it needs the
+    three later probes to know the run exists, so the freeze point is chosen
+    with hindsight and cannot be computed online. Both are kept so the old
+    result stays reproducible; `run4` is the deployable one.
+    """
     rs = runs(probes)
     if rule.startswith("run"):
-        k = int(rule[3:])
-        return next((a for a, n in rs if n >= k), None)
+        spec = rule[3:]
+        at_first = spec.endswith("@first")
+        k = int(spec.removesuffix("@first"))
+        hit = next(((a, n) for a, n in rs if n >= k), None)
+        if hit is None:
+            return None
+        return hit[0] if at_first else hit[0] + k - 1
     if rule == "terminal":  # the candidate never abandoned inside the probe window
         if rs and rs[-1][0] + rs[-1][1] == len(probes) and rs[-1][1] >= 2:
             return rs[-1][0]
@@ -89,7 +112,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--key", default="none")
     p.add_argument("--out", type=Path, default=Path("data/prefix/prefixes.jsonl"))
     p.add_argument("--audit", type=Path, default=Path("data/prefix/audit.md"))
-    p.add_argument("--rule", default="run4")
+    p.add_argument("--rule", default="run4",
+                   help="run4 = freeze at the 4th agreeing probe (online); "
+                        "run4@first = at the 1st (what Finding 10 used)")
     p.add_argument("--audit-n", type=int, default=60)
     # The matched non-answer control RESEARCH-DIRECTION asks for: without it,
     # "steering after the answer works" cannot be told apart from "steering late

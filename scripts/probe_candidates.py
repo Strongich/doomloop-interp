@@ -56,7 +56,12 @@ STEM = "\n</think>\n\n**Final Answer:** $\\boxed{"
 
 
 def boxed_value(text: str) -> str:
-    """The contents of the forced box, up to its matching close."""
+    """The contents of the forced box, up to its matching close.
+
+    An UNCLOSED box returns "" -- unknown, not a candidate. Accepting the
+    truncated prefix instead would turn a probe that ran out of budget into an
+    answer, and two such probes could then "agree" on a half-written expression.
+    """
     depth = 1
     for i, ch in enumerate(text):
         if ch == "{":
@@ -66,18 +71,46 @@ def boxed_value(text: str) -> str:
             if depth == 0:
                 return text[:i].strip()
         elif ch in "\n$" and depth == 1:
+            # A bare newline or `$` at depth 1 closes the expression in practice;
+            # anything still nested is an incomplete \frac{..}{..} and is unknown.
             return text[:i].strip()
-    return text.strip()
+    return ""
 
 
 def normalize(v: str) -> str:
-    """Enough normalization that `1,100`, `1100 ` and `1100.0` are one answer."""
+    """Enough normalization that `1,100`, `1100 ` and `1100.0` are one answer.
+
+    Braces are PRESERVED. An earlier version stripped every `}`, which turned
+    `\\sqrt{2}` into the malformed `\\sqrt{2` -- harmless on integer-answer GSM8K
+    but fatal for any symbolic answer, so it silently capped the detector at one
+    dataset.
+    """
     v = v.replace(",", "").replace("\\!", "").replace("\\,", "").replace("$", "")
-    v = v.replace("\\text{", "").replace("}", "").replace("\\ ", "").strip()
+    v = v.replace("\\ ", " ").strip()
+    # \text{ minutes} is a unit, not part of the value.
+    v = re.sub(r"\\(?:text|mathrm|mbox)\s*\{[^{}]*\}", "", v)
     v = " ".join(v.split())
-    if v.endswith(".0"):
-        v = v[:-2]
-    return v.rstrip(".")
+    if re.fullmatch(r"-?\d+\.0+", v):
+        v = v.split(".")[0]
+    return v.rstrip(".") if re.fullmatch(r"-?[\d.]+\.", v) else v
+
+
+def same_answer(a: str, b: str) -> bool:
+    """Do two probes name the same answer?
+
+    String equality first because it is free and settles almost everything, then
+    symbolic equivalence, so `0.5` and `\\frac{1}{2}` count as agreement instead
+    of resetting the stability run. Erring toward "different" only delays
+    detection, so a failed comparison is a non-match.
+    """
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        return bool(grade("\\boxed{" + a + "}", b).is_correct)
+    except Exception:
+        return False
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,7 +124,9 @@ def parse_args() -> argparse.Namespace:
     # early enough that a continuation experiment still has something to remove.
     p.add_argument("--max-boundaries", type=int, default=24)
     p.add_argument("--max-prefix-tokens", type=int, default=2048)
-    p.add_argument("--probe-tokens", type=int, default=32)
+    # 32 was enough for an integer but truncates a symbolic answer mid-brace,
+    # and a truncated box is now discarded rather than guessed at.
+    p.add_argument("--probe-tokens", type=int, default=96)
     p.add_argument("--chunk", type=int, default=40, help="questions per checkpoint")
     p.add_argument("--gpu-util", type=float, default=0.86)
     return p.parse_args()
@@ -172,8 +207,8 @@ def main() -> None:
             i = 0
             while i < len(probes):
                 j2 = i
-                while (j2 + 1 < len(probes) and probes[j2 + 1]["candidate"]
-                       and probes[j2 + 1]["candidate"] == probes[i]["candidate"]):
+                while (j2 + 1 < len(probes)
+                       and same_answer(probes[j2 + 1]["candidate"], probes[i]["candidate"])):
                     j2 += 1
                 if probes[i]["candidate"]:
                     runs.append((i, j2 - i + 1))

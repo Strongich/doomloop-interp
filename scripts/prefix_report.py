@@ -57,6 +57,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--csv", type=Path, default=Path("data/prefix/branches.csv"))
     ap.add_argument("--base", default="base")
+    ap.add_argument("--seeds", type=int, nargs="+", default=None,
+                    help="override which seeds to score (default: the complete ones)")
     args = ap.parse_args()
 
     path = args.csv if args.csv.exists() else Path(str(args.csv) + ".partial")
@@ -68,8 +70,21 @@ def main() -> None:
             r[k] = int(r[k])
         r["doubt_rate"] = float(r["doubt_rate"])
     arms = sorted({r["arm"] for r in rows}, key=lambda a: (a != args.base, a))
-    seeds = sorted({r["seed"] for r in rows})
-    print(f"{path}: {len(rows)} branches, arms {arms}, seeds {seeds}")
+    all_seeds = sorted({r["seed"] for r in rows})
+    # A run in progress always has one half-finished seed. Scoring it would
+    # silently drop every question that seed has not reached yet, so only seeds
+    # that every arm finished are used, and which ones is printed.
+    have: dict[tuple[str, int], set[str]] = defaultdict(set)
+    for r in rows:
+        have[(r["arm"], r["seed"])].add(r["question_id"])
+    widest = max((len(v) for v in have.values()), default=0)
+    seeds = ([s for s in all_seeds if all(len(have[(a, s)]) >= widest for a in arms)]
+             if args.seeds is None else args.seeds)
+    if not seeds:
+        print(f"{path}: no seed is complete across all arms yet ({len(rows)} branches)")
+        return
+    rows = [r for r in rows if r["seed"] in seeds]
+    print(f"{path}: {len(rows)} branches, arms {arms}, seeds {seeds} of {all_seeds}")
 
     # Only questions every arm has finished at every seed are comparable.
     per: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)

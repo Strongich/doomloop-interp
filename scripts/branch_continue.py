@@ -88,7 +88,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--retire-every", type=int, default=64,
                    help="steps between dropping finished sequences from the batch")
     p.add_argument("--max-new-tokens", type=int, default=8192)
-    p.add_argument("--exit-tokens", type=int, default=512)
+    # 512 truncated 13% of forced-exit responses, and a truncated response has
+    # no \boxed{}, so the comparator was scoring its own budget rather than the
+    # policy. 4096 caps essentially none of them and costs little: the arm skips
+    # the whole thinking phase.
+    p.add_argument("--exit-tokens", type=int, default=4096)
     return p.parse_args()
 
 

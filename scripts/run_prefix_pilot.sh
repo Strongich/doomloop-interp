@@ -19,9 +19,10 @@ say () { echo "[prefix $(date -u +%H:%M:%S)] $*"; }
 
 LIMIT=${LIMIT:-0}
 SEEDS=${SEEDS:-4}
-BATCH=${BATCH:-6}
+BATCH=${BATCH:-24}   # a cap, not a size: --kv-budget picks the actual width
 ALPHA=${ALPHA:-1.0}
 MAX_NEW=${MAX_NEW:-12288}
+EXIT_TOK=${EXIT_TOK:-4096}
 ARMS=${ARMS:-"base N D exit"}
 PREFIXES=${PREFIXES:-data/prefix/prefixes.jsonl}
 OUTDIR=${OUTDIR:-data/prefix}
@@ -39,7 +40,7 @@ say "branching: seeds=$SEEDS batch=$BATCH limit=${LIMIT:-all}"
 # shellcheck disable=SC2086
 uv run python scripts/branch_continue.py \
     --seeds "$SEEDS" --batch "$BATCH" --alpha "$ALPHA" \
-    --max-new-tokens "$MAX_NEW" --limit "$LIMIT" \
+    --max-new-tokens "$MAX_NEW" --exit-tokens "$EXIT_TOK" --limit "$LIMIT" \
     --prefixes "$PREFIXES" --outdir "$OUTDIR" \
     --arms $ARMS 2>&1 | tee -a logs/prefix_branch.log
 

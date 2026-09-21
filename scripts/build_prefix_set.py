@@ -209,6 +209,9 @@ def main() -> None:
         for r in rows:
             fh.write(json.dumps(r) + "\n")
 
+    if not rows:
+        raise SystemExit(f"rule={args.rule}: no prefix survived detection "
+                         f"({skipped} undetected) -- nothing to write")
     n_bad = sum(1 for r in rows if not r["cand_correct"])
     print(f"rule={args.rule}: {len(rows)} prefixes, {skipped} undetected")
     print(f"  incorrect candidates: {n_bad} ({n_bad / len(rows):.0%})")

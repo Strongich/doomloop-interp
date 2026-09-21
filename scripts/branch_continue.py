@@ -27,9 +27,9 @@ correct->wrong is the damage the intervention does; on initially INCORRECT ones,
 wrong->correct is the repair it prevents. k seeds per prefix estimate how much
 of each is just sampling.
 
-One engine for every arm on purpose. vLLM would be much faster for `base` and
-`exit`, but N and D need a forward hook, and comparing a vLLM arm against an HF
-arm would confound the intervention with the engine.
+All arms use one engine. The default vLLM backend installs a version-checked
+worker hook. Use --backend transformers to reproduce the historical engine.
+Outputs from different backends must live in separate directories.
 
     uv run python scripts/branch_continue.py --seeds 4 --arms base N D exit
 """
@@ -73,7 +73,12 @@ FIELDS = [
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--prefixes", type=Path, default=Path("data/prefix/prefixes.jsonl"))
-    p.add_argument("--outdir", type=Path, default=Path("data/prefix"))
+    p.add_argument("--outdir", type=Path, default=None)
+    p.add_argument("--backend", choices=["vllm", "transformers"], default="vllm")
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    p.add_argument("--max-num-batched-tokens", type=int, default=2048)
+    p.add_argument("--checkpoint-every", type=int, default=128,
+                   help="vLLM requests per durable checkpoint; scheduling uses --batch")
     p.add_argument("--arms", nargs="+", default=["base", "N", "D", "exit"])
     p.add_argument("--seeds", type=int, default=4)
     p.add_argument("--alpha", type=float, default=1.0)
@@ -98,6 +103,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.outdir is None:
+        args.outdir = Path("data/prefix_vllm" if args.backend == "vllm" else "data/prefix")
+    if args.backend == "vllm":
+        from branch_continue_vllm import run
+        run(args)
+        return
+    if (args.outdir / "run_manifest.json").exists():
+        raise ValueError("Refusing Transformers output into a manifested vLLM directory")
     cfg = NLAConfig()
     from transformers import AutoModelForCausalLM, AutoTokenizer
 

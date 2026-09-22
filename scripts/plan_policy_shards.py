@@ -57,24 +57,40 @@ def default_cells() -> list[tuple[str, ...]]:
 
 
 def cells_from(policies: list[str]) -> list[tuple[str, ...]]:
-    """Group an explicit policy list into matched cells where partners exist.
+    """Group an explicit policy list into cells that keep both directions together.
 
-    A shortlist need not be symmetric -- N and D are selected independently -- so
-    a policy whose partner was not shortlisted forms a cell of one rather than
-    being dropped or paired with something it does not match.
+    Stage 1 sweeps a full grid, so every N has a D at the same operating point and
+    a cell is that matched pair. A stage-2 shortlist has no such symmetry: N and D
+    are selected independently and generally land on DIFFERENT alphas and delays,
+    so grouping by operating point yields all singletons and the packer is free to
+    put every N on one device.
+
+    Where an exact partner exists it is used. The rest are paired ACROSS
+    directions by cost rank -- cheapest N with cheapest D, and so on -- which is
+    not a matched comparison but does guarantee each device carries both
+    directions, so no device effect can align with the direction contrast. Any
+    odd one out forms a cell of its own rather than being dropped.
     """
     by_point: dict[str, list[str]] = collections.defaultdict(list)
-    singles: list[tuple[str, ...]] = []
+    other: list[tuple[str, ...]] = []
     for p in policies:
-        if "@" not in p:
-            singles.append((p,))
-            continue
-        direction, point = p.split("@", 1)
-        if direction in ("N", "D"):
+        direction, _, point = p.partition("@")
+        if point and direction in ("N", "D"):
             by_point[point].append(p)
         else:
-            singles.append((p,))
-    return [tuple(sorted(v)) for v in by_point.values()] + singles
+            other.append((p,))
+
+    cells = [tuple(sorted(v)) for v in by_point.values() if len(v) > 1]
+    left = {
+        d: sorted((v[0] for v in by_point.values() if len(v) == 1 and v[0][0] == d),
+                  key=modelled_cost)
+        for d in ("N", "D")
+    }
+    for n, d in zip(left["N"], left["D"], strict=False):
+        cells.append((n, d))
+    paired = {p for cell in cells for p in cell}
+    cells += [(p,) for v in left.values() for p in v if p not in paired]
+    return cells + other
 
 
 def modelled_cost(policy: str) -> float:
@@ -171,12 +187,19 @@ def main() -> None:
           f"({100 * (args.shards - 1) * sum(cost[p] for p in replicate) / sum(loads):.0f}% "
           f"overhead, spent on cross-device diagnostics)")
 
+    # A device effect must not align with the direction contrast. Perfect balance
+    # is impossible with an odd shortlist, so the requirement is that no shard
+    # carries one direction alone while another is available to it.
+    worst = 0
     for i, s in enumerate(shards):
         n = sum(1 for p in s if p.startswith("N@"))
         d = sum(1 for p in s if p.startswith("D@"))
-        if abs(n - d) > len([p for p in replicate if p.startswith(("N@", "D@"))]):
-            raise SystemExit(f"shard {i} has {n} N and {d} D: direction confounded with device")
-    print("direction balance: every shard holds matched N/D pairs")
+        worst = max(worst, abs(n - d))
+        if (n == 0) != (d == 0) and min(n, d) == 0 and max(n, d) > 1:
+            raise SystemExit(
+                f"shard {i} has {n} N and {d} D: direction is confounded with device"
+            )
+    print(f"direction balance: max |N-D| per shard is {worst}")
 
     out = args.out or Path(f"data/policy/shards_stage{args.stage}.json")
     out.parent.mkdir(parents=True, exist_ok=True)

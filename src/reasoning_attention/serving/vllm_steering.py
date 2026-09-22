@@ -35,9 +35,13 @@ def boundary_positions(
     `start_delay` withholds the intervention for the first generated thinking
     tokens. For a consumed token at absolute position `p`, its one-based
     generated index is `g = p - prompt_length + 1`, and a site needs
-    `g >= start_delay`. The prompt -- including the chat template's `<think>`
-    opener -- is never counted, so `start_delay=0` and `1` both mean "from the
-    first generated boundary onward" and are the same policy.
+    `g >= start_delay`. The prompt is never counted, so `start_delay=0` and `1`
+    both mean "from the first generated boundary onward" and are the same policy.
+
+    Note that for Qwen3's thinking template the `<think>` opener is GENERATED,
+    not prompted, so it occupies g=1 and the count includes it. It is never a
+    site itself: it is followed by a single newline, not the double newline a
+    boundary token carries.
     """
     if not thinking:
         return []

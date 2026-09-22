@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import json
 import math
 from pathlib import Path
 
@@ -114,6 +115,11 @@ def main() -> None:
     ap.add_argument("--run", type=Path, required=True)
     ap.add_argument("--base", default="base")
     ap.add_argument("--shortlist", action="store_true")
+    ap.add_argument("--shortlist-out", type=Path, default=None,
+                    help="write the nominations as JSON, for an unattended chain")
+    ap.add_argument("--gate-min-base-acc", type=float, default=35.0)
+    ap.add_argument("--gate-max-base-acc", type=float, default=70.0)
+    ap.add_argument("--gate-max-capped", type=float, default=5.0)
     args = ap.parse_args()
 
     rows = load(args.run)
@@ -166,6 +172,49 @@ def main() -> None:
                 print(f"{d}: {' '.join(picked)}")
         print("\nStage 2:  STAGE=2 SHORTLIST=\"<the 8 above>\" "
               "bash scripts/run_reasoning_policy_sweep.sh")
+
+        if args.shortlist_out:
+            # Sanity gates for an UNATTENDED chain. The pre-registration makes
+            # stage 2 a human checkpoint so a degenerate screen cannot promote
+            # itself; when nobody is watching, these stand in for that judgement.
+            # They are deliberately loose -- they catch a broken run (grader
+            # failing, engine truncating everything, injection not firing), not a
+            # disappointing one. A disappointing screen is a result; a broken one
+            # must not spend another two GPU-hours.
+            picks = {d: shortlist(table, d) for d in ("N", "D")}
+            pct_capped = 100 * capped / len(rows)
+            problems = []
+            if not (args.gate_min_base_acc <= 100 * base_acc <= args.gate_max_base_acc):
+                problems.append(
+                    f"baseline accuracy {100 * base_acc:.1f}% outside "
+                    f"[{args.gate_min_base_acc}, {args.gate_max_base_acc}] -- "
+                    f"suspect grading or generation, not policy quality"
+                )
+            if pct_capped > args.gate_max_capped:
+                problems.append(f"capped {pct_capped:.1f}% > {args.gate_max_capped}%")
+            for d in ("N", "D"):
+                if len(picks[d]) < 2:
+                    problems.append(f"only {len(picks[d])} {d} nomination(s)")
+            no_inject = [
+                p for p in policies
+                if p != args.base
+                and mean([float(r["injections"]) for r in rows if r["policy"] == p]) == 0
+            ]
+            if no_inject:
+                problems.append(f"steered policies with zero injections: {no_inject[:3]}")
+
+            args.shortlist_out.write_text(json.dumps({
+                "shortlist": [p for d in ("N", "D") for p in picks[d]],
+                "by_direction": picks, "baseline_accuracy": 100 * base_acc,
+                "pct_capped": pct_capped, "problems": problems,
+                "ok": not problems,
+            }, indent=1))
+            if problems:
+                print("\nGATE FAILED -- not proceeding unattended:")
+                for x in problems:
+                    print(f"  - {x}")
+            else:
+                print(f"\ngates passed; wrote {args.shortlist_out}")
 
 
 if __name__ == "__main__":

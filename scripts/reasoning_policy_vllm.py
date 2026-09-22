@@ -68,6 +68,18 @@ DIRECTIONS: dict[str, str] = {
     "R303": "data/dirs_random/dir_R303.pt",
 }
 
+# EVERY arm carries this, exactly as `scripts/prompt_baseline.py` does (Finding 7).
+# Grading reads `\boxed{}` only, so an output that answers in prose -- "**Answer:**
+# 26" -- scores as no answer at all. Finding 7 measured the consequence directly:
+# without it, 10 of 16 prompted rollouts were graded wrong while carrying the
+# correct value, and the experiment would have reported a formatting change as a
+# 60-point accuracy collapse. Omitting it here reproduced that artifact -- brevityA
+# lost 5.6 points of which 5.1 were unboxed correct answers.
+#
+# It goes on the baseline too. A format instruction present in one arm and absent
+# from another measures the instruction, not the intervention.
+FORMAT = "Give your final answer in \\boxed{}."
+
 # Declared brevity instructions, tuned on development only. They condition the
 # prompt and are practical baselines, not identical-prefix causal controls.
 BREVITY: dict[str, str] = {
@@ -211,11 +223,15 @@ def main() -> None:
     }
 
     def prompt_ids(question: str, brevity: str | None) -> list[int]:
-        """Canonical thinking template. Brevity conditions a SYSTEM turn, so the
-        user turn -- the task itself -- is byte-identical in every arm."""
-        messages = build_messages(question)
-        if brevity is not None:
-            messages = [{"role": "system", "content": BREVITY[brevity]}, *messages]
+        """Canonical thinking template, with the shared format instruction.
+
+        The user turn -- the task itself -- is byte-identical in every arm. The
+        system turn carries FORMAT everywhere, plus the brevity text where that
+        arm declares one, so the only difference between arms is the brevity
+        instruction itself.
+        """
+        system = f"{BREVITY[brevity]} {FORMAT}" if brevity else FORMAT
+        messages = [{"role": "system", "content": system}, *build_messages(question)]
         text = tok.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
         )
@@ -237,6 +253,7 @@ def main() -> None:
         "question_ids": [r["question_id"] for r in rows],
         "policies": policies,
         "directions": {n: digest(Path(DIRECTIONS[n])) for n in used},
+        "format_instruction": FORMAT,
         "brevity_prompts": {k: v for k, v in BREVITY.items()
                             if k in {p["brevity"] for p in policies}},
         "code": {p: digest(Path(p)) for p in (

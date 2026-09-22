@@ -25,16 +25,24 @@ def boundary_positions(
     boundary_ids: np.ndarray,
     close_id: int,
     thinking: bool = True,
+    start_delay: int = 0,
 ) -> list[int]:
     """Absolute consumed-token sites; excludes prompt and all tokens after close.
 
     Recomputing generated tokens after KV preemption must replay the same edits.
     The final sampled token is not a site unless it is subsequently consumed.
+
+    `start_delay` withholds the intervention for the first generated thinking
+    tokens. For a consumed token at absolute position `p`, its one-based
+    generated index is `g = p - prompt_length + 1`, and a site needs
+    `g >= start_delay`. The prompt -- including the chat template's `<think>`
+    opener -- is never counted, so `start_delay=0` and `1` both mean "from the
+    first generated boundary onward" and are the same policy.
     """
     if not thinking:
         return []
     end = start + count
-    first = max(start, prompt_length)
+    first = max(start, prompt_length + max(0, start_delay - 1))
     if first >= end:
         return []
     history = np.asarray(tokens[prompt_length:end])
@@ -97,6 +105,7 @@ class SteeringWorkerExtension:
         self._reasoning_unit = None
         self._reasoning_alpha = 0.0
         self._reasoning_thinking = True
+        self._reasoning_delay = 0
         self._reasoning_stats: dict[str, Any] = {}
         self._reasoning_calls = 0
 
@@ -119,6 +128,7 @@ class SteeringWorkerExtension:
                     self._reasoning_boundaries,
                     self._reasoning_close,
                     self._reasoning_thinking,
+                    self._reasoning_delay,
                 )
                 params = runner.requests[req_id].sampling_params
                 extra = params.extra_args or {}
@@ -146,9 +156,18 @@ class SteeringWorkerExtension:
         return {"layer": layer, "vllm": version("vllm"), "model": type(model).__name__}
 
     def configure_reasoning_steering(
-        self: Any, unit: list[float] | None, alpha: float, thinking: bool = True
+        self: Any,
+        unit: list[float] | None,
+        alpha: float,
+        thinking: bool = True,
+        start_delay: int = 0,
     ) -> None:
-        """Call between completed generate() calls, never while requests are active."""
+        """Call between completed generate() calls, never while requests are active.
+
+        `start_delay` is part of the policy, not the installation, so one engine
+        serves every delay in a sweep -- but it is fixed for a whole batch. Vary
+        it per request only by batching each policy separately.
+        """
         self._reasoning_unit = None
         if unit is not None:
             u = torch.tensor(unit, dtype=torch.float32, device=self.device)
@@ -162,6 +181,9 @@ class SteeringWorkerExtension:
             raise ValueError("alpha must be finite")
         self._reasoning_alpha = alpha
         self._reasoning_thinking = thinking
+        if int(start_delay) != start_delay or start_delay < 0:
+            raise ValueError("start_delay must be a non-negative integer token count")
+        self._reasoning_delay = int(start_delay)
         self._reasoning_stats = {}
         self._reasoning_calls = 0
 

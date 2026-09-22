@@ -15,6 +15,17 @@ directions. `boxed_match_priority=0` and `try_extract_without_anchor=False`
 together mean *only* a `\\boxed{}` counts: the grader never guesses an answer out
 of trailing prose, so "no box" stays cleanly distinguishable.
 
+**Gold answers are parsed boxed** (D58). `parse(gold)` on a bare LaTeX gold runs
+the unanchored extractor, which on MATH-500 fails outright for 51 of 500 golds
+(`\\pi`, `\\text{Evelyn}`, `p - q`) and, worse, silently TRUNCATES 57 more —
+`3\\sqrt{13}` parses to `3`, `6-5i` to `6`. Truncation is the dangerous one: it
+produces false positives, marking a response of `\\boxed{3}` correct for gold
+`3\\sqrt{13}`. Wrapping the gold in `\\boxed{}` and parsing it through the SAME
+config as the response makes gold round-trip against itself 500/500 on MATH-500
+and 300/300 on GSM8K. GSM8K golds are bare integers that parsed correctly either
+way, so this does not move any historical GSM8K number — verified by re-grading
+all 3,096 rows of `data/prefix_online_vllm/`.
+
 sympy can hang or blow the stack on adversarial input, hence the alarm. Note
 `signal.setitimer` only works on the main thread — call `grade()` from the main
 thread, or pass `timeout=None` to skip the guard.
@@ -78,13 +89,33 @@ def _extraction_config() -> list[Any]:
     ]
 
 
+def _parse_gold(gold: str) -> list[Any]:
+    """Parse the gold answer through the same boxed extractor as the response.
+
+    Order matters. The boxed form is tried FIRST because the unanchored parser
+    silently truncates symbolic golds rather than declining them, so asking it
+    first would hand back a confidently wrong answer for `3\\sqrt{13}`. The raw
+    parse is kept as a fallback for a gold that is already a full LaTeX
+    expression the boxed wrapper would break.
+    """
+    from math_verify import parse
+
+    for candidate in ("\\boxed{" + gold + "}", gold):
+        try:
+            parsed = parse(
+                candidate, extraction_config=_extraction_config(), extraction_mode="first_match"
+            )
+        except Exception:
+            parsed = []
+        if parsed:
+            return list(parsed)
+    return []
+
+
 def _grade_inner(response: str, gold: str) -> Grade:
     from math_verify import parse, verify
 
-    try:
-        gold_parsed = parse(gold, extraction_mode="first_match")
-    except Exception:
-        gold_parsed = []
+    gold_parsed = _parse_gold(gold)
 
     if not gold_parsed:
         # GSM8K golds are bare integers, which `parse` sometimes declines. Fall

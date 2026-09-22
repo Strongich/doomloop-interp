@@ -28,9 +28,22 @@ format:
 # ---------------------------------------------------------------------------
 # Pod lifecycle. Same flow as the MASTERS Makefile.
 # ---------------------------------------------------------------------------
+# Seconds to let Longhorn detach the RWO volume after the old pod is gone, before
+# asking for it again. Longhorn attaches slower than the CSI deadline, so applying
+# immediately can request the volume while the previous attach is still completing
+# — which surfaces as "the volume is currently attached to different node".
+# Override for a fast restart on the SAME node: make start SETTLE=0
+SETTLE ?= 20
+
 start:
 	-kubectl delete pod $(POD) -n $(NAMESPACE) --ignore-not-found --wait
+	@echo "Letting Longhorn release the volume ($(SETTLE)s)..."
+	@sleep $(SETTLE)
 	kubectl apply -f pod.yaml
+	@echo "Waiting for Ready. FailedAttachVolume events here are usually NOT fatal:"
+	@echo "Longhorn often finishes attaching after the CSI deadline has expired, so"
+	@echo "let this wait run out before touching anything. Do NOT change nodeName and"
+	@echo "re-run on those events — that chases the volume between nodes."
 	kubectl wait --for=condition=Ready pod/$(POD) -n $(NAMESPACE) --timeout=600s
 	@echo "Waiting for zsh + oh-my-zsh to finish installing..."
 	@until kubectl exec $(POD) -n $(NAMESPACE) -- test -d /root/.oh-my-zsh > /dev/null 2>&1; do sleep 2; done

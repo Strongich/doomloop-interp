@@ -1,0 +1,25 @@
+# Wheel-installable core of the Stage-2 RL environment.
+#
+# Miles, SGLang, the reference `nla` package and this project are NOT here: all
+# four are installed editable from patched git checkouts by
+# scripts/setup_rl_stack.sh. This file pins the parts pip can resolve, so the env
+# is reproducible from a manifest instead of from whatever resolved that day.
+#
+# torch is deliberately unpinned here and installed FIRST from the cu124 index by
+# the setup script. Pinning it in this file would fight that.
+# PINNED, not >=. The NLA input_embeds patches anchor on exact source lines and
+# stop applying at 0.5.9 (three fields were appended to `reset_for_retract`
+# between the anchor and `def offload_kv_cache`). An open bound here resolved to
+# 0.5.9 while setup_rl_stack.sh builds v0.5.8 from source, so the manifest and the
+# installed code disagreed. Keep this equal to SGLANG_PIN in setup_rl_stack.sh.
+sglang[all]==0.5.8
+transformers
+accelerate
+ray
+pyarrow
+numpy
+safetensors
+httpx
+orjson
+pyyaml
+tqdm

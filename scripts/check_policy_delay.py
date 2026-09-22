@@ -16,6 +16,14 @@ intervention and not sampling noise:
    diverge; identical output everywhere would mean the direction is being
    applied at no strength.
 
+Each request is generated ALONE, one per `generate()` call. Batching several
+sequences together makes check 2 untestable: vLLM's kernels reduce over whatever
+tokens share a step, so as soon as one sequence in the batch diverges, every
+other sequence's arithmetic changes too and can diverge before its own first
+edited site. That is continuous batching working correctly, not a steering bug --
+but it is indistinguishable from one unless the sequences are separated. Check 2
+is a statement about a single request's trajectory, so it is measured that way.
+
     uv run python scripts/check_policy_delay.py
 """
 
@@ -73,9 +81,13 @@ def main() -> None:
     greedy = [SamplingParams(temperature=0.0, max_tokens=max_new) for _ in prompts]
 
     def run(unit_arg, alpha, delay):
+        """One request per generate() call -- see the module docstring."""
         llm.collective_rpc("configure_reasoning_steering", args=(unit_arg, alpha, True, delay))
-        outs = llm.generate(prompts, greedy, use_tqdm=False)
-        return [list(o.outputs[0].token_ids) for o in outs]
+        out = []
+        for prompt, param in zip(prompts, greedy, strict=True):
+            result = llm.generate([prompt], [param], use_tqdm=False)
+            out.append(list(result[0].outputs[0].token_ids))
+        return out
 
     failures = []
     base = run(None, 0.0, 0)
@@ -103,7 +115,14 @@ def main() -> None:
             # edited site, i.e. generated index (site - plen) + 1.
             cut = extra[0] - plen + 1
             if a[:cut] != b[:cut]:
-                failures.append(f"q{i} d{early} vs d{late}: diverged before the first extra site")
+                first = next(
+                    (k for k in range(min(len(a), len(b))) if a[k] != b[k]), min(len(a), len(b))
+                )
+                failures.append(
+                    f"q{i} d{early} vs d{late}: first difference at generated index {first}, "
+                    f"but the first site only {early} edits is at index {cut - 1} "
+                    f"(so agreement was required through {cut})"
+                )
             if a != b:
                 diverged += 1
     print(f"[2] prefix agreement before the first distinguishing site: "

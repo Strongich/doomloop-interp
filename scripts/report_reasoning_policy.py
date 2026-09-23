@@ -143,8 +143,10 @@ def main() -> None:
 
     base_tok = mean([tok_q[q][args.base] for q in tok_q if args.base in tok_q[q]])
     base_acc = mean([acc_q[q][args.base] for q in acc_q if args.base in acc_q[q]])
+    doubt_q = collapse(rows, "doubt_blocks")
+    base_doubt = mean([doubt_q[q][args.base] for q in doubt_q if args.base in doubt_q[q]])
     print(f"{'policy':16s}{'n':>5s}{'acc':>7s}{'dacc':>7s}{'95% CI':>17s}{'p':>7s}"
-          f"{'tokens':>9s}{'save':>7s}{'think':>8s}{'inj':>6s}")
+          f"{'tokens':>9s}{'save':>7s}{'think':>8s}{'inj':>6s}{'doubt':>7s}{'cut':>7s}")
     table = []
     for p in policies:
         d_acc, hw, pv, n = paired(acc_q, p, args.base)
@@ -154,8 +156,10 @@ def main() -> None:
         inj = mean([float(r["injections"]) for r in rows if r["policy"] == p])
         save = 100 * (1 - tok / base_tok) if base_tok else 0.0
         ci = "" if p == args.base else f"[{100*(d_acc-hw):+.1f},{100*(d_acc+hw):+.1f}]"
+        dbl = mean([doubt_q[q][p] for q in doubt_q if p in doubt_q[q]])
+        cut = 100 * (1 - dbl / base_doubt) if base_doubt else 0.0
         print(f"{p:16s}{n:5d}{100*a:7.1f}{100*d_acc:+7.1f}{ci:>17s}"
-              f"{pv:7.3f}{tok:9.0f}{save:+7.1f}{think:8.0f}{inj:6.1f}")
+              f"{pv:7.3f}{tok:9.0f}{save:+7.1f}{think:8.0f}{inj:6.1f}{dbl:7.1f}{cut:+7.1f}")
         if p != args.base:
             table.append({
                 "policy": p, "direction": meta[p]["direction"],

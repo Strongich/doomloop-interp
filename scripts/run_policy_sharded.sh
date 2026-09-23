@@ -43,6 +43,11 @@ case "$STAGE" in
     SEEDS=${SEEDS:-2}
     : "${SHORTLIST:?stage 2 requires SHORTLIST (the stage-1 nominations)}"
     PLAN_ARGS=(--stage 2 --policies "$SHORTLIST" --controls $CONTROLS)
+    # REPLICATE=0 runs the baseline once instead of on every shard (evaluation).
+    [ "${REPLICATE:-1}" = "0" ] && PLAN_ARGS+=(--no-replicate)
+    # PAIR=0 packs N and D independently; COSTS= measured run dirs for packing.
+    [ "${PAIR:-1}" = "0" ] && PLAN_ARGS+=(--no-pair)
+    [ -n "${COSTS:-}" ] && PLAN_ARGS+=(--from-run $COSTS)
     ;;
   *)
     echo "STAGE must be 1 or 2 (got '$STAGE')" >&2; exit 1 ;;

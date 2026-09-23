@@ -23,7 +23,9 @@ CHECKPOINT=${CHECKPOINT:-200}
 BATCHTOK=${BATCHTOK:-8192}
 GPUFRAC=${GPUFRAC:-0.90}
 LOGDIR=${LOGDIR:-/workspace}
-CONTROLS=${CONTROLS:-"brevityA brevityB"}
+# `-` not `:-`: an explicitly EMPTY value means "no prompt controls". With `:-`,
+# CONTROLS= silently fell back to the default and added both brevity arms.
+CONTROLS=${CONTROLS-"brevityA brevityB"}
 
 # --- stage-specific settings -------------------------------------------------
 # Stage 2 is a different experiment, not a different output directory: another

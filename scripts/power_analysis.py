@@ -22,7 +22,19 @@ Prefix-continuation and whole-question generation are different estimands with
 different spreads, so `--run` should point at whole-question development output
 once it exists.
 
-    uv run python scripts/power_analysis.py --run data/reasoning_policy_v1/stage2 --arm N@a1.0d512
+`--seed-projection` answers the other lever. When the question pool is capped,
+more seeds per question can still shrink the paired sd -- but only the
+within-question part of it. With two seeds per question the variance of the
+seed-averaged difference splits as
+
+    Var(dbar_q) = between + within / 2,   within = E_q[(d_q1 - d_q2)^2 / 2]
+
+so k seeds give sd_k = sqrt(between + within / k). The between term is a small
+difference of two estimates and is the noisier of the two; if it is under-
+estimated the projection is optimistic, and gains saturate sooner than shown.
+
+    uv run python scripts/power_analysis.py --run data/reasoning_policy_v1/stage2 --arm N@a1.0d256
+    uv run python scripts/power_analysis.py --run ... --arm N@a1.0d256 --seed-projection
 """
 
 from __future__ import annotations
@@ -91,6 +103,34 @@ def _z(p: float) -> float:
     return (lo + hi) / 2
 
 
+def seed_projection(
+    run: Path, arm: str, base: str, field: str, margin: float, pool: int
+) -> None:
+    """Split paired variance into within/between and project over seed counts."""
+    path = run / "rollouts.csv"
+    vals: dict[tuple[str, str], dict[int, float]] = collections.defaultdict(dict)
+    with path.open() as f:
+        for r in csv.DictReader(f):
+            vals[(r["question_id"], r["policy"])][int(r["seed"])] = float(r[field])
+    qs = sorted({q for q, p in vals if p == arm})
+    seeds = sorted(vals[(qs[0], arm)])
+    if len(seeds) != 2:
+        print(f"\nseed projection needs exactly 2 seeds per question, found {len(seeds)}")
+        return
+    d = {q: [vals[(q, arm)][s] - vals[(q, base)][s] for s in seeds] for q in qs}
+    var_bar = st.variance([st.mean(x) for x in d.values()])
+    within = st.mean([(x[0] - x[1]) ** 2 / 2 for x in d.values()])
+    between = max(var_bar - within / 2, 0.0)
+    share = 100 * within / (within + between) if within + between else 0.0
+    print(f"\nvariance split (per single-seed difference): within={within:.4f} "
+          f"between={between:.4f} -> {share:.0f}% is within-question sampling")
+    print(f"{'seeds':>6s}{'sd':>8s}{'power @ pool, true 0':>22s}{'n for 80%':>11s}")
+    for k in (1, 2, 4, 8, 16):
+        sd = math.sqrt(between + within / k)
+        print(f"{k:6d}{sd:8.4f}{100 * power_at(pool, sd, margin, 0.0):21.0f}%"
+              f"{n_for(0.80, sd, margin, 0.0):11,.0f}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", type=Path, required=True)
@@ -100,6 +140,8 @@ def main() -> None:
     ap.add_argument("--margin", type=float, default=2.0, help="percentage points")
     ap.add_argument("--pool", type=int, default=997, help="available fresh questions")
     ap.add_argument("--effects", type=float, nargs="+", default=[0.0, -0.25, -0.5, -1.0, -1.5])
+    ap.add_argument("--seed-projection", action="store_true",
+                    help="decompose variance and project power for more seeds")
     args = ap.parse_args()
 
     sd, obs, n = paired_sd(args.run, args.arm, args.base, args.field)
@@ -121,6 +163,9 @@ def main() -> None:
         f80 = "infeasible" if n80 == float("inf") else f"{n80:,.0f}"
         f90 = "infeasible" if n90 == float("inf") else f"{n90:,.0f}"
         print(f"{eff:>+11.2f} pp{100 * p:>13.0f}%{f80:>12s}{f90:>12s}")
+    if args.seed_projection:
+        seed_projection(args.run, args.arm, args.base, args.field, m, args.pool)
+
     print("\nPower at the true effect of 0 alone overstates the design; read the row")
     print("matching the effect you actually expect. 'infeasible' means the true")
     print("effect is at or beyond the margin, so no sample size can certify it.")

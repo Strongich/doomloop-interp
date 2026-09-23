@@ -1,0 +1,160 @@
+{
+ "name": "reasoning-policy-v1 fresh evaluation",
+ "locked": "2026-09-23",
+ "status": "LOCKED before any fresh GSM8K or MATH-500 treated rollout",
+ "model": "Qwen/Qwen3-1.7B",
+ "model_commit": null,
+ "layer": 20,
+ "versions": {
+  "vllm": "0.22.0",
+  "torch": "2.11.0",
+  "transformers": "5.9.0"
+ },
+ "arms": [
+  "base",
+  "N@a1.0d256",
+  "D@a0.5d512",
+  "brevityA",
+  "R101@a1.0d256",
+  "R202@a1.0d256",
+  "R303@a1.0d256"
+ ],
+ "policies": {
+  "base": {
+   "name": "base",
+   "direction": null,
+   "alpha": 0.0,
+   "delay": 0,
+   "brevity": null
+  },
+  "N@a1.0d256": {
+   "name": "N@a1.0d256",
+   "direction": "N",
+   "alpha": 1.0,
+   "delay": 256,
+   "brevity": null
+  },
+  "D@a0.5d512": {
+   "name": "D@a0.5d512",
+   "direction": "D",
+   "alpha": 0.5,
+   "delay": 512,
+   "brevity": null
+  },
+  "brevityA": {
+   "name": "brevityA",
+   "direction": null,
+   "alpha": 0.0,
+   "delay": 0,
+   "brevity": "A"
+  },
+  "R101@a1.0d256": {
+   "name": "R101@a1.0d256",
+   "direction": "R101",
+   "alpha": 1.0,
+   "delay": 256,
+   "brevity": null
+  },
+  "R202@a1.0d256": {
+   "name": "R202@a1.0d256",
+   "direction": "R202",
+   "alpha": 1.0,
+   "delay": 256,
+   "brevity": null
+  },
+  "R303@a1.0d256": {
+   "name": "R303@a1.0d256",
+   "direction": "R303",
+   "alpha": 1.0,
+   "delay": 256,
+   "brevity": null
+  }
+ },
+ "format_instruction": "Give your final answer in \\boxed{}.",
+ "brevity_prompts": {
+  "A": "Solve concisely. Avoid repeating calculations or explanations."
+ },
+ "directions": {
+  "N": {
+   "path": "data/pool/dir_A_1trace.pt",
+   "sha256": "6efc847671486f95add72341f2d9a2c0b4d34497deb73a487b1bab3a31a1ad44"
+  },
+  "D": {
+   "path": "data/dom/dir_D_diffmeans.pt",
+   "sha256": "d5a07a6f28f5d4a1a1c2ffd90da164c1a0bba12165f823b56cb8c074e0bfe033"
+  },
+  "R101": {
+   "path": "data/dirs_random/dir_R101.pt",
+   "sha256": "23851ea94180f1de5647d512aeb88ee9f1eda08384e6aee7579670d533cd8638"
+  },
+  "R202": {
+   "path": "data/dirs_random/dir_R202.pt",
+   "sha256": "7723ac6f43ba60a28b73eb3e7d1bafaa30bf98d4a0938ab457d7e6f146a9312b"
+  },
+  "R303": {
+   "path": "data/dirs_random/dir_R303.pt",
+   "sha256": "2fa338f5885fa9537a0fd711bcde09dc1f8474e317e55ca02195a1fa110fcf0b"
+  }
+ },
+ "decoding": {
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "top_k": 20
+ },
+ "evaluations": [
+  {
+   "order": 1,
+   "set": "MATH-500",
+   "cohort": "data/policy/math500.jsonl",
+   "sha256": "facd4b1433bbd26e2fd31535cd9c42f63855037ec572661274a1ba650774a1de",
+   "n_questions": 500,
+   "seeds": 4,
+   "max_new_tokens": 32768,
+   "role": "generalization, reported separately, never pooled",
+   "note": "50-question base-only budget check disclosed in EXPERIMENT-reasoning-policy.md; those questions stay in"
+  },
+  {
+   "order": 2,
+   "set": "fresh GSM8K official test",
+   "cohort": "data/policy/fresh_gsm8k_test_997.jsonl",
+   "sha256": "8ce4f3f7a07cad57a1d1bf9e430ca7e7b7fa41ef4a97fd328dad5ed78e09901f",
+   "n_questions": 997,
+   "seeds": 4,
+   "max_new_tokens": 16384,
+   "role": "PRIMARY accuracy-cost test",
+   "split": "official test only; exposure audit data/exposure_audit.json",
+   "exposure_audit_sha256": "72c1f64cb8308eb82262ec8072db584103f33a58b59414d31f9082db37ec0a69"
+  }
+ ],
+ "grading": {
+  "rule": "boxed-only math_verify; gold parsed boxed (D61)",
+  "code_sha256": "51fdf04c63cf521b77170b8db76a12035adf088241c093abbbf9fb05e4321713",
+  "sensitivity": "scripts/audit_unboxed.py, arm-blind, secondary only"
+ },
+ "analysis": {
+  "unit": "question; seeds averaged within question; paired against base on shared questions",
+  "primary": "N@a1.0d256 vs base on fresh GSM8K test",
+  "accuracy_criterion": "lower bound of two-sided 95% CI on paired difference > -2.0 pp",
+  "cost_criterion": "token saving 1-mean(N)/mean(base) >= 20% point estimate, bootstrap 95% lower bound > 0",
+  "claim_requires": "both accuracy and cost criteria; otherwise report tradeoff or inconclusive",
+  "secondary": "D@a0.5d512, brevityA, R101/R202/R303 vs base; Holm correction for formal claims",
+  "margin_fixed": "-2.0 pp; not widened after results; no continued testing until an interval passes",
+  "also_report": "thinking/answer tokens, medians, p90/p99, caps, unanswered, doubt paragraphs; MATH-500 by level and subject"
+ },
+ "power_note": "from stage-2 variance (N@a1.0d256): 4 seeds x 997 -> 71% at true 0, ~53% at observed -0.375 pp. MATH-500 variance unknown.",
+ "execution": {
+  "engine": "vLLM 0.22.0 V1 eager, one single-GPU engine per shard, 4 x A100-80GB",
+  "sharding": "by policy, baseline once (REPLICATE=0), unpaired (PAIR=0); device effects declared negligible 2026-09-23",
+  "batch": 200,
+  "checkpoint_every": 200,
+  "max_num_batched_tokens": 8192,
+  "gpu_memory_utilization": 0.9
+ },
+ "code_sha256": {
+  "scripts/reasoning_policy_vllm.py": "e216ecd2bad38abb3406e7e6a74d7d2233f45955fee07a5d7e85ed1a3258aa52",
+  "src/reasoning_attention/serving/vllm_steering.py": "44417cb601b988e8720ff213c8aaae10387bf140b5ebe000b5d046f2da69bebc",
+  "scripts/run_policy_sharded.sh": "206a3832fd9a5ba8a11862e4fa0d660eeb89dd82e408d40d82e5bf438e225dd6",
+  "scripts/plan_policy_shards.py": "cf64d6eb9a1cdf7323b04e1c183f8e8435801d26e2b68299eec5a578ef8d2157",
+  "scripts/merge_policy_shards.py": "492e5ac60c8af1111c7139075525e5dc7dfd302079a333a40a18490b4b4a310d"
+ }
+}

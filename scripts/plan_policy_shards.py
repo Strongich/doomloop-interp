@@ -137,7 +137,16 @@ def main() -> None:
     ap.add_argument("--controls", nargs="*", default=[], help="stage 2: prompt controls")
     ap.add_argument("--replicate", nargs="*", default=None,
                     help="policies run on EVERY shard; base is always included")
-    ap.add_argument("--from-run", type=Path, default=None)
+    ap.add_argument("--no-replicate", action="store_true",
+                    help="run every policy exactly once, baseline included. For "
+                         "evaluation runs where cross-device replicas are not wanted: "
+                         "they cost a full extra baseline per shard.")
+    ap.add_argument("--from-run", type=Path, nargs="+", default=None,
+                    help="one or more run dirs whose measured mean tokens replace the model")
+    ap.add_argument("--no-pair", action="store_true",
+                    help="pack every policy on its own instead of keeping N and D together. "
+                         "Pairing only guards against device effects on the N/D contrast; "
+                         "use this when those are declared negligible (2026-09-23).")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--questions", type=int, default=None)
     args = ap.parse_args()
@@ -149,7 +158,11 @@ def main() -> None:
         listed = args.policies.split()
         if not listed:
             raise SystemExit("stage 2 needs --policies (the stage-1 shortlist)")
-        units = cells_from(listed + list(args.controls))
+        units = (
+            [(p,) for p in listed + list(args.controls)]
+            if args.no_pair
+            else cells_from(listed + list(args.controls))
+        )
         questions = args.questions or 400
 
     steered = [p for cell in units for p in cell]
@@ -157,8 +170,12 @@ def main() -> None:
         raise SystemExit(f"duplicate policies: {sorted(steered)}")
 
     # Replicated policies are removed from the packing -- they run everywhere.
-    replicate = ["base"] + list(args.replicate or [])
-    if args.replicate is None and args.stage == 1:
+    # With --no-replicate the baseline is packed like any other policy instead.
+    if args.no_replicate:
+        units = [*units, ("base",)]
+        steered.append("base")
+    replicate = [] if args.no_replicate else ["base"] + list(args.replicate or [])
+    if args.replicate is None and args.stage == 1 and not args.no_replicate:
         # A steered replica is what actually tests the HOOK across devices;
         # an untreated baseline only tests the engine. Pick the strongest
         # intervention present, where a device difference would show up first.
@@ -169,7 +186,9 @@ def main() -> None:
     units = [tuple(p for p in cell if p not in replicate) for cell in units]
     units = [c for c in units if c]
 
-    measured = measured_costs(args.from_run) if args.from_run else {}
+    measured: dict[str, float] = {}
+    for run in args.from_run or []:
+        measured.update(measured_costs(run))
     cost = {p: measured.get(p, modelled_cost(p)) for p in steered + replicate}
     if measured:
         print(f"using {len(set(measured) & set(cost))} measured means from "
@@ -183,9 +202,12 @@ def main() -> None:
         print(f"  {' '.join(s)}")
     print(f"\nload imbalance (max/min): {max(loads) / min(loads):.3f}  "
           f"[ESTIMATE -- verify against measured shard wall times]")
-    print(f"replicated on every shard: {' '.join(replicate)}  "
-          f"({100 * (args.shards - 1) * sum(cost[p] for p in replicate) / sum(loads):.0f}% "
-          f"overhead, spent on cross-device diagnostics)")
+    if replicate:
+        print(f"replicated on every shard: {' '.join(replicate)}  "
+              f"({100 * (args.shards - 1) * sum(cost[p] for p in replicate) / sum(loads):.0f}% "
+              f"overhead, spent on cross-device diagnostics)")
+    else:
+        print("no replicated policies: every policy, baseline included, runs once")
 
     # A device effect must not align with the direction contrast. Perfect balance
     # is impossible with an odd shortlist, so the requirement is that no shard
@@ -206,7 +228,7 @@ def main() -> None:
     out.write_text(json.dumps({
         "stage": args.stage, "shards": shards, "replicated": replicate,
         "questions": questions,
-        "cost_source": str(args.from_run) if measured else "modelled",
+        "cost_source": [str(r) for r in args.from_run] if measured else "modelled",
     }, indent=1))
     print(f"\nwrote {out}")
 

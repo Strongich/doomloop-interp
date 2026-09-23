@@ -24,8 +24,18 @@ selection-free official GSM8K **test** ids recorded by
     is knowable in advance, so drawing a "balanced" or "hard" fresh set would
     quietly reintroduce the selection the fresh set exists to avoid.
 
+`--math500` writes the generalization set: all 500 HuggingFaceH4/MATH-500
+problems, loaded directly rather than through `math_datasets.load_one`, because
+the common schema drops `subject` and `level` and the report needs both. It also
+writes a budget-check subset, 10 per level, seeded. That subset runs the
+UNTREATED baseline only, to see whether the 16,384-token budget caps harder
+problems. The budget is arm-blind -- every arm gets the same one -- so choosing it
+from untreated lengths does not favour any policy; the subset stays in the
+evaluation set and its use is disclosed.
+
     uv run python scripts/build_policy_cohort.py
     uv run python scripts/build_policy_cohort.py --fresh 300 --seed 20260922
+    uv run python scripts/build_policy_cohort.py --math500
 """
 
 from __future__ import annotations
@@ -112,14 +122,47 @@ def fresh(out: Path, n: int, seed: int) -> None:
     print(f"  drawn from {len(eligible)} selection-free test ids with seed {seed}")
 
 
+def math500(out: Path, seed: int, per_level: int = 10) -> None:
+    from datasets import load_dataset
+
+    ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
+    rows = [
+        {
+            "question_id": f"math500:{i}",
+            "dataset": "math500",
+            "question": r["problem"],
+            "gold": str(r["answer"]),
+            "subject": r["subject"],
+            "level": int(r["level"]),
+            "unique_id": r["unique_id"],
+        }
+        for i, r in enumerate(ds)
+    ]
+    if len(rows) != 500 or len({r["question_id"] for r in rows}) != 500:
+        raise ValueError(f"expected 500 unique MATH-500 rows, got {len(rows)}")
+    write(out / "math500.jsonl", rows)
+    by_level: dict[int, list[dict]] = collections.defaultdict(list)
+    for r in rows:
+        by_level[r["level"]].append(r)
+    rng = random.Random(seed)
+    subset = [r for lv in sorted(by_level) for r in rng.sample(by_level[lv], per_level)]
+    subset.sort(key=lambda r: int(r["question_id"].split(":")[1]))
+    write(out / f"math500_budget{len(subset)}.jsonl", subset)
+    levels = collections.Counter(r["level"] for r in subset)
+    print(f"  budget subset by level: {dict(sorted(levels.items()))}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, default=Path("data/policy"))
     ap.add_argument("--subset", type=int, default=200, help="stage-1 screening size")
     ap.add_argument("--seed", type=int, default=20260922)
     ap.add_argument("--fresh", type=int, default=0, help="draw the confirmatory cohort instead")
+    ap.add_argument("--math500", action="store_true", help="write the MATH-500 evaluation set")
     args = ap.parse_args()
-    if args.fresh:
+    if args.math500:
+        math500(args.out, args.seed)
+    elif args.fresh:
         fresh(args.out, args.fresh, args.seed)
     else:
         development(args.out, args.subset, args.seed)

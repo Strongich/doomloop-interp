@@ -23,6 +23,7 @@ CHECKPOINT=${CHECKPOINT:-200}
 BATCHTOK=${BATCHTOK:-8192}
 GPUFRAC=${GPUFRAC:-0.90}
 LOGDIR=${LOGDIR:-/workspace}
+mkdir -p "$LOGDIR"
 # `-` not `:-`: an explicitly EMPTY value means "no prompt controls". With `:-`,
 # CONTROLS= silently fell back to the default and added both brevity arms.
 CONTROLS=${CONTROLS-"brevityA brevityB"}

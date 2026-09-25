@@ -181,7 +181,10 @@ def build(args: argparse.Namespace) -> None:
 def _parse(text: str | None) -> dict | None:
     if not text:
         return None
-    m = re.search(r"<json>\s*(\{.*\})\s*</json>", text, re.S)
+    # Tagged JSON; failing that, the outermost {...} (the judge sometimes drops the tags).
+    m = re.search(r"<json>\s*(\{.*\})\s*</json>", text, re.S) or re.search(
+        r"(\{.*\})", text, re.S
+    )
     if not m:
         return None
     # Judges quote LaTeX (`\(`, `\frac`, `\neq`) inside JSON strings. Every backslash

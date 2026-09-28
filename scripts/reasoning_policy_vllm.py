@@ -98,7 +98,10 @@ FIELDS = [
     "doubt_blocks", "doubt_rate",
 ]
 
-POLICY_RE = re.compile(r"^(?P<dir>[A-Za-z0-9]+)@a(?P<alpha>[0-9.]+)d(?P<delay>\d+)$")
+POLICY_RE = re.compile(
+    r"^(?P<dir>[A-Za-z0-9]+)@a(?P<alpha>[0-9.]+)d(?P<delay>\d+)(?:g(?P<guard>\d+))?$"
+)
+REPEAT_MINLEN = 8  # tokens; a paragraph shorter than this never counts toward the guard
 
 
 def parse_policy(spec: str) -> dict[str, Any]:
@@ -109,12 +112,14 @@ def parse_policy(spec: str) -> dict[str, Any]:
     without consulting the manifest.
     """
     if spec == "base":
-        return {"name": spec, "direction": None, "alpha": 0.0, "delay": 0, "brevity": None}
+        return {"name": spec, "direction": None, "alpha": 0.0, "delay": 0, "brevity": None,
+                "guard": 0}
     if spec.startswith("brevity"):
         key = spec.removeprefix("brevity")
         if key not in BREVITY:
             raise ValueError(f"Unknown brevity prompt {key!r}; have {sorted(BREVITY)}")
-        return {"name": spec, "direction": None, "alpha": 0.0, "delay": 0, "brevity": key}
+        return {"name": spec, "direction": None, "alpha": 0.0, "delay": 0, "brevity": key,
+                "guard": 0}
     m = POLICY_RE.match(spec)
     if not m:
         raise ValueError(f"Bad policy {spec!r}; use base, brevity<A|B>, or DIR@a<alpha>d<delay>")
@@ -127,11 +132,14 @@ def parse_policy(spec: str) -> dict[str, Any]:
         "alpha": float(m.group("alpha")),
         "delay": int(m.group("delay")),
         "brevity": None,
+        # g<K>: stop steering once any paragraph occurs for the K-th time (loop guard).
+        "guard": int(m.group("guard") or 0),
     }
 
 
 def expected_sites(
-    ids: list[int], prompt_len: int, boundary_set: set[int], close_id: int, delay: int
+    ids: list[int], prompt_len: int, boundary_set: set[int], close_id: int, delay: int,
+    guard: int = 0,
 ) -> list[int]:
     """Reconstruct eligible sites from output IDs alone, to audit the worker.
 
@@ -141,10 +149,25 @@ def expected_sites(
     it to predict a successor.
     """
     close = ids.index(close_id) if close_id in ids else len(ids)
+    cut = len(ids)
+    if guard:
+        seen: dict[tuple[int, ...], int] = {}
+        start = 0
+        for i, token in enumerate(ids[:-1]):
+            if i >= close:
+                break
+            if token in boundary_set:
+                para = tuple(ids[start : i + 1])
+                if len(para) >= REPEAT_MINLEN:
+                    seen[para] = seen.get(para, 0) + 1
+                    if seen[para] >= guard:
+                        cut = i
+                        break
+                start = i + 1
     return [
         prompt_len + i
         for i, token in enumerate(ids[:-1])
-        if i < close and token in boundary_set and (i + 1) >= delay
+        if i < close and i < cut and token in boundary_set and (i + 1) >= delay
     ]
 
 
@@ -179,7 +202,18 @@ def main() -> None:
     ap.add_argument("--checkpoint-every", type=int, default=128)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     ap.add_argument("--max-num-batched-tokens", type=int, default=2048)
+    # Cross-model transfer (EXPERIMENT-transfer-8b-log.md): a different target model,
+    # its steering layer, and extra NAME=PATH directions in that model's residual space.
+    ap.add_argument("--model", default=None, help="HF id; default config.MODEL_ID (1.7B)")
+    ap.add_argument("--layer", type=int, default=None, help="decoder layer; default l=20")
+    ap.add_argument("--dir", action="append", default=[], metavar="NAME=PATH")
+    ap.add_argument("--pp", type=int, default=1, help="pipeline-parallel size (one engine)")
     args = ap.parse_args()
+    for spec in args.dir:
+        name, _, path = spec.partition("=")
+        if not name.isalnum() or not Path(path).exists():
+            raise ValueError(f"Bad --dir {spec!r}")
+        DIRECTIONS[name] = path
 
     from transformers import AutoTokenizer
     from vllm import SamplingParams
@@ -187,7 +221,7 @@ def main() -> None:
     from reasoning_attention.config import MODEL_ID, NLAConfig, SamplingDefaults
     from reasoning_attention.data.math_datasets import build_messages
     from reasoning_attention.grading import grade
-    from reasoning_attention.serving.vllm_steering import build_steering_llm
+    from reasoning_attention.serving.vllm_steering import build_steering_llm, steering_stats
     from suppress_answer import NEWLINE_CHAR, doubt_stats
 
     if args.batch < 1 or args.checkpoint_every < 1 or args.seeds < 1:
@@ -196,9 +230,11 @@ def main() -> None:
     if len({p["name"] for p in policies}) != len(policies):
         raise ValueError("Duplicate policy names")
 
-    tok = AutoTokenizer.from_pretrained(MODEL_ID)
-    d_model = NLAConfig().d_model if hasattr(NLAConfig(), "d_model") else 2048
-    build_random_directions(Path("data/dirs_random"), d_model, (101, 202, 303))
+    model_id = args.model or MODEL_ID
+    layer = NLAConfig().extraction_layer if args.layer is None else args.layer
+    tok = AutoTokenizer.from_pretrained(model_id)
+    if model_id == MODEL_ID:
+        build_random_directions(Path("data/dirs_random"), 2048, (101, 202, 303))
 
     rows = [json.loads(x) for x in args.cohort.read_text().splitlines() if x.strip()]
     if args.limit:
@@ -247,7 +283,7 @@ def main() -> None:
     args.outdir.mkdir(parents=True, exist_ok=True)
     manifest = {
         "runner": "reasoning_policy_vllm", "protocol": "whole-question-delayed-boundary-v1",
-        "model": MODEL_ID, "model_commit": tok.init_kwargs.get("_commit_hash"),
+        "model": model_id, "model_commit": tok.init_kwargs.get("_commit_hash"),
         "versions": {p: version(p) for p in ("vllm", "torch", "transformers")},
         "cohort_sha256": digest(args.cohort), "limit": args.limit,
         "question_ids": [r["question_id"] for r in rows],
@@ -262,11 +298,12 @@ def main() -> None:
             "src/reasoning_attention/grading.py")},
         "seeds": args.seeds, "max_new_tokens": args.max_new_tokens,
         "temperature": sampling.temperature, "top_p": sampling.top_p, "top_k": sampling.top_k,
-        "layer": NLAConfig().extraction_layer, "max_model_len": max_len,
+        "layer": layer, "max_model_len": max_len,
         "max_num_seqs": args.batch, "checkpoint_every": args.checkpoint_every,
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "enforce_eager": True, "async_scheduling": False, "prefix_caching": False,
+        "pipeline_parallel_size": args.pp,
         "seed_scheme": "sha256(question_id:seed), identical across policies",
         "delay_scheme": "g = p - prompt_len + 1, one-based; prompt <think> not counted",
     }
@@ -308,8 +345,8 @@ def main() -> None:
           f"= {total}; {len(done)} resumed; max context {max_len}", flush=True)
 
     llm = build_steering_llm(
-        MODEL_ID, NLAConfig().extraction_layer, boundaries, close_id, max_len,
-        args.batch, args.gpu_memory_utilization, args.max_num_batched_tokens,
+        model_id, layer, boundaries, close_id, max_len,
+        args.batch, args.gpu_memory_utilization, args.max_num_batched_tokens, args.pp,
     )
     started = time.monotonic()
     completed = 0
@@ -323,7 +360,8 @@ def main() -> None:
                     unit = units.get(policy["direction"]) if policy["direction"] else None
                     llm.collective_rpc(
                         "configure_reasoning_steering",
-                        args=(unit, policy["alpha"], True, policy["delay"]),
+                        args=(unit, policy["alpha"], True, policy["delay"],
+                              policy["guard"], REPEAT_MINLEN),
                     )
                     inputs = [
                         {"prompt_token_ids": prompts[(r["question_id"], name)]} for r in chunk
@@ -340,7 +378,7 @@ def main() -> None:
                     batch_start = time.monotonic()
                     outputs = llm.generate(inputs, params, use_tqdm=False)
                     elapsed = time.monotonic() - batch_start
-                    stats = llm.collective_rpc("reasoning_steering_stats")[0]
+                    stats = steering_stats(llm)
                     if stats["calls"] == 0:
                         raise RuntimeError("Steering hook did not execute")
                     for row, result in zip(chunk, outputs, strict=True):
@@ -350,7 +388,8 @@ def main() -> None:
                         close = ids.index(close_id) if close_id in ids else None
                         think_end = close if close is not None else len(ids)
                         sites = expected_sites(
-                            ids, prompt_len, boundary_set, close_id, policy["delay"]
+                            ids, prompt_len, boundary_set, close_id, policy["delay"],
+                            policy["guard"],
                         )
                         steering = unit is not None and policy["alpha"] != 0
                         actual = stats["requests"][row["question_id"]]
@@ -386,6 +425,9 @@ def main() -> None:
                             "doubt_rate": round(doubt_blocks / n_bound, 4) if n_bound else -1.0,
                             "text": text, "token_ids": ids,
                             "prompt_tokens": prompt_len,
+                            "guard": policy["guard"],
+                            # Last eligible site the guard allowed (-1: none / guard off).
+                            "last_site_g": (sites[-1] - prompt_len + 1) if sites else -1,
                             "request_seed": request_seed(row["question_id"], seed),
                             "finish_reason": gen.finish_reason,
                             "batch_generation_seconds": elapsed,

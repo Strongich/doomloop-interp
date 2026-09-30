@@ -26,6 +26,14 @@ and 300/300 on GSM8K. GSM8K golds are bare integers that parsed correctly either
 way, so this does not move any historical GSM8K number — verified by re-grading
 all 3,096 rows of `data/prefix_online_vllm/`.
 
+**Gold answers are canonicalized first** (D69). Golds cut from raw MATH reference
+solutions (the MATH-train/test cohorts; MATH-500's HuggingFaceH4 golds are already
+canonical) use TeX shorthand arguments -- `\\frac83`, `\\frac 1{72}`, `\\sqrt2` -- which
+math_verify mis-parses, so a correct `\\dfrac{8}{3}` graded WRONG against gold
+`\\frac83`. `\\text{C,E}` against a boxed `C,E` failed the same way. Canonicalization
+braces single-token arguments and unwraps `\\text{}` around a plain choice list; it is
+applied to the gold only, and re-grading shows it moves no MATH-500 or GSM8K result.
+
 sympy can hang or blow the stack on adversarial input, hence the alarm. Note
 `signal.setitimer` only works on the main thread — call `grade()` from the main
 thread, or pass `timeout=None` to skip the guard.
@@ -33,6 +41,7 @@ thread, or pass `timeout=None` to skip the guard.
 
 from __future__ import annotations
 
+import re
 import signal
 from dataclasses import dataclass
 from typing import Any
@@ -89,6 +98,66 @@ def _extraction_config() -> list[Any]:
     ]
 
 
+_SHORTHAND = {"\\frac": 2, "\\dfrac": 2, "\\tfrac": 2, "\\sqrt": 1}
+_CHOICES = re.compile(r"^\\text\{([A-Za-z](?:\s*,\s*[A-Za-z])*)\}$")
+
+
+def _tex_arg(s: str, i: int) -> tuple[str, int]:
+    """One TeX macro argument starting at s[i] (spaces skipped): a braced group, a
+    control word, or a single character. Returns (argument without braces, next i)."""
+    while i < len(s) and s[i] == " ":
+        i += 1
+    if i >= len(s):
+        return "", i
+    if s[i] == "{":
+        depth = 0
+        for j in range(i, len(s)):
+            depth += (s[j] == "{") - (s[j] == "}")
+            if depth == 0:
+                return s[i + 1 : j], j + 1
+        return s[i + 1 :], len(s)
+    if s[i] == "\\":
+        j = i + 1
+        while j < len(s) and s[j].isalpha():
+            j += 1
+        return s[i : max(j, i + 2)], max(j, i + 2)
+    return s[i], i + 1
+
+
+def canonicalize_gold(gold: str) -> str:
+    """Brace TeX shorthand arguments (`\\frac83` -> `\\frac{8}{3}`) and unwrap `\\text{}`
+    around a plain choice list (`\\text{C,E}` -> `C,E`). Canonical golds pass unchanged."""
+    m = _CHOICES.match(gold.strip())
+    if m:
+        return m.group(1)
+    out, i = [], 0
+    while i < len(gold):
+        for macro, nargs in _SHORTHAND.items():
+            if (
+                gold.startswith(macro, i)
+                and not gold[i + len(macro) : i + len(macro) + 1].isalpha()
+            ):
+                i += len(macro)
+                if macro == "\\sqrt" and gold[i : i + 1] == "[":  # \\sqrt[n]{x}: leave the index
+                    j = gold.find("]", i)
+                    if j < 0:  # malformed index: keep the rest verbatim, never rewind
+                        j = len(gold) - 1
+                    out.append(macro + gold[i : j + 1])
+                    i = j + 1
+                else:
+                    out.append(macro)
+                args = []
+                for _ in range(nargs):
+                    a, i = _tex_arg(gold, i)
+                    args.append("{" + canonicalize_gold(a) + "}")
+                out.append("".join(args))
+                break
+        else:
+            out.append(gold[i])
+            i += 1
+    return "".join(out)
+
+
 def _parse_gold(gold: str) -> list[Any]:
     """Parse the gold answer through the same boxed extractor as the response.
 
@@ -115,7 +184,7 @@ def _parse_gold(gold: str) -> list[Any]:
 def _grade_inner(response: str, gold: str) -> Grade:
     from math_verify import parse, verify
 
-    gold_parsed = _parse_gold(gold)
+    gold_parsed = _parse_gold(canonicalize_gold(gold))
 
     if not gold_parsed:
         # GSM8K golds are bare integers, which `parse` sometimes declines. Fall

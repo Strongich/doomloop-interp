@@ -93,18 +93,34 @@ Return a JSON object inside <json></json>: {{"better": "A" | "B" | "tie", "reaso
 """
 
 
-def _load() -> tuple[pd.DataFrame, dict]:
-    rows = [json.loads(line) for f in sorted(glob.glob(ROLL)) for line in open(f)]
+def _load(regrade: bool = False) -> tuple[pd.DataFrame, dict]:
+    rows = [json.loads(line) for pat in ROLL.split(",") for f in sorted(glob.glob(pat))
+            for line in open(f)]
     df = pd.DataFrame([r for r in rows if r["policy"] in ARMS])
     cohort = {(r := json.loads(line))["question_id"]: r for line in open(COHORT)}
+    if regrade:  # D69: pick pairs / calibration with the fixed grader, not the journal's
+        import sys
+
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+        from reasoning_attention.grading import grade
+
+        g = [grade(t, gold) for t, gold in zip(df.text, df.gold, strict=True)]
+        df["correct"] = [int(x.is_correct) for x in g]
+        df["has_answer"] = [int(x.has_answer) for x in g]
+        df["status"] = [x.status for x in g]
     return df, cohort
 
 
 def build(args: argparse.Namespace) -> None:
     os.makedirs(OUT, exist_ok=True)
     rng = random.Random(args.seed)
-    df, cohort = _load()
+    df, cohort = _load(args.regrade)
     df["level"] = df.question_id.map(lambda q: cohort[q]["level"])
+    if args.exclude_from:  # a follow-up batch on questions no earlier batch used
+        used = {v["question_id"] for d in args.exclude_from.split(",")
+                for v in json.load(open(f"{d}/key.json")).values()}
+        df = df[~df.question_id.isin(used)]
+        print(f"excluding {len(used)} questions used by {args.exclude_from}")
     by = {(r.question_id, r.policy, r.seed): r for r in df.itertuples()}
 
     pairs = []
@@ -113,13 +129,16 @@ def build(args: argparse.Namespace) -> None:
         for (q, pol, s), r in by.items():
             if pol != "base" or r.level != level or not r.correct:
                 continue
-            n = by.get((q, "N@a1.0d256", s))
+            n = by.get((q, ARMS[1], s))
             if n is not None and n.correct:
                 cands.setdefault(q, []).append(s)
         qs = sorted(cands)
         rng.shuffle(qs)
         for q in sorted(qs[: args.per_level]):
             pairs.append((q, rng.choice(sorted(cands[q])), int(level)))
+    if args.n_pairs:  # a fixed-size random subsample across levels, one pair per question
+        rng.shuffle(pairs)
+        pairs = sorted(pairs[: args.n_pairs], key=lambda t: (t[2], t[0]))
 
     # Calibration: wrong-answer traces from hard levels, half per arm.
     wrong = sorted(
@@ -130,7 +149,7 @@ def build(args: argparse.Namespace) -> None:
     calib = []
     for arm in ARMS:
         pool = [w for w in wrong if w[1] == arm]
-        calib += rng.sample(pool, args.calibration // 2)
+        calib += rng.sample(pool, min(len(pool), args.calibration // 2))
 
     items, key = [], {}
 
@@ -144,13 +163,15 @@ def build(args: argparse.Namespace) -> None:
 
     for q, s, level in pairs:
         c = cohort[q]
-        tb, tn = by[(q, "base", s)].text, by[(q, "N@a1.0d256", s)].text
-        for arm, t in (("base", tb), ("N@a1.0d256", tn)):
+        tb, tn = by[(q, "base", s)].text, by[(q, ARMS[1], s)].text
+        for arm, t in (("base", tb), (ARMS[1], tn)):
             add(
                 "absolute",
                 ABSOLUTE.format(question=c["question"], gold=c["gold"], text=t),
                 {"question_id": q, "seed": s, "level": level, "arm": arm, "tokens": len(t)},
             )
+        if args.absolute_only:
+            continue
         for first in ARMS:  # both orders
             a, b = (tb, tn) if first == "base" else (tn, tb)
             add(
@@ -158,7 +179,7 @@ def build(args: argparse.Namespace) -> None:
                 PAIRWISE.format(question=c["question"], gold=c["gold"], a=a, b=b),
                 {"question_id": q, "seed": s, "level": level, "A": first},
             )
-    for q, arm, s in calib:
+    for q, arm, s in ([] if args.absolute_only else calib):
         c = cohort[q]
         add(
             "calibration",
@@ -268,7 +289,7 @@ def report(args: argparse.Namespace) -> None:
         print(f"-- {lab} (n={len(s)})")
         for m in metrics:
             bv = s[(m, "base")].astype(float).to_numpy()
-            nv = s[(m, "N@a1.0d256")].astype(float).to_numpy()
+            nv = s[(m, ARMS[1])].astype(float).to_numpy()
             lo, hi = _boot(nv - bv)
             print(f"  {m:20s} {bv.mean():7.3f} {nv.mean():7.3f}   {(nv - bv).mean():+.3f} [{lo:+.3f}, {hi:+.3f}]")
 
@@ -278,8 +299,8 @@ def report(args: argparse.Namespace) -> None:
         def n_score(r: pd.Series) -> float:
             if r.better == "tie":
                 return 0.0
-            winner = r.A if r.better == "A" else ("base" if r.A != "base" else "N@a1.0d256")
-            return 1.0 if winner == "N@a1.0d256" else -1.0
+            winner = r.A if r.better == "A" else ("base" if r.A != "base" else ARMS[1])
+            return 1.0 if winner == ARMS[1] else -1.0
 
         pw["n_score"] = pw.apply(n_score, axis=1)
         pq = pw.groupby(["question_id", "level"]).n_score.mean()
@@ -301,12 +322,17 @@ def report(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    global ROLL, COHORT, ARMS, OUT
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build")
     b.add_argument("--per-level", type=int, default=40)
     b.add_argument("--calibration", type=int, default=20)
     b.add_argument("--seed", type=int, default=20260925)
+    b.add_argument("--exclude-from", default="", help="comma-separated audit dirs")
+    b.add_argument("--regrade", action="store_true", help="select with the D69 grader")
+    b.add_argument("--n-pairs", type=int, default=0, help="random subsample of N pairs")
+    b.add_argument("--absolute-only", action="store_true", help="no pairwise / calibration")
     j = sub.add_parser("judge")
     j.add_argument("--limit", type=int, default=0)
     j.add_argument("--kind", choices=("absolute", "pairwise", "calibration"), default=None)
@@ -315,7 +341,15 @@ def main() -> None:
     j.add_argument("--concurrency", type=int, default=16)
     j.add_argument("--chunk", type=int, default=32)
     sub.add_parser("report")
+    # Transfer runs (claim-4 T3b): other rollouts / cohort / steered arm / output dir.
+    # Defaults reproduce Finding 14's MATH-500 audit exactly.
+    for sp in sub.choices.values():
+        sp.add_argument("--rollouts", default=ROLL, help="comma-separated globs")
+        sp.add_argument("--cohort", default=COHORT)
+        sp.add_argument("--arm", default=ARMS[1])
+        sp.add_argument("--out", default=OUT)
     args = ap.parse_args()
+    ROLL, COHORT, ARMS, OUT = args.rollouts, args.cohort, ("base", args.arm), args.out
     {"build": build, "judge": judge, "report": report}[args.cmd](args)
 
 

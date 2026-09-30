@@ -1,6 +1,7 @@
 """Norm-relative decoder-output steering for the installed vLLM 0.22 worker.
 
-Single-GPU, synchronous scheduling, eager execution only. Hooks are installed
+Synchronous scheduling, eager execution only; pipeline and tensor parallel supported
+(the steered block's output is replicated across TP ranks, see install). Hooks are installed
 AFTER vLLM's memory profiling. Prefix caching is disabled by the engine factory:
 changing the direction must never reuse intervention-dependent KV entries.
 """
@@ -125,14 +126,19 @@ class SteeringWorkerExtension:
             raise RuntimeError("Steering requires enforce_eager=True, async_scheduling=False")
         if cfg.cache_config.enable_prefix_caching or cfg.speculative_config is not None:
             raise RuntimeError("Disable prefix caching and speculative decoding for steering")
-        # Pipeline parallelism is supported: every PP rank holds the full layer list,
-        # with PPMissingLayer outside its own [start, end) range, so exactly one rank
-        # owns the steered block and installs the hook. Tensor parallelism is not
-        # validated here and stays refused.
-        if cfg.parallel_config.tensor_parallel_size != 1:
-            raise RuntimeError("This steering backend does not support tensor parallelism")
+        # Pipeline parallelism: every PP rank holds the full layer list, with
+        # PPMissingLayer outside its own [start, end) range, so one PP stage owns the
+        # steered block. Tensor parallelism: the block output is replicated on every TP
+        # rank of that stage (attention o_proj and FusedMoE/MLP outputs are all-reduced
+        # before the residual add; sequence-parallel MoE needs EP + DP > 1 and is
+        # refused), so each TP rank applies the identical edit to its own copy.
+        pc = cfg.parallel_config
+        if pc.use_sequence_parallel_moe or pc.enable_expert_parallel:
+            raise RuntimeError("Steering assumes replicated block outputs; disable EP / SP-MoE")
         if hasattr(self, "_reasoning_hook"):
             raise RuntimeError("Steering hook already installed")
+        from vllm.distributed import get_tensor_model_parallel_rank
+
         model = self.get_model()
         self._reasoning_owner = False
         if type(model.model.layers[layer]).__name__ == "PPMissingLayer":
@@ -157,6 +163,7 @@ class SteeringWorkerExtension:
         self._reasoning_repeat_minlen = 8
         self._reasoning_stats: dict[str, Any] = {}
         self._reasoning_calls = 0
+        self._reasoning_units: dict[str, torch.Tensor] = {}
 
         def hook(_module: Any, _inputs: Any, output: Any) -> Any:
             hidden, residual = output
@@ -164,44 +171,69 @@ class SteeringWorkerExtension:
             query = runner.query_start_loc.np
             if int(query[batch.num_reqs]) != hidden.shape[0]:
                 raise RuntimeError("Unexpected padded/microbatched forward in eager steering")
-            indices: list[int] = []
+            # (direction name, alpha) -> (unit, alpha, flat indices); the engine-wide
+            # policy uses the key None.
+            groups: dict[Any, tuple[torch.Tensor, float, list[int]]] = {}
             for row, req_id in enumerate(batch.req_ids):
                 start = int(batch.num_computed_tokens_cpu[row])
                 count = int(query[row + 1] - query[row])
                 prompt_len = int(batch.num_prompt_tokens[row])
-                sites = boundary_positions(
-                    batch.token_ids_cpu[row],
-                    prompt_len,
-                    start,
-                    count,
-                    self._reasoning_boundaries,
-                    self._reasoning_close,
-                    self._reasoning_thinking,
-                    self._reasoning_delay,
-                    self._reasoning_repeat_k,
-                    self._reasoning_repeat_minlen,
-                )
                 params = runner.requests[req_id].sampling_params
                 extra = params.extra_args or {}
+                # A per-request policy {"dir", "alpha", "delay", "guard"} overrides the
+                # engine-wide one, so mixed policies can share one engine queue.
+                policy = extra.get("steer")
+                if policy is not None:
+                    name = policy["dir"]
+                    if name is not None and name not in self._reasoning_units:
+                        raise RuntimeError(f"Unregistered steering direction {name!r}")
+                    unit = self._reasoning_units[name] if name is not None else None
+                    alpha = float(policy["alpha"])
+                    delay, repeat_k, key = int(policy["delay"]), int(policy["guard"]), (name, alpha)
+                else:
+                    unit, alpha = self._reasoning_unit, self._reasoning_alpha
+                    delay, repeat_k, key = self._reasoning_delay, self._reasoning_repeat_k, None
+                forced = extra.get("steer_positions")
+                if forced is not None:
+                    # Single-site screen: explicit absolute positions (prompt included)
+                    # replace the boundary policy for this request.
+                    sites = [int(p) for p in forced if start <= int(p) < start + count]
+                else:
+                    sites = boundary_positions(
+                        batch.token_ids_cpu[row],
+                        prompt_len,
+                        start,
+                        count,
+                        self._reasoning_boundaries,
+                        self._reasoning_close,
+                        self._reasoning_thinking,
+                        delay,
+                        repeat_k,
+                        self._reasoning_repeat_minlen,
+                    )
                 audit_id = extra.get("steering_audit_id", req_id)
                 stats = self._reasoning_stats.setdefault(
                     audit_id, {"sites": set(), "injections": set(), "applications": 0}
                 )
                 stats["sites"].update(sites)
-                if self._reasoning_unit is not None and self._reasoning_alpha != 0:
+                if unit is not None and alpha != 0 and sites:
                     stats["injections"].update(sites)
                     stats["applications"] += len(sites)
-                    indices.extend(int(query[row]) + pos - start for pos in sites)
+                    groups.setdefault(key, (unit, alpha, []))[2].extend(
+                        int(query[row]) + pos - start for pos in sites
+                    )
             self._reasoning_calls += 1
-            if not indices:
+            if not groups:
                 return output
-            return edit_decoder_output(
-                hidden,
-                residual,
-                torch.tensor(indices, device=hidden.device, dtype=torch.long),
-                self._reasoning_unit,
-                self._reasoning_alpha,
-            )
+            for unit, alpha, flat in groups.values():  # disjoint row sets
+                hidden, residual = edit_decoder_output(
+                    hidden,
+                    residual,
+                    torch.tensor(flat, device=hidden.device, dtype=torch.long),
+                    unit,
+                    alpha,
+                )
+            return hidden, residual
 
         self._reasoning_hook = model.model.layers[layer].register_forward_hook(hook)
         self._reasoning_owner = True
@@ -210,6 +242,7 @@ class SteeringWorkerExtension:
             "vllm": version("vllm"),
             "model": type(model).__name__,
             "owner": True,
+            "tp_rank": get_tensor_model_parallel_rank(),
         }
 
     def configure_reasoning_steering(
@@ -250,6 +283,34 @@ class SteeringWorkerExtension:
         self._reasoning_stats = {}
         self._reasoning_calls = 0
 
+    def register_steering_units(self: Any, units: dict[str, list[float]]) -> None:
+        """Named unit directions for per-request policies (`extra_args["steer"]`)."""
+        if not getattr(self, "_reasoning_owner", False):
+            return
+        expected = self.get_model().config.hidden_size
+        for name, unit in units.items():
+            u = torch.tensor(unit, dtype=torch.float32, device=self.device)
+            if u.shape != (expected,) or not bool(torch.isfinite(u).all()):
+                raise ValueError(f"Invalid steering vector {name!r}")
+            if not torch.isclose(u.norm(), torch.ones((), device=u.device), atol=1e-3):
+                raise ValueError(f"Direction {name!r} is not unit-norm")
+            self._reasoning_units[name] = u
+
+    def pop_reasoning_stats(self: Any, audit_ids: list[str]) -> dict[str, Any] | None:
+        """Audit records for finished requests, removed from the store (streaming runs)."""
+        if not getattr(self, "_reasoning_owner", False):
+            return None
+        out = {}
+        for aid in audit_ids:
+            s = self._reasoning_stats.pop(aid, None)
+            if s is not None:
+                out[aid] = {
+                    "sites": sorted(s["sites"]),
+                    "injections": sorted(s["injections"]),
+                    "applications": s["applications"],
+                }
+        return {"calls": self._reasoning_calls, "requests": out}
+
     def reasoning_steering_stats(self: Any) -> dict[str, Any] | None:
         if not getattr(self, "_reasoning_owner", False):
             return None
@@ -276,9 +337,15 @@ class CaptureWorkerExtension(SteeringWorkerExtension):
     """
 
     def install_capture(self: Any, layers: list[int]) -> dict[str, Any]:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
         runner = self.model_runner
         model = self.get_model()
         self._captures: dict[str, dict[int, dict[int, torch.Tensor]]] = {}
+        # Block outputs are replicated across TP ranks (see install_reasoning_steering),
+        # so only TP rank 0 of the owning stage stores: every layer is owned exactly once.
+        if get_tensor_model_parallel_rank() != 0:
+            return {"owned": []}
         owned = [
             layer
             for layer in layers
@@ -325,6 +392,19 @@ class CaptureWorkerExtension(SteeringWorkerExtension):
             for cid, d in out.items()
         }
 
+    def dump_captures(self: Any, path_template: str) -> int:
+        """torch.save pending captures to `path_template.format(pid)` and clear them.
+
+        For large extractions: float lists over RPC cost ~10x the bf16 bytes, and the
+        workers share the host. Returns the number of stored vectors; a worker with
+        nothing stored writes no file.
+        """
+        out, self._captures = getattr(self, "_captures", {}), {}
+        n = sum(len(pos) for d in out.values() for pos in d.values())
+        if n:
+            torch.save(out, path_template.format(os.getpid()))
+        return n
+
 
 def build_steering_llm(
     model_id: str,
@@ -336,8 +416,15 @@ def build_steering_llm(
     gpu_memory_utilization: float = 0.85,
     max_num_batched_tokens: int = 2048,
     pipeline_parallel_size: int = 1,
+    tensor_parallel_size: int = 1,
+    **llm_kwargs: Any,
 ) -> Any:
-    """Build a version-checked engine; all experiment arms share this engine."""
+    """Build a version-checked engine; all experiment arms share this engine.
+
+    `llm_kwargs` pass through to `vllm.LLM` (e.g. `max_logprobs` for the single-site
+    screen). Quantized checkpoints (e.g. Qwen3-235B-A22B-FP8) are detected from their
+    config; activations and the steering edit stay bf16.
+    """
     # 0.22 defaults Qwen3 to its V2 runner, which has a different metadata API.
     # Select the bundled V1 runner; do not replace/downgrade the installed package.
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
@@ -351,7 +438,7 @@ def build_steering_llm(
     llm = LLM(
         model=model_id,
         dtype="bfloat16",
-        tensor_parallel_size=1,
+        tensor_parallel_size=tensor_parallel_size,
         pipeline_parallel_size=pipeline_parallel_size,
         enforce_eager=True,
         async_scheduling=False,
@@ -362,17 +449,38 @@ def build_steering_llm(
         max_num_batched_tokens=max_num_batched_tokens,
         gpu_memory_utilization=gpu_memory_utilization,
         worker_extension_cls=("reasoning_attention.serving.vllm_steering.SteeringWorkerExtension"),
+        **llm_kwargs,
     )
     result = llm.collective_rpc("install_reasoning_steering", args=(layer, boundary_ids, close_id))
     owners = [r for r in result if r["owner"]]
-    if len(owners) != 1 or owners[0]["layer"] != layer or len(result) != pipeline_parallel_size:
+    if (
+        len(result) != pipeline_parallel_size * tensor_parallel_size
+        or sorted(r["tp_rank"] for r in owners) != list(range(tensor_parallel_size))
+        or any(r["layer"] != layer for r in owners)
+    ):
         raise RuntimeError(f"Steering installation failed: {result}")
     return llm
 
 
+def pop_steering_stats(llm: Any, audit_ids: list[str]) -> dict[str, Any]:
+    """`pop_reasoning_stats` from the owning stage, checked equal across its TP ranks."""
+    stats = [s for s in llm.collective_rpc("pop_reasoning_stats", args=(audit_ids,)) if s]
+    if not stats:
+        raise RuntimeError("No worker owns the steered block")
+    if any(s["requests"] != stats[0]["requests"] for s in stats[1:]):
+        raise RuntimeError(f"Steering stats differ across {len(stats)} TP ranks")
+    return stats[0]
+
+
 def steering_stats(llm: Any) -> dict[str, Any]:
-    """Audit stats from the one worker that owns the steered block."""
+    """Audit stats from the pipeline stage that owns the steered block.
+
+    Under tensor parallelism every TP rank of that stage steers its replicated copy;
+    their site/injection records must agree exactly, or the ranks have diverged.
+    """
     stats = [s for s in llm.collective_rpc("reasoning_steering_stats") if s is not None]
-    if len(stats) != 1:
-        raise RuntimeError(f"Expected stats from exactly one pipeline rank, got {len(stats)}")
+    if not stats:
+        raise RuntimeError("No worker owns the steered block")
+    if any(s != stats[0] for s in stats[1:]):
+        raise RuntimeError(f"Steering stats differ across {len(stats)} TP ranks")
     return stats[0]

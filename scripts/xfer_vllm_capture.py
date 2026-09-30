@@ -24,12 +24,13 @@ sys.path.insert(0, str(ROOT / "src"))
 
 
 def build_capture_llm(model: str, layers: list[int], max_model_len: int, pp: int = 1,
-                      gpu_memory_utilization: float = 0.85, max_num_seqs: int = 64) -> Any:
+                      gpu_memory_utilization: float = 0.85, max_num_seqs: int = 64,
+                      tp: int = 1) -> Any:
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
     os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
     from vllm import LLM
 
-    llm = LLM(model=model, dtype="bfloat16", tensor_parallel_size=1, pipeline_parallel_size=pp,
+    llm = LLM(model=model, dtype="bfloat16", tensor_parallel_size=tp, pipeline_parallel_size=pp,
               enforce_eager=True, async_scheduling=False, enable_prefix_caching=False,
               enable_chunked_prefill=True, max_model_len=max_model_len, max_num_seqs=max_num_seqs,
               max_num_batched_tokens=8192, gpu_memory_utilization=gpu_memory_utilization,
@@ -41,18 +42,33 @@ def build_capture_llm(model: str, layers: list[int], max_model_len: int, pp: int
 
 
 def capture(llm: Any, seqs: list[list[int]], positions: list[list[int]],
-            layers: list[int]) -> dict[int, torch.Tensor]:
+            layers: list[int], tmpdir: str | None = None) -> dict[int, torch.Tensor]:
+    """With `tmpdir`, workers torch.save their captures there (fast, same host);
+    otherwise they come back over RPC as float lists (fine for small checks)."""
     from vllm import SamplingParams
 
     params = [SamplingParams(max_tokens=1, temperature=0.0,
                              extra_args={"capture_id": str(i), "capture_positions": list(p)})
               for i, p in enumerate(positions)]
     llm.generate([{"prompt_token_ids": s} for s in seqs], params, use_tqdm=False)
-    merged: dict[str, dict[int, dict[int, torch.Tensor]]] = {}
-    for part in llm.collective_rpc("pop_captures"):
+    merged: dict[str, dict[int, dict[int, Any]]] = {}
+    if tmpdir is None:
+        parts = llm.collective_rpc("pop_captures")
+    else:
+        Path(tmpdir).mkdir(parents=True, exist_ok=True)
+        counts = llm.collective_rpc("dump_captures", args=(str(Path(tmpdir) / "cap_{}.pt"),))
+        files = sorted(Path(tmpdir).glob("cap_*.pt"))
+        if len(files) != sum(1 for c in counts if c):
+            raise RuntimeError(f"expected {sum(1 for c in counts if c)} dumps, found {len(files)}")
+        parts = []
+        for f in files:
+            parts.append(torch.load(f, weights_only=False))
+            f.unlink()
+    for part in parts:
         for cid, by_layer in part.items():
             for layer, by_pos in by_layer.items():
-                merged.setdefault(cid, {}).setdefault(layer, {}).update(by_pos)
+                merged.setdefault(cid, {}).setdefault(int(layer), {}).update(
+                    {int(k): v for k, v in by_pos.items()})
     out = {}
     for layer in layers:
         rows = []
@@ -66,7 +82,7 @@ def capture(llm: Any, seqs: list[list[int]], positions: list[list[int]],
     return out
 
 
-def check() -> None:
+def check(pp: int = 1, tp: int = 1, tmpdir: str | None = None) -> None:
     import json
     import random
 
@@ -81,8 +97,9 @@ def check() -> None:
         ids = tok(json.loads(line)["text"], add_special_tokens=False)["input_ids"][:3000]
         seqs.append(ids)
         pos.append(sorted(rng.sample(range(16, len(ids)), 6)))
-    llm = build_capture_llm("Qwen/Qwen3-1.7B", [20], 4096, gpu_memory_utilization=0.5)
-    got = capture(llm, seqs, pos, [20])[20].float()
+    llm = build_capture_llm("Qwen/Qwen3-1.7B", [20], 4096, pp=pp, tp=tp,
+                            gpu_memory_utilization=0.5)
+    got = capture(llm, seqs, pos, [20], tmpdir)[20].float()
     del llm
     hf = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-1.7B", dtype=torch.bfloat16,
                                               device_map="cuda").eval()
@@ -101,5 +118,9 @@ def check() -> None:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true")
-    if ap.parse_args().check:
-        check()
+    ap.add_argument("--pp", type=int, default=1)
+    ap.add_argument("--tp", type=int, default=1)
+    ap.add_argument("--tmpdir", default=None)
+    a = ap.parse_args()
+    if a.check:
+        check(a.pp, a.tp, a.tmpdir)

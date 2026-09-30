@@ -53,8 +53,14 @@ class FrozenNLA:
         self.device = device
 
     @torch.no_grad()
-    def verbalize(self, vecs: torch.Tensor, max_new_tokens: int = 300, batch: int = 64) -> list[str]:
-        """vecs [N, 2048] in 1.7B layer-20 space (any norm; rescaled to 1000)."""
+    def verbalize(self, vecs: torch.Tensor, max_new_tokens: int = 300, batch: int = 64,
+                  temperature: float = 0.0, seed: int | None = None) -> list[str]:
+        """vecs [N, 2048] in 1.7B layer-20 space (any norm; rescaled to 1000).
+
+        temperature 0 = greedy (default, as in Finding 15); > 0 samples (T1 uses T=1,
+        the AV's RL sampling temperature), seeded per call for reproducibility."""
+        if seed is not None:
+            torch.manual_seed(seed)
         out: list[str] = []
         emb_layer = self.nla.av.get_input_embeddings()
         for i in range(0, len(vecs), batch):
@@ -62,7 +68,10 @@ class FrozenNLA:
             ids = self.av_ids.expand(len(v), -1)
             emb = inject_at_placeholder(ids, emb_layer(ids), v, self.cfg.placeholder_token_id)
             gen = self.nla.av.generate(inputs_embeds=emb, attention_mask=torch.ones_like(ids),
-                                       max_new_tokens=max_new_tokens, do_sample=False,
+                                       max_new_tokens=max_new_tokens,
+                                       do_sample=temperature > 0,
+                                       **({"temperature": temperature, "top_p": 1.0, "top_k": 0}
+                                          if temperature > 0 else {}),
                                        pad_token_id=self.tok.pad_token_id)
             for g in gen:
                 out.append(extract_explanation(self.tok.decode(g, skip_special_tokens=True)) or "")

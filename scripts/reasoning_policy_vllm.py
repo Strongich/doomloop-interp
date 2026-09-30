@@ -208,6 +208,10 @@ def main() -> None:
     ap.add_argument("--layer", type=int, default=None, help="decoder layer; default l=20")
     ap.add_argument("--dir", action="append", default=[], metavar="NAME=PATH")
     ap.add_argument("--pp", type=int, default=1, help="pipeline-parallel size (one engine)")
+    ap.add_argument("--tp", type=int, default=1, help="tensor-parallel size (one engine)")
+    ap.add_argument("--stream", action="store_true",
+                    help="one engine queue for all seeds/policies (per-request steering); "
+                         "--checkpoint-every then only sets the export/log cadence")
     args = ap.parse_args()
     for spec in args.dir:
         name, _, path = spec.partition("=")
@@ -221,7 +225,9 @@ def main() -> None:
     from reasoning_attention.config import MODEL_ID, NLAConfig, SamplingDefaults
     from reasoning_attention.data.math_datasets import build_messages
     from reasoning_attention.grading import grade
-    from reasoning_attention.serving.vllm_steering import build_steering_llm, steering_stats
+    from reasoning_attention.serving.vllm_steering import (
+        build_steering_llm, pop_steering_stats, steering_stats,
+    )
     from suppress_answer import NEWLINE_CHAR, doubt_stats
 
     if args.batch < 1 or args.checkpoint_every < 1 or args.seeds < 1:
@@ -303,7 +309,8 @@ def main() -> None:
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "enforce_eager": True, "async_scheduling": False, "prefix_caching": False,
-        "pipeline_parallel_size": args.pp,
+        "pipeline_parallel_size": args.pp, "tensor_parallel_size": args.tp,
+        "stream": args.stream,
         "seed_scheme": "sha256(question_id:seed), identical across policies",
         "delay_scheme": "g = p - prompt_len + 1, one-based; prompt <think> not counted",
     }
@@ -347,102 +354,174 @@ def main() -> None:
     llm = build_steering_llm(
         model_id, layer, boundaries, close_id, max_len,
         args.batch, args.gpu_memory_utilization, args.max_num_batched_tokens, args.pp,
+        args.tp,
     )
     started = time.monotonic()
     completed = 0
+
+    def finish(out: Any, row: dict[str, Any], policy: dict[str, Any], seed: int, result: Any,
+               actual: dict[str, Any], elapsed: float, unit: Any) -> None:
+        """Audit one finished rollout against an independent site re-derivation, grade it,
+        and journal it. Shared by the chunked and the streaming paths."""
+        name = policy["name"]
+        gen = result.outputs[0]
+        ids = list(gen.token_ids)
+        prompt_len = len(result.prompt_token_ids)
+        close = ids.index(close_id) if close_id in ids else None
+        think_end = close if close is not None else len(ids)
+        sites = expected_sites(
+            ids, prompt_len, boundary_set, close_id, policy["delay"],
+            policy["guard"],
+        )
+        steering = unit is not None and policy["alpha"] != 0
+        if actual["sites"] != sites:
+            raise RuntimeError(
+                f"Site mismatch for {row['question_id']} under {name}: "
+                f"worker {actual['sites'][:8]}... expected {sites[:8]}..."
+            )
+        if actual["injections"] != (sites if steering else []):
+            raise RuntimeError(f"Injection mismatch for {row['question_id']}")
+        text = tok.decode(ids, skip_special_tokens=False)
+        g = grade(text, row["gold"])
+        markers, _, doubt_blocks = doubt_stats(text)
+        n_bound = sum(t in boundary_set for t in ids[:think_end])
+        inj = actual["injections"]
+        record = {
+            "question_id": row["question_id"],
+            "dataset": row.get("dataset", "gsm8k"),
+            "gold": str(row["gold"]), "policy": name,
+            "direction": policy["direction"] or "",
+            "alpha": policy["alpha"], "delay": policy["delay"],
+            "brevity": policy["brevity"] or "", "seed": seed,
+            "correct": int(g.is_correct), "has_answer": int(g.has_answer),
+            "status": g.status, "total_tokens": len(ids),
+            "think_tokens": think_end + int(close is not None),
+            "answer_tokens": len(ids) - think_end - int(close is not None),
+            "capped": int(gen.finish_reason == "length"),
+            "closed": int(close is not None), "boundaries": n_bound,
+            "eligible_sites": len(sites), "injections": len(inj),
+            # Where the policy actually began, in generated tokens.
+            "first_injection_g": (inj[0] - prompt_len + 1) if inj else -1,
+            "markers": markers, "doubt_blocks": doubt_blocks,
+            "doubt_rate": round(doubt_blocks / n_bound, 4) if n_bound else -1.0,
+            "text": text, "token_ids": ids,
+            "prompt_tokens": prompt_len,
+            "guard": policy["guard"],
+            # Last eligible site the guard allowed (-1: none / guard off).
+            "last_site_g": (sites[-1] - prompt_len + 1) if sites else -1,
+            "request_seed": request_seed(row["question_id"], seed),
+            "finish_reason": gen.finish_reason,
+            "batch_generation_seconds": elapsed,
+        }
+        out.write(json.dumps(record) + "\n")
+        records.append(record)
+        done.add((row["question_id"], name, seed))
+
+    def params_for(row: dict[str, Any], seed: int, extra: dict[str, Any]) -> Any:
+        return SamplingParams(
+            temperature=sampling.temperature, top_p=sampling.top_p,
+            top_k=sampling.top_k, max_tokens=args.max_new_tokens,
+            seed=request_seed(row["question_id"], seed), stop_token_ids=stop_ids,
+            extra_args=extra,
+        )
+
     with journal.open("a") as out:
-        for seed in range(args.seeds):
-            for policy in policies:
-                name = policy["name"]
-                todo = [r for r in rows if (r["question_id"], name, seed) not in done]
-                for offset in range(0, len(todo), args.checkpoint_every):
-                    chunk = todo[offset : offset + args.checkpoint_every]
+        if args.stream:
+            # Streaming: every (seed, policy, question) goes into ONE engine queue with its
+            # own per-request policy (`extra_args["steer"]`), so the batch stays full and
+            # the long-rollout tail is paid once per run instead of once per chunk. Each
+            # rollout is audited and journaled as soon as it finishes.
+            llm.collective_rpc(
+                "register_steering_units",
+                args=({d: units[d] for d in {p["direction"] for p in policies if p["direction"]}},),
+            )
+            llm.collective_rpc("configure_reasoning_steering", args=(None, 0.0, True, 0, 0,
+                                                                     REPEAT_MINLEN))
+            engine = llm.llm_engine
+            pending: dict[str, tuple[dict[str, Any], dict[str, Any], int, str]] = {}
+            alias: dict[str, str] = {}
+            for seed in range(args.seeds):
+                for policy in policies:
+                    name = policy["name"]
+                    for r in rows:
+                        if (r["question_id"], name, seed) in done:
+                            continue
+                        aid = f"{r['question_id']}|{name}|{seed}"
+                        steer = {"dir": policy["direction"], "alpha": policy["alpha"],
+                                 "delay": policy["delay"], "guard": policy["guard"]}
+                        rid = engine.add_request(
+                            aid, {"prompt_token_ids": prompts[(r["question_id"], name)]},
+                            params_for(r, seed, {"steering_audit_id": aid, "steer": steer}),
+                        )
+                        # Outputs may carry the external id or vLLM's internal one.
+                        pending[aid] = (r, policy, seed, aid)
+                        alias[aid] = alias[rid] = aid
+            n_total = len(pending)
+            t_last, tok_window = time.monotonic(), 0
+            while engine.has_unfinished_requests():
+                finished = [o for o in engine.step() if o.finished]
+                if not finished:
+                    continue
+                keys = [alias.get(o.request_id) for o in finished]
+                if None in keys:
+                    raise RuntimeError("Finished request with an unknown id")
+                stats = pop_steering_stats(llm, [pending[k][3] for k in keys])
+                if stats["calls"] == 0:
+                    raise RuntimeError("Steering hook did not execute")
+                for o, k in zip(finished, keys, strict=True):
+                    row, policy, seed, aid = pending.pop(k)
                     unit = units.get(policy["direction"]) if policy["direction"] else None
-                    llm.collective_rpc(
-                        "configure_reasoning_steering",
-                        args=(unit, policy["alpha"], True, policy["delay"],
-                              policy["guard"], REPEAT_MINLEN),
-                    )
-                    inputs = [
-                        {"prompt_token_ids": prompts[(r["question_id"], name)]} for r in chunk
-                    ]
-                    params = [
-                        SamplingParams(
-                            temperature=sampling.temperature, top_p=sampling.top_p,
-                            top_k=sampling.top_k, max_tokens=args.max_new_tokens,
-                            seed=request_seed(r["question_id"], seed), stop_token_ids=stop_ids,
-                            extra_args={"steering_audit_id": r["question_id"]},
-                        )
-                        for r in chunk
-                    ]
-                    batch_start = time.monotonic()
-                    outputs = llm.generate(inputs, params, use_tqdm=False)
-                    elapsed = time.monotonic() - batch_start
-                    stats = steering_stats(llm)
-                    if stats["calls"] == 0:
-                        raise RuntimeError("Steering hook did not execute")
-                    for row, result in zip(chunk, outputs, strict=True):
-                        gen = result.outputs[0]
-                        ids = list(gen.token_ids)
-                        prompt_len = len(result.prompt_token_ids)
-                        close = ids.index(close_id) if close_id in ids else None
-                        think_end = close if close is not None else len(ids)
-                        sites = expected_sites(
-                            ids, prompt_len, boundary_set, close_id, policy["delay"],
-                            policy["guard"],
-                        )
-                        steering = unit is not None and policy["alpha"] != 0
-                        actual = stats["requests"][row["question_id"]]
-                        if actual["sites"] != sites:
-                            raise RuntimeError(
-                                f"Site mismatch for {row['question_id']} under {name}: "
-                                f"worker {actual['sites'][:8]}... expected {sites[:8]}..."
-                            )
-                        if actual["injections"] != (sites if steering else []):
-                            raise RuntimeError(f"Injection mismatch for {row['question_id']}")
-                        text = tok.decode(ids, skip_special_tokens=False)
-                        g = grade(text, row["gold"])
-                        markers, _, doubt_blocks = doubt_stats(text)
-                        n_bound = sum(t in boundary_set for t in ids[:think_end])
-                        inj = actual["injections"]
-                        record = {
-                            "question_id": row["question_id"],
-                            "dataset": row.get("dataset", "gsm8k"),
-                            "gold": str(row["gold"]), "policy": name,
-                            "direction": policy["direction"] or "",
-                            "alpha": policy["alpha"], "delay": policy["delay"],
-                            "brevity": policy["brevity"] or "", "seed": seed,
-                            "correct": int(g.is_correct), "has_answer": int(g.has_answer),
-                            "status": g.status, "total_tokens": len(ids),
-                            "think_tokens": think_end + int(close is not None),
-                            "answer_tokens": len(ids) - think_end - int(close is not None),
-                            "capped": int(gen.finish_reason == "length"),
-                            "closed": int(close is not None), "boundaries": n_bound,
-                            "eligible_sites": len(sites), "injections": len(inj),
-                            # Where the policy actually began, in generated tokens.
-                            "first_injection_g": (inj[0] - prompt_len + 1) if inj else -1,
-                            "markers": markers, "doubt_blocks": doubt_blocks,
-                            "doubt_rate": round(doubt_blocks / n_bound, 4) if n_bound else -1.0,
-                            "text": text, "token_ids": ids,
-                            "prompt_tokens": prompt_len,
-                            "guard": policy["guard"],
-                            # Last eligible site the guard allowed (-1: none / guard off).
-                            "last_site_g": (sites[-1] - prompt_len + 1) if sites else -1,
-                            "request_seed": request_seed(row["question_id"], seed),
-                            "finish_reason": gen.finish_reason,
-                            "batch_generation_seconds": elapsed,
-                        }
-                        out.write(json.dumps(record) + "\n")
-                        records.append(record)
-                        done.add((row["question_id"], name, seed))
-                    out.flush()
-                    os.fsync(out.fileno())
+                    finish(out, row, policy, seed, o, stats["requests"][aid],
+                           time.monotonic() - started, unit)
+                    completed += 1
+                    tok_window += len(o.outputs[0].token_ids)
+                out.flush()
+                os.fsync(out.fileno())
+                if completed % args.checkpoint_every < len(finished) or not pending:
                     export()
-                    completed += len(chunk)
-                    toks = sum(len(o.outputs[0].token_ids) for o in outputs)
-                    print(f"seed={seed} policy={name} {offset + len(chunk)}/{len(todo)} "
-                          f"{toks / elapsed:.1f} tok/s; "
-                          f"{(time.monotonic() - started) / completed:.2f}s/rollout", flush=True)
+                    now = time.monotonic()
+                    print(f"stream {completed}/{n_total} {tok_window / (now - t_last):.1f} tok/s; "
+                          f"{(now - started) / completed:.2f}s/rollout", flush=True)
+                    t_last, tok_window = now, 0
+            if pending:
+                raise RuntimeError(f"{len(pending)} requests never finished")
+        else:
+            for seed in range(args.seeds):
+                for policy in policies:
+                    name = policy["name"]
+                    todo = [r for r in rows if (r["question_id"], name, seed) not in done]
+                    for offset in range(0, len(todo), args.checkpoint_every):
+                        chunk = todo[offset : offset + args.checkpoint_every]
+                        unit = units.get(policy["direction"]) if policy["direction"] else None
+                        llm.collective_rpc(
+                            "configure_reasoning_steering",
+                            args=(unit, policy["alpha"], True, policy["delay"],
+                                  policy["guard"], REPEAT_MINLEN),
+                        )
+                        inputs = [
+                            {"prompt_token_ids": prompts[(r["question_id"], name)]}
+                            for r in chunk
+                        ]
+                        params = [params_for(r, seed, {"steering_audit_id": r["question_id"]})
+                                  for r in chunk]
+                        batch_start = time.monotonic()
+                        outputs = llm.generate(inputs, params, use_tqdm=False)
+                        elapsed = time.monotonic() - batch_start
+                        stats = steering_stats(llm)
+                        if stats["calls"] == 0:
+                            raise RuntimeError("Steering hook did not execute")
+                        for row, result in zip(chunk, outputs, strict=True):
+                            finish(out, row, policy, seed, result,
+                                   stats["requests"][row["question_id"]], elapsed, unit)
+                        out.flush()
+                        os.fsync(out.fileno())
+                        export()
+                        completed += len(chunk)
+                        toks = sum(len(o.outputs[0].token_ids) for o in outputs)
+                        print(f"seed={seed} policy={name} {offset + len(chunk)}/{len(todo)} "
+                              f"{toks / elapsed:.1f} tok/s; "
+                              f"{(time.monotonic() - started) / completed:.2f}s/rollout",
+                              flush=True)
     export(final=True)
     print(f"Wrote {args.outdir / 'rollouts.csv'}", flush=True)
 

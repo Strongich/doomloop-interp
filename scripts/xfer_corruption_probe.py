@@ -40,9 +40,16 @@ def main() -> None:
     ap.add_argument("--cohort", default="data/xfer8b/fit_math400.jsonl")
     ap.add_argument("--n", type=int, default=400)
     ap.add_argument("--repeat", type=int, default=1, help="prompts are repeated this many times")
+    ap.add_argument("--runner", choices=["v1", "v2"], default="v1",
+                    help="v1 = what the steering engine uses; v2 = vLLM 0.22's default for Qwen3")
+    ap.add_argument("--quantization", default=None, help="e.g. fp8 (online, for a bf16 model)")
     args = ap.parse_args()
 
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    if args.runner == "v1":
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    else:
+        assert args.no_hook, "the steering hook needs the V1 runner"
+        os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
     os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
@@ -59,7 +66,8 @@ def main() -> None:
                   pipeline_parallel_size=args.pp, enforce_eager=True, async_scheduling=False,
                   enable_prefix_caching=False, enable_chunked_prefill=True,
                   max_model_len=max_len, max_num_seqs=args.batch,
-                  max_num_batched_tokens=args.mbt, gpu_memory_utilization=0.90)
+                  max_num_batched_tokens=args.mbt, gpu_memory_utilization=0.90,
+                  quantization=args.quantization)
     else:
         from reasoning_attention.serving.vllm_steering import build_steering_llm
 
@@ -85,7 +93,8 @@ def main() -> None:
         res = llm.generate([{"prompt_token_ids": p} for p in prompts], sp, use_tqdm=False)
         out = [r.outputs[0].text for r in res]
     bad = [i for i, t in enumerate(out) if not t.startswith("<think>")]
-    print(f"PROBE pp={args.pp} tp={args.tp} batch={args.batch} mbt={args.mbt} "
+    print(f"PROBE model={args.model.split('/')[-1]} runner={args.runner} q={args.quantization} "
+          f"pp={args.pp} tp={args.tp} batch={args.batch} mbt={args.mbt} "
           f"stream={args.stream} hook={not args.no_hook} n={len(out)}: "
           f"bad {len(bad)} ({100 * len(bad) / len(out):.1f}%) first bad idx {bad[:12]} "
           f"[{time.monotonic() - t0:.0f}s]", flush=True)

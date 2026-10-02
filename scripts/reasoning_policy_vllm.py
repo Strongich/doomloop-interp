@@ -196,6 +196,8 @@ def main() -> None:
     ap.add_argument("--outdir", type=Path, required=True)
     ap.add_argument("--policies", nargs="+", required=True)
     ap.add_argument("--seeds", type=int, default=2)
+    ap.add_argument("--seed-start", type=int, default=0,
+                    help="first seed index; seeds run seed_start..seeds-1 (top-ups)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--max-new-tokens", type=int, default=16384)
     ap.add_argument("--batch", type=int, default=32)
@@ -302,7 +304,7 @@ def main() -> None:
             "scripts/reasoning_policy_vllm.py",
             "src/reasoning_attention/serving/vllm_steering.py",
             "src/reasoning_attention/grading.py")},
-        "seeds": args.seeds, "max_new_tokens": args.max_new_tokens,
+        "seeds": args.seeds, "seed_start": args.seed_start, "max_new_tokens": args.max_new_tokens,
         "temperature": sampling.temperature, "top_p": sampling.top_p, "top_k": sampling.top_k,
         "layer": layer, "max_model_len": max_len,
         "max_num_seqs": args.batch, "checkpoint_every": args.checkpoint_every,
@@ -343,7 +345,7 @@ def main() -> None:
             os.fsync(f.fileno())
         os.replace(tmp, csv_path)
 
-    total = len(rows) * len(policies) * args.seeds
+    total = len(rows) * len(policies) * (args.seeds - args.seed_start)
     if len(done) == total:
         export(final=True)
         print("All rollouts already complete")
@@ -440,7 +442,7 @@ def main() -> None:
             engine = llm.llm_engine
             pending: dict[str, tuple[dict[str, Any], dict[str, Any], int, str]] = {}
             alias: dict[str, str] = {}
-            for seed in range(args.seeds):
+            for seed in range(args.seed_start, args.seeds):
                 for policy in policies:
                     name = policy["name"]
                     for r in rows:
@@ -486,7 +488,7 @@ def main() -> None:
             if pending:
                 raise RuntimeError(f"{len(pending)} requests never finished")
         else:
-            for seed in range(args.seeds):
+            for seed in range(args.seed_start, args.seeds):
                 for policy in policies:
                     name = policy["name"]
                     todo = [r for r in rows if (r["question_id"], name, seed) not in done]

@@ -38,6 +38,7 @@ SETS = {
     "val": "data/distill/val.jsonl",
     "aime_amc": "data/distill/eval_aime_amc.jsonl",
     "mathfresh": "data/distill_v3/mathtest_fresh1000.jsonl",  # PROTOCOL v3 §V6
+    "mathpipe": "data/pipeline_sft/mathtest_pipe1000.jsonl",  # EXPERIMENT-pipeline-sft §P4
 }
 SEEDS = {"aime_amc": 8}  # §L7: 70 x 8; everything else 4
 FORMAT = "Give your final answer in \\boxed{}."

@@ -142,7 +142,8 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=None, help="override the §L6 LR (§L10 item 8)")
     ap.add_argument("--lr-from", type=Path, default=None,
                     help="json with the selected {'lr': ...} (distill_queue.py sweep)")
-    ap.add_argument("--init", default=MODEL,
+    ap.add_argument("--model", default=MODEL, help="base model (PROTOCOL v4: Qwen/Qwen3-8B)")
+    ap.add_argument("--init", default=None,
                     help="starting weights; also the DPO reference (v3: the twin's merged SFT model)")
     ap.add_argument("--max-steps", type=int, default=0,
                     help="sweep proxy: stop after N steps, constant LR after warmup, no save")
@@ -150,6 +151,7 @@ def main() -> None:
     ap.add_argument("--wandb-project", default="doomloop-nla-sft")
     ap.add_argument("--no-wandb", action="store_true")
     args = ap.parse_args()
+    args.init = args.init or args.model
 
     name = args.name or f"{args.method}_{args.arm}_{args.peft}"
     out = args.out / name
@@ -175,6 +177,8 @@ def main() -> None:
         batches = batches[: args.max_steps]
         assert not set(hold) & {i for b in batches for i in b}, "held-out overlaps sweep batches"
     lr = LR[(args.method, args.peft)]
+    if args.model != MODEL and args.lr is None and args.lr_from is None:
+        raise SystemExit("non-default model: pass --lr or --lr-from explicitly")
     if args.lr_from is not None:
         lr = float(json.loads(args.lr_from.read_text())["lr"])
     if args.lr is not None:
@@ -185,7 +189,7 @@ def main() -> None:
               "global_batch": G, "steps": steps, "warmup_steps": warm, "examples": len(rows),
               "completion_tokens": comp, "max_len": MAX_LEN, "micro_tokens": args.micro_tokens,
               "beta": BETA if args.method == "dpo" else None, "seed": 0, "epochs": 1,
-              "data": str(data_path), "model": MODEL, "init": args.init,
+              "data": str(data_path), "model": args.model, "init": args.init,
               "lora": {"r": 64, "alpha": 128, "dropout": 0.05, "targets": "all-linear"}
               if args.peft == "lora" else None, "grad_clip": 1.0, "weight_decay": 0.0,
               "sweep_max_steps": args.max_steps or None,
@@ -209,8 +213,10 @@ def main() -> None:
         import wandb
 
         run = wandb.init(project=args.wandb_project, name=name, config=config,
-                         group=f"{'sweep-' if args.max_steps else ''}{args.method}-{args.peft}",
-                         tags=["protocol-v2", "1.7B"] + (["lr-sweep"] if args.max_steps else []))
+                         group=f"{'' if args.model == MODEL else 'v4-8b-'}"
+                               f"{'sweep-' if args.max_steps else ''}{args.method}-{args.peft}",
+                         tags=(["protocol-v2", "1.7B"] if args.model == MODEL
+                               else ["protocol-v4", args.model.split("/")[-1]]) + (["lr-sweep"] if args.max_steps else []))
 
     def batch_loss(b: list[int], train: bool) -> tuple[dict, int]:
         """One global batch: backward (train) or forward-only; returns (log, completion tokens)."""
@@ -350,7 +356,7 @@ def main() -> None:
     model = model.to(torch.bfloat16)
     model.config.use_cache = True
     model.save_pretrained(out, safe_serialization=True)
-    AutoTokenizer.from_pretrained(MODEL).save_pretrained(out)
+    AutoTokenizer.from_pretrained(args.model).save_pretrained(out)
     summary = {**config, "train_seconds": time.monotonic() - t0, "tokens_seen": seen_tok}
     (out / "train_summary.json").write_text(json.dumps(summary, indent=1) + "\n")
     (out / "DONE").write_text("ok\n")

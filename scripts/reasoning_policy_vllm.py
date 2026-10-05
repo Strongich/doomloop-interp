@@ -95,12 +95,14 @@ FIELDS = [
     "brevity", "seed", "correct", "has_answer", "status", "total_tokens",
     "think_tokens", "answer_tokens", "capped", "closed", "boundaries",
     "eligible_sites", "injections", "first_injection_g", "markers",
-    "doubt_blocks", "doubt_rate",
+    "doubt_blocks", "doubt_rate", "fired_sites", "unsteered_sites",
 ]
 
 POLICY_RE = re.compile(
-    r"^(?P<dir>[A-Za-z0-9]+)@a(?P<alpha>[0-9.]+)d(?P<delay>\d+)(?:g(?P<guard>\d+))?$"
+    r"^(?P<dir>[A-Za-z0-9]+)@a(?P<alpha>[0-9.]+)d(?P<delay>\d+)(?:g(?P<guard>\d+))?"
+    r"(?:G(?P<gq>\d+)|R(?P<rp>0\.[0-9]+))?$"
 )
+GATE_WINDOW = 3  # EXPERIMENT-probe-gated.md §G4
 REPEAT_MINLEN = 8  # tokens; a paragraph shorter than this never counts toward the guard
 
 
@@ -113,13 +115,13 @@ def parse_policy(spec: str) -> dict[str, Any]:
     """
     if spec == "base":
         return {"name": spec, "direction": None, "alpha": 0.0, "delay": 0, "brevity": None,
-                "guard": 0}
+                "guard": 0, "gate": None}
     if spec.startswith("brevity"):
         key = spec.removeprefix("brevity")
         if key not in BREVITY:
             raise ValueError(f"Unknown brevity prompt {key!r}; have {sorted(BREVITY)}")
         return {"name": spec, "direction": None, "alpha": 0.0, "delay": 0, "brevity": key,
-                "guard": 0}
+                "guard": 0, "gate": None}
     m = POLICY_RE.match(spec)
     if not m:
         raise ValueError(f"Bad policy {spec!r}; use base, brevity<A|B>, or DIR@a<alpha>d<delay>")
@@ -134,6 +136,10 @@ def parse_policy(spec: str) -> dict[str, Any]:
         "brevity": None,
         # g<K>: stop steering once any paragraph occurs for the K-th time (loop guard).
         "guard": int(m.group("guard") or 0),
+        # G<q>: probe-gated at tau_q of --gate-probe; R<p>: random-gated with probability p
+        # (EXPERIMENT-probe-gated.md §G4). Either skips the site of a firing and the next 3.
+        "gate": ({"kind": "probe", "q": m.group("gq")} if m.group("gq")
+                 else {"kind": "random", "p": float(m.group("rp"))} if m.group("rp") else None),
     }
 
 
@@ -169,6 +175,42 @@ def expected_sites(
         for i, token in enumerate(ids[:-1])
         if i < close and i < cut and token in boundary_set and (i + 1) >= delay
     ]
+
+
+def expected_gate(
+    gate: list[list[float]], sites: list[int], kind: str, request_seed: int, p: float,
+    tau: float, window: int = GATE_WINDOW,
+) -> tuple[list[int], list[int]]:
+    """Driver-side audit of a gated rollout (§G4), written independently of the worker.
+
+    The worker's per-site record must cover exactly the eligible sites. Probe firings are
+    taken as given (only checked against score > tau); random firings are re-drawn here.
+    Returns (fired, steered sites) re-derived with the skip window.
+    """
+    if [int(x[0]) for x in gate] != sites:
+        raise RuntimeError("Gate record does not cover exactly the eligible sites")
+    fired = []
+    for pos, score, f in gate:
+        pos = int(pos)
+        if kind == "probe":
+            if bool(f) != (score > tau):
+                raise RuntimeError(f"Probe firing at {pos} inconsistent with its score")
+            if f:
+                fired.append(pos)
+        else:
+            u = int.from_bytes(hashlib.sha256(f"{request_seed}:{pos}".encode()).digest()[:8], "big")
+            if (u / 2**64 < p) != bool(f):
+                raise RuntimeError(f"Random firing at {pos} does not re-derive")
+            if f:
+                fired.append(pos)
+    last = -10**9  # index of the most recent firing among eligible sites
+    steered, fired_set = [], set(fired)
+    for i, pos in enumerate(sites):
+        if pos in fired_set:
+            last = i
+        if i - last > window:
+            steered.append(pos)
+    return fired, steered
 
 
 def build_random_directions(outdir: Path, d_model: int, seeds: tuple[int, ...]) -> None:
@@ -211,6 +253,8 @@ def main() -> None:
     ap.add_argument("--dir", action="append", default=[], metavar="NAME=PATH")
     ap.add_argument("--pp", type=int, default=1, help="pipeline-parallel size (one engine)")
     ap.add_argument("--tp", type=int, default=1, help="tensor-parallel size (one engine)")
+    ap.add_argument("--gate-probe", type=Path, default=Path("data/gated/probe.pt"),
+                    help="probe for G<q> policies: {w, b, tau: {q: threshold}}")
     ap.add_argument("--stream", action="store_true",
                     help="one engine queue for all seeds/policies (per-request steering); "
                          "--checkpoint-every then only sets the export/log cadence")
@@ -258,6 +302,14 @@ def main() -> None:
     close_id = int(tok.convert_tokens_to_ids("</think>"))
     stop_ids = sorted({int(tok.eos_token_id), int(tok.convert_tokens_to_ids("<|endoftext|>"))})
 
+    probe = None
+    if any(p["gate"] for p in policies) and not args.stream:
+        raise ValueError("Gated policies need --stream (per-request steering)")
+    if any(p["gate"] and p["gate"]["kind"] == "probe" for p in policies):
+        probe = torch.load(args.gate_probe, map_location="cpu", weights_only=False)
+        for p in policies:
+            if p["gate"] and p["gate"]["kind"] == "probe":
+                p["gate"]["tau"] = float(probe["tau"][p["gate"]["q"]])
     used = sorted({p["direction"] for p in policies if p["direction"]})
     units = {
         name: torch.load(DIRECTIONS[name], map_location="cpu", weights_only=False)["unit"]
@@ -313,6 +365,8 @@ def main() -> None:
         "enforce_eager": True, "async_scheduling": False, "prefix_caching": False,
         "pipeline_parallel_size": args.pp, "tensor_parallel_size": args.tp,
         "stream": args.stream,
+        **({"gate_probe": digest(args.gate_probe), "gate_window": GATE_WINDOW} if probe
+           else {"gate_window": GATE_WINDOW} if any(p["gate"] for p in policies) else {}),
         "seed_scheme": "sha256(question_id:seed), identical across policies",
         "delay_scheme": "g = p - prompt_len + 1, one-based; prompt <think> not counted",
     }
@@ -340,7 +394,7 @@ def main() -> None:
         with tmp.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=FIELDS)
             writer.writeheader()
-            writer.writerows({k: row[k] for k in FIELDS} for row in records)
+            writer.writerows({k: row.get(k, "") for k in FIELDS} for row in records)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, csv_path)
@@ -381,7 +435,14 @@ def main() -> None:
                 f"Site mismatch for {row['question_id']} under {name}: "
                 f"worker {actual['sites'][:8]}... expected {sites[:8]}..."
             )
-        if actual["injections"] != (sites if steering else []):
+        rseed = request_seed(row["question_id"], seed)
+        fired: list[int] = []
+        allowed = sites
+        if policy["gate"]:
+            g = policy["gate"]
+            fired, allowed = expected_gate(actual.get("gate", []), sites, g["kind"], rseed,
+                                           g.get("p", 0.0), g.get("tau", 0.0))
+        if actual["injections"] != (allowed if steering else []):
             raise RuntimeError(f"Injection mismatch for {row['question_id']}")
         text = tok.decode(ids, skip_special_tokens=False)
         g = grade(text, row["gold"])
@@ -406,12 +467,15 @@ def main() -> None:
             "first_injection_g": (inj[0] - prompt_len + 1) if inj else -1,
             "markers": markers, "doubt_blocks": doubt_blocks,
             "doubt_rate": round(doubt_blocks / n_bound, 4) if n_bound else -1.0,
+            "fired_sites": len(fired) if policy["gate"] else "",
+            "unsteered_sites": len(sites) - len(allowed) if policy["gate"] else "",
+            "gate": actual.get("gate") if policy["gate"] else None,
             "text": text, "token_ids": ids,
             "prompt_tokens": prompt_len,
             "guard": policy["guard"],
             # Last eligible site the guard allowed (-1: none / guard off).
             "last_site_g": (sites[-1] - prompt_len + 1) if sites else -1,
-            "request_seed": request_seed(row["question_id"], seed),
+            "request_seed": rseed,
             "finish_reason": gen.finish_reason,
             "batch_generation_seconds": elapsed,
         }
@@ -439,6 +503,9 @@ def main() -> None:
             )
             llm.collective_rpc("configure_reasoning_steering", args=(None, 0.0, True, 0, 0,
                                                                      REPEAT_MINLEN))
+            if probe is not None:
+                llm.collective_rpc("register_gate_probe",
+                                   args=(probe["w"].float().tolist(), float(probe["b"])))
             engine = llm.llm_engine
             pending: dict[str, tuple[dict[str, Any], dict[str, Any], int, str]] = {}
             alias: dict[str, str] = {}
@@ -451,6 +518,13 @@ def main() -> None:
                         aid = f"{r['question_id']}|{name}|{seed}"
                         steer = {"dir": policy["direction"], "alpha": policy["alpha"],
                                  "delay": policy["delay"], "guard": policy["guard"]}
+                        if policy["gate"]:
+                            g = policy["gate"]
+                            steer["gate"] = (
+                                {"kind": "probe", "tau": g["tau"], "window": GATE_WINDOW}
+                                if g["kind"] == "probe" else
+                                {"kind": "random", "p": g["p"], "window": GATE_WINDOW,
+                                 "seed": request_seed(r["question_id"], seed)})
                         rid = engine.add_request(
                             aid, {"prompt_token_ids": prompts[(r["question_id"], name)]},
                             params_for(r, seed, {"steering_audit_id": aid, "steer": steer}),

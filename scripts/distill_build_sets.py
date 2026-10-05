@@ -43,13 +43,18 @@ def main() -> None:
     ap.add_argument("--runs", default="data/distill/gen/shard*")
     ap.add_argument("--pool", default="data/distill/train.jsonl")
     ap.add_argument("--out", type=Path, default=ROOT / "data/distill/sets")
+    # PROTOCOL v4 (8B): same rules, another model / teacher policy / pool
+    ap.add_argument("--model", default="Qwen/Qwen3-1.7B", help="tokenizer for prompt ids")
+    ap.add_argument("--steer", default="N@a1.0d256", help="teacher policy name")
     args = ap.parse_args()
+    global STEER
+    STEER = args.steer
 
     from transformers import AutoTokenizer
 
     from reasoning_attention.data.math_datasets import build_messages
 
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B")
+    tok = AutoTokenizer.from_pretrained(args.model)
 
     def prompt_ids(question: str) -> list[int]:  # == reasoning_policy_vllm.prompt_ids(q, None)
         messages = [{"role": "system", "content": FORMAT}, *build_messages(question)]
@@ -95,7 +100,7 @@ def main() -> None:
     sft: dict[str, list[dict]] = {k: [] for k in ("ordinary", "short", "steered", "steered_short")}
     dpo: dict[str, dict[str, list[dict]]] = {"natural": {"L": [], "K": [], "P": []},
                                              "steered": {"L": [], "K": [], "P": []}}
-    yield_hits, yield_n = 0, 0
+    yield_hits, yield_n, yield_short = 0, 0, 0
     for qid in sorted(by):
         v = by[qid]
         el = {}
@@ -127,6 +132,7 @@ def main() -> None:
             yield_n += 1
             yield_hits += pick(qid, "sft_steered", el[STEER])["total_tokens"] < \
                 shortest(el[BASE])["total_tokens"]
+            yield_short += shortest(el[STEER])["total_tokens"] < shortest(el[BASE])["total_tokens"]
         # --- DPO (§L5)
         chosen_l = {}
         if len(el[BASE]) >= 1:
@@ -177,7 +183,8 @@ def main() -> None:
         pol: sum(eligible_nolen(r) and fits(r) for v in by.values() for r in v[pol])
         for pol in (BASE, STEER)}
     stats["steered_yield"] = {"desc": "P(random eligible steered < shortest of eligible base), "
-                                      "over Q_SFT", "value": round(yield_hits / max(yield_n, 1), 4)}
+                                      "over Q_SFT", "value": round(yield_hits / max(yield_n, 1), 4),
+                             "shortest_vs_shortest": round(yield_short / max(yield_n, 1), 4)}
     for arm, rows in sft.items():
         path = args.out / f"sft_{arm}.jsonl"
         with path.open("w") as f:

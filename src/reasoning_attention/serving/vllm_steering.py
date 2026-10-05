@@ -92,6 +92,27 @@ def repeat_trigger(
     return None
 
 
+GATE_WINDOW = 3  # EXPERIMENT-probe-gated.md §G4: a firing also covers the next 3 sites
+
+
+def random_gate_fires(request_seed: int, position: int, p: float) -> bool:
+    """Deterministic random-gate draw (§G4): sha256("seed:position") as a uniform in [0, 1)."""
+    import hashlib
+
+    h = hashlib.sha256(f"{request_seed}:{position}".encode()).digest()
+    return int.from_bytes(h[:8], "big") / 2**64 < p
+
+
+def gate_window(sites: list[int], fired: set[int], window: int = GATE_WINDOW) -> list[int]:
+    """Sites that stay steered: no firing at the site or at any of its `window` preceding
+    eligible sites (`sites` sorted, all eligible sites of the request so far)."""
+    return [
+        p
+        for i, p in enumerate(sites)
+        if not any(q in fired for q in sites[max(0, i - window) : i + 1])
+    ]
+
+
 def edit_decoder_output(
     hidden: torch.Tensor,
     residual: torch.Tensor,
@@ -164,6 +185,7 @@ class SteeringWorkerExtension:
         self._reasoning_stats: dict[str, Any] = {}
         self._reasoning_calls = 0
         self._reasoning_units: dict[str, torch.Tensor] = {}
+        self._reasoning_probe: tuple[torch.Tensor, float] | None = None
 
         def hook(_module: Any, _inputs: Any, output: Any) -> Any:
             hidden, residual = output
@@ -174,15 +196,20 @@ class SteeringWorkerExtension:
             # (direction name, alpha) -> (unit, alpha, flat indices); the engine-wide
             # policy uses the key None.
             groups: dict[Any, tuple[torch.Tensor, float, list[int]]] = {}
+            # Gated requests (EXPERIMENT-probe-gated.md §G4) are decided after one batched
+            # probe evaluation on the PRE-edit block output of this forward.
+            gated: list[tuple[Any, ...]] = []
+            score_flat: list[int] = []
             for row, req_id in enumerate(batch.req_ids):
                 start = int(batch.num_computed_tokens_cpu[row])
                 count = int(query[row + 1] - query[row])
                 prompt_len = int(batch.num_prompt_tokens[row])
                 params = runner.requests[req_id].sampling_params
                 extra = params.extra_args or {}
-                # A per-request policy {"dir", "alpha", "delay", "guard"} overrides the
-                # engine-wide one, so mixed policies can share one engine queue.
+                # A per-request policy {"dir", "alpha", "delay", "guard"[, "gate"]} overrides
+                # the engine-wide one, so mixed policies can share one engine queue.
                 policy = extra.get("steer")
+                gate = None
                 if policy is not None:
                     name = policy["dir"]
                     if name is not None and name not in self._reasoning_units:
@@ -190,6 +217,7 @@ class SteeringWorkerExtension:
                     unit = self._reasoning_units[name] if name is not None else None
                     alpha = float(policy["alpha"])
                     delay, repeat_k, key = int(policy["delay"]), int(policy["guard"]), (name, alpha)
+                    gate = policy.get("gate")
                 else:
                     unit, alpha = self._reasoning_unit, self._reasoning_alpha
                     delay, repeat_k, key = self._reasoning_delay, self._reasoning_repeat_k, None
@@ -215,6 +243,20 @@ class SteeringWorkerExtension:
                 stats = self._reasoning_stats.setdefault(
                     audit_id, {"sites": set(), "injections": set(), "applications": 0}
                 )
+                if gate is not None:
+                    # Decisions are recorded per position and replayed verbatim if a
+                    # KV-preemption recompute revisits it, so a recompute never re-decides.
+                    decided = stats.setdefault("gate", {})
+                    new = [p for p in sites if p not in decided]
+                    if gate["kind"] == "probe" and new:
+                        if self._reasoning_probe is None:
+                            raise RuntimeError("Probe gate requested but no probe registered")
+                        first = len(score_flat)
+                        score_flat.extend(int(query[row]) + p - start for p in new)
+                    else:
+                        first = -1
+                    gated.append((row, sites, new, first, gate, stats, unit, alpha, key, start))
+                    continue
                 stats["sites"].update(sites)
                 if unit is not None and alpha != 0 and sites:
                     stats["injections"].update(sites)
@@ -222,6 +264,43 @@ class SteeringWorkerExtension:
                     groups.setdefault(key, (unit, alpha, []))[2].extend(
                         int(query[row]) + pos - start for pos in sites
                     )
+            if gated:
+                scores: list[float] = []
+                if score_flat:
+                    w, b = self._reasoning_probe
+                    idx = torch.tensor(score_flat, device=hidden.device, dtype=torch.long)
+                    h = hidden.index_select(0, idx) + residual.index_select(0, idx)
+                    scores = (h.float() @ w + b).cpu().tolist()
+                for row, sites, new, first, gate, stats, unit, alpha, key, start in gated:
+                    decided = stats["gate"]
+                    for j, p in enumerate(new):
+                        if gate["kind"] == "probe":
+                            s = scores[first + j]
+                            decided[p] = (s, s > float(gate["tau"]))
+                        elif gate["kind"] == "random":
+                            decided[p] = (
+                                -1.0,
+                                random_gate_fires(int(gate["seed"]), p, float(gate["p"])),
+                            )
+                        else:
+                            raise RuntimeError(f"Unknown gate kind {gate['kind']!r}")
+                    if not sites:
+                        continue
+                    stats["sites"].update(sites)
+                    every = sorted(stats["sites"])
+                    win = int(gate.get("window", GATE_WINDOW))
+                    at = {p: i for i, p in enumerate(every)}
+                    steer = [
+                        p
+                        for p in sites
+                        if not any(decided[q][1] for q in every[max(0, at[p] - win) : at[p] + 1])
+                    ]
+                    if unit is not None and alpha != 0 and steer:
+                        stats["injections"].update(steer)
+                        stats["applications"] += len(steer)
+                        groups.setdefault(key, (unit, alpha, []))[2].extend(
+                            int(query[row]) + pos - start for pos in steer
+                        )
             self._reasoning_calls += 1
             if not groups:
                 return output
@@ -296,8 +375,18 @@ class SteeringWorkerExtension:
                 raise ValueError(f"Direction {name!r} is not unit-norm")
             self._reasoning_units[name] = u
 
+    def register_gate_probe(self: Any, w: list[float], b: float) -> None:
+        """Linear probe s = <h, w> + b on the raw pre-edit block output (probe-gated runs)."""
+        if not getattr(self, "_reasoning_owner", False):
+            return
+        u = torch.tensor(w, dtype=torch.float32, device=self.device)
+        if u.shape != (self.get_model().config.hidden_size,) or not bool(torch.isfinite(u).all()):
+            raise ValueError("Invalid probe weights")
+        self._reasoning_probe = (u, float(b))
+
     def pop_reasoning_stats(self: Any, audit_ids: list[str]) -> dict[str, Any] | None:
-        """Audit records for finished requests, removed from the store (streaming runs)."""
+        """Audit records for finished requests, removed from the store (streaming runs).
+        Gated requests also carry `gate`: [[position, score, fired]] for every eligible site."""
         if not getattr(self, "_reasoning_owner", False):
             return None
         out = {}
@@ -309,6 +398,8 @@ class SteeringWorkerExtension:
                     "injections": sorted(s["injections"]),
                     "applications": s["applications"],
                 }
+                if "gate" in s:
+                    out[aid]["gate"] = [[p, sc, int(f)] for p, (sc, f) in sorted(s["gate"].items())]
         return {"calls": self._reasoning_calls, "requests": out}
 
     def reasoning_steering_stats(self: Any) -> dict[str, Any] | None:

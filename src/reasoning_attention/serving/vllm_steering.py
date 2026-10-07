@@ -119,12 +119,21 @@ def edit_decoder_output(
     indices: torch.Tensor,
     unit: torch.Tensor,
     alpha: float,
+    absolute: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Edit the full residual sum, preserving untouched vLLM tensor pairs exactly."""
+    """Edit the full residual sum, preserving untouched vLLM tensor pairs exactly.
+
+    Norm-relative by default (h + alpha * ||h|| * unit). `absolute` adds alpha * unit as
+    is, with `unit` then an unnormalized vector (SEAL's H + alpha * S,
+    EXPERIMENT-reviewer-baselines.md §B4b).
+    """
     if indices.numel() == 0 or alpha == 0:
         return hidden, residual
     h = hidden.index_select(0, indices) + residual.index_select(0, indices)
-    push = (alpha * h.float().norm(dim=-1, keepdim=True)) * unit
+    if absolute:
+        push = alpha * unit.unsqueeze(0).expand(h.shape[0], -1)
+    else:
+        push = (alpha * h.float().norm(dim=-1, keepdim=True)) * unit
     edited = h + push.to(h.dtype)
     hidden = hidden.index_copy(0, indices, edited)
     residual = residual.index_fill(0, indices, 0)
@@ -185,6 +194,7 @@ class SteeringWorkerExtension:
         self._reasoning_stats: dict[str, Any] = {}
         self._reasoning_calls = 0
         self._reasoning_units: dict[str, torch.Tensor] = {}
+        self._reasoning_vectors: dict[str, torch.Tensor] = {}  # absolute-scale (SEAL)
         self._reasoning_probe: tuple[torch.Tensor, float] | None = None
 
         def hook(_module: Any, _inputs: Any, output: Any) -> Any:
@@ -193,9 +203,10 @@ class SteeringWorkerExtension:
             query = runner.query_start_loc.np
             if int(query[batch.num_reqs]) != hidden.shape[0]:
                 raise RuntimeError("Unexpected padded/microbatched forward in eager steering")
-            # (direction name, alpha) -> (unit, alpha, flat indices); the engine-wide
-            # policy uses the key None.
-            groups: dict[Any, tuple[torch.Tensor, float, list[int]]] = {}
+            # (direction name, alpha, absolute) -> (unit, alpha, flat indices, absolute,
+            # [(stats, position)] aligned with the indices); the engine-wide policy uses
+            # the key None.
+            groups: dict[Any, tuple[torch.Tensor, float, list[int], bool, list[Any]]] = {}
             # Gated requests (EXPERIMENT-probe-gated.md §G4) are decided after one batched
             # probe evaluation on the PRE-edit block output of this forward.
             gated: list[tuple[Any, ...]] = []
@@ -210,13 +221,17 @@ class SteeringWorkerExtension:
                 # the engine-wide one, so mixed policies can share one engine queue.
                 policy = extra.get("steer")
                 gate = None
+                absolute = False
                 if policy is not None:
                     name = policy["dir"]
-                    if name is not None and name not in self._reasoning_units:
+                    absolute = bool(policy.get("abs", False))
+                    store = self._reasoning_vectors if absolute else self._reasoning_units
+                    if name is not None and name not in store:
                         raise RuntimeError(f"Unregistered steering direction {name!r}")
-                    unit = self._reasoning_units[name] if name is not None else None
+                    unit = store[name] if name is not None else None
                     alpha = float(policy["alpha"])
-                    delay, repeat_k, key = int(policy["delay"]), int(policy["guard"]), (name, alpha)
+                    delay, repeat_k = int(policy["delay"]), int(policy["guard"])
+                    key = (name, alpha, absolute)
                     gate = policy.get("gate")
                 else:
                     unit, alpha = self._reasoning_unit, self._reasoning_alpha
@@ -255,15 +270,17 @@ class SteeringWorkerExtension:
                         score_flat.extend(int(query[row]) + p - start for p in new)
                     else:
                         first = -1
-                    gated.append((row, sites, new, first, gate, stats, unit, alpha, key, start))
+                    gated.append(
+                        (row, sites, new, first, gate, stats, unit, alpha, key, start, absolute)
+                    )
                     continue
                 stats["sites"].update(sites)
                 if unit is not None and alpha != 0 and sites:
                     stats["injections"].update(sites)
                     stats["applications"] += len(sites)
-                    groups.setdefault(key, (unit, alpha, []))[2].extend(
-                        int(query[row]) + pos - start for pos in sites
-                    )
+                    grp = groups.setdefault(key, (unit, alpha, [], absolute, []))
+                    grp[2].extend(int(query[row]) + pos - start for pos in sites)
+                    grp[4].extend((stats, pos) for pos in sites)
             if gated:
                 scores: list[float] = []
                 if score_flat:
@@ -271,7 +288,7 @@ class SteeringWorkerExtension:
                     idx = torch.tensor(score_flat, device=hidden.device, dtype=torch.long)
                     h = hidden.index_select(0, idx) + residual.index_select(0, idx)
                     scores = (h.float() @ w + b).cpu().tolist()
-                for row, sites, new, first, gate, stats, unit, alpha, key, start in gated:
+                for row, sites, new, first, gate, stats, unit, alpha, key, start, absolute in gated:
                     decided = stats["gate"]
                     for j, p in enumerate(new):
                         if gate["kind"] == "probe":
@@ -298,20 +315,26 @@ class SteeringWorkerExtension:
                     if unit is not None and alpha != 0 and steer:
                         stats["injections"].update(steer)
                         stats["applications"] += len(steer)
-                        groups.setdefault(key, (unit, alpha, []))[2].extend(
-                            int(query[row]) + pos - start for pos in steer
-                        )
+                        grp = groups.setdefault(key, (unit, alpha, [], absolute, []))
+                        grp[2].extend(int(query[row]) + pos - start for pos in steer)
+                        grp[4].extend((stats, pos) for pos in steer)
             self._reasoning_calls += 1
             if not groups:
                 return output
-            for unit, alpha, flat in groups.values():  # disjoint row sets
-                hidden, residual = edit_decoder_output(
-                    hidden,
-                    residual,
-                    torch.tensor(flat, device=hidden.device, dtype=torch.long),
-                    unit,
-                    alpha,
-                )
+            for unit, alpha, flat, absolute, recs in groups.values():  # disjoint row sets
+                idx = torch.tensor(flat, device=hidden.device, dtype=torch.long)
+                if absolute:
+                    # Per-site ||h|| of the pre-edit block output, for the logged ||S||/||h||.
+                    norms = (
+                        (hidden.index_select(0, idx) + residual.index_select(0, idx))
+                        .float()
+                        .norm(dim=-1)
+                        .cpu()
+                        .tolist()
+                    )
+                    for (st, pos), n in zip(recs, norms, strict=True):
+                        st.setdefault("hnorm", {})[pos] = n
+                hidden, residual = edit_decoder_output(hidden, residual, idx, unit, alpha, absolute)
             return hidden, residual
 
         self._reasoning_hook = model.model.layers[layer].register_forward_hook(hook)
@@ -375,6 +398,18 @@ class SteeringWorkerExtension:
                 raise ValueError(f"Direction {name!r} is not unit-norm")
             self._reasoning_units[name] = u
 
+    def register_steering_vectors(self: Any, vectors: dict[str, list[float]]) -> None:
+        """Named UNNORMALIZED vectors for absolute-scale per-request policies
+        (`extra_args["steer"]["abs"] = True`: h + alpha * v, SEAL)."""
+        if not getattr(self, "_reasoning_owner", False):
+            return
+        expected = self.get_model().config.hidden_size
+        for name, vec in vectors.items():
+            v = torch.tensor(vec, dtype=torch.float32, device=self.device)
+            if v.shape != (expected,) or not bool(torch.isfinite(v).all()):
+                raise ValueError(f"Invalid steering vector {name!r}")
+            self._reasoning_vectors[name] = v
+
     def register_gate_probe(self: Any, w: list[float], b: float) -> None:
         """Linear probe s = <h, w> + b on the raw pre-edit block output (probe-gated runs)."""
         if not getattr(self, "_reasoning_owner", False):
@@ -400,6 +435,8 @@ class SteeringWorkerExtension:
                 }
                 if "gate" in s:
                     out[aid]["gate"] = [[p, sc, int(f)] for p, (sc, f) in sorted(s["gate"].items())]
+                if "hnorm" in s:
+                    out[aid]["hnorm"] = [[p, n] for p, n in sorted(s["hnorm"].items())]
         return {"calls": self._reasoning_calls, "requests": out}
 
     def reasoning_steering_stats(self: Any) -> dict[str, Any] | None:

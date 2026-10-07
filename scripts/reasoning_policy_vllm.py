@@ -95,7 +95,8 @@ FIELDS = [
     "brevity", "seed", "correct", "has_answer", "status", "total_tokens",
     "think_tokens", "answer_tokens", "capped", "closed", "boundaries",
     "eligible_sites", "injections", "first_injection_g", "markers",
-    "doubt_blocks", "doubt_rate", "fired_sites", "unsteered_sites",
+    "doubt_blocks", "doubt_rate", "fired_sites", "unsteered_sites", "ban_sites",
+    "seal_ratio", "nonseal_sites",
 ]
 
 POLICY_RE = re.compile(
@@ -103,7 +104,16 @@ POLICY_RE = re.compile(
     r"(?:G(?P<gq>\d+)|R(?P<rp>0\.[0-9]+))?$"
 )
 GATE_WINDOW = 3  # EXPERIMENT-probe-gated.md §G4
+# Decode-time doubt-word bans (EXPERIMENT-reviewer-baselines.md §B2): `ban_all` forbids
+# V_ban at every generated token; `ban_para_d<K>` only at the first token of a paragraph
+# inside <think> whose boundary token has g >= K (N's site rule). See serving/vllm_ban.py.
+BAN_RE = re.compile(r"^ban_(?:(?P<all>all)|para_d(?P<delay>\d+))$")
 REPEAT_MINLEN = 8  # tokens; a paragraph shorter than this never counts toward the guard
+# SEAL (EXPERIMENT-reviewer-baselines.md §B4b): `SEAL` adds the UNNORMALIZED vector
+# (--dir SEAL=path, key "vector") as is, alpha 1.0, at every paragraph break inside <think>
+# from the first generated token. SEALu@a<alpha>d<delay> is S normalized on N's schedule.
+SEAL_POLICY = {"name": "SEAL", "direction": "SEAL", "alpha": 1.0, "delay": 0, "brevity": None,
+               "guard": 0, "gate": None, "abs": True}
 
 
 def parse_policy(spec: str) -> dict[str, Any]:
@@ -113,9 +123,16 @@ def parse_policy(spec: str) -> dict[str, Any]:
     results file can always be traced back to the exact policy that produced it
     without consulting the manifest.
     """
+    if spec == "SEAL":
+        return dict(SEAL_POLICY)
     if spec == "base":
         return {"name": spec, "direction": None, "alpha": 0.0, "delay": 0, "brevity": None,
                 "guard": 0, "gate": None}
+    if (b := BAN_RE.match(spec)):
+        return {"name": spec, "direction": None, "alpha": 0.0, "delay": 0, "brevity": None,
+                "guard": 0, "gate": None,
+                "ban": ({"mode": "all", "delay": 0} if b.group("all")
+                        else {"mode": "para", "delay": int(b.group("delay"))})}
     if spec.startswith("brevity"):
         key = spec.removeprefix("brevity")
         if key not in BREVITY:
@@ -213,6 +230,30 @@ def expected_gate(
     return fired, steered
 
 
+def ban_audit(
+    ids: list[int], ban: dict[str, Any], ban_set: set[int], boundary_set: set[int],
+    close_id: int,
+) -> int:
+    """Driver-side audit of a ban rollout (§B2), written from the output tokens alone.
+
+    Returns the number of positions where the ban was in force; raises if a banned token
+    was sampled at one of them. `all`: every generated token. `para`: the token after each
+    paragraph boundary inside <think> whose one-based index g = i + 1 >= delay.
+    """
+    if ban["mode"] == "all":
+        bad = [i for i, t in enumerate(ids) if t in ban_set]
+        if bad:
+            raise RuntimeError(f"ban_all audit: banned token at generated index {bad[:5]}")
+        return len(ids)
+    close = ids.index(close_id) if close_id in ids else len(ids)
+    sites = [i + 1 for i in range(len(ids) - 1)
+             if i < close and ids[i] in boundary_set and i + 1 >= ban["delay"]]
+    bad = [j for j in sites if ids[j] in ban_set]
+    if bad:
+        raise RuntimeError(f"ban_para audit: paragraph opens with a banned token at {bad[:5]}")
+    return len(sites)
+
+
 def build_random_directions(outdir: Path, d_model: int, seeds: tuple[int, ...]) -> None:
     """Isotropic unit directions with fixed seeds, written once and then hashed.
 
@@ -258,6 +299,8 @@ def main() -> None:
     ap.add_argument("--stream", action="store_true",
                     help="one engine queue for all seeds/policies (per-request steering); "
                          "--checkpoint-every then only sets the export/log cadence")
+    ap.add_argument("--ban-file", default="data/baselines/ban_tokens.json",
+                    help="V_ban + boundary ids for ban_* policies (baselines_ban_tokens.py)")
     args = ap.parse_args()
     for spec in args.dir:
         name, _, path = spec.partition("=")
@@ -311,12 +354,29 @@ def main() -> None:
             if p["gate"] and p["gate"]["kind"] == "probe":
                 p["gate"]["tau"] = float(probe["tau"][p["gate"]["q"]])
     used = sorted({p["direction"] for p in policies if p["direction"]})
+    banning = any(p.get("ban") for p in policies)
+    ban_set: set[int] = set()
+    if banning:
+        ban_blob = json.loads(Path(args.ban_file).read_text())
+        ban_set = {int(x["id"]) for x in ban_blob["ban"]}
+        if (ban_blob["boundary_ids"] != boundaries
+                or int(ban_blob["close_id"]) != close_id):
+            raise ValueError("Ban file boundary/close ids do not match this tokenizer")
+    absolute = {p["direction"] for p in policies if p.get("abs")}
+    if absolute and not args.stream:
+        raise ValueError("Absolute-scale (SEAL) policies need --stream")
     units = {
-        name: torch.load(DIRECTIONS[name], map_location="cpu", weights_only=False)["unit"]
+        name: torch.load(DIRECTIONS[name], map_location="cpu", weights_only=False)[
+            "vector" if name in absolute else "unit"
+        ]
         .float()
         .tolist()
         for name in used
     }
+    # SEAL's own split set: vocabulary tokens containing "\n\n" (official
+    # modeling_qwen2.py: "ĊĊ" in token). Ours (>= 2 newlines anywhere) is a superset.
+    seal_split = {i for t, i in tok.get_vocab().items() if "ĊĊ" in t}
+    seal_checked = False
 
     def prompt_ids(question: str, brevity: str | None) -> list[int]:
         """Canonical thinking template, with the shared format instruction.
@@ -367,6 +427,9 @@ def main() -> None:
         "stream": args.stream,
         **({"gate_probe": digest(args.gate_probe), "gate_window": GATE_WINDOW} if probe
            else {"gate_window": GATE_WINDOW} if any(p["gate"] for p in policies) else {}),
+        **({"ban_file": digest(Path(args.ban_file)),
+            "ban_code": digest(Path("src/reasoning_attention/serving/vllm_ban.py"))}
+           if banning else {}),
         "seed_scheme": "sha256(question_id:seed), identical across policies",
         "delay_scheme": "g = p - prompt_len + 1, one-based; prompt <think> not counted",
     }
@@ -407,10 +470,12 @@ def main() -> None:
     print(f"{len(rows)} questions x {len(policies)} policies x {args.seeds} seeds "
           f"= {total}; {len(done)} resumed; max context {max_len}", flush=True)
 
+    if banning:
+        from reasoning_attention.serving.vllm_ban import BAN_PROCESSOR
     llm = build_steering_llm(
         model_id, layer, boundaries, close_id, max_len,
         args.batch, args.gpu_memory_utilization, args.max_num_batched_tokens, args.pp,
-        args.tp,
+        args.tp, **({"logits_processors": [BAN_PROCESSOR]} if banning else {}),
     )
     started = time.monotonic()
     completed = 0
@@ -444,6 +509,28 @@ def main() -> None:
                                            g.get("p", 0.0), g.get("tau", 0.0))
         if actual["injections"] != (allowed if steering else []):
             raise RuntimeError(f"Injection mismatch for {row['question_id']}")
+        seal_ratio: float | str = ""
+        nonseal: int | str = ""
+        if policy.get("abs"):
+            nonlocal seal_checked
+            hn = actual.get("hnorm", [])
+            if [int(p) for p, _ in hn] != (sites if steering else []):
+                raise RuntimeError(f"SEAL norm record does not cover the sites for {row['question_id']}")
+            nonseal = sum(ids[p - prompt_len] not in seal_split for p in sites)
+            if not seal_checked:
+                # First SEAL rollout: the hook's sites are SEAL's "\n\n" tokens.
+                if not sites or nonseal:
+                    raise RuntimeError(f"SEAL first-rollout site check failed: {len(sites)} "
+                                       f"sites, {nonseal} outside SEAL's split set")
+                seal_checked = True
+            snorm = float(torch.tensor(unit).norm())
+            seal_ratio = (round(sum(snorm / n for _, n in hn) / len(hn), 5) if hn else -1.0)
+        ban_sites: int | str = ""
+        if policy.get("ban"):
+            try:
+                ban_sites = ban_audit(ids, policy["ban"], ban_set, boundary_set, close_id)
+            except RuntimeError as e:
+                raise RuntimeError(f"{row['question_id']} seed {seed} {name}: {e}") from e
         text = tok.decode(ids, skip_special_tokens=False)
         g = grade(text, row["gold"])
         markers, _, doubt_blocks = doubt_stats(text)
@@ -469,6 +556,8 @@ def main() -> None:
             "doubt_rate": round(doubt_blocks / n_bound, 4) if n_bound else -1.0,
             "fired_sites": len(fired) if policy["gate"] else "",
             "unsteered_sites": len(sites) - len(allowed) if policy["gate"] else "",
+            "ban_sites": ban_sites,
+            "seal_ratio": seal_ratio, "nonseal_sites": nonseal,
             "gate": actual.get("gate") if policy["gate"] else None,
             "text": text, "token_ids": ids,
             "prompt_tokens": prompt_len,
@@ -483,7 +572,10 @@ def main() -> None:
         records.append(record)
         done.add((row["question_id"], name, seed))
 
-    def params_for(row: dict[str, Any], seed: int, extra: dict[str, Any]) -> Any:
+    def params_for(row: dict[str, Any], seed: int, extra: dict[str, Any],
+                   policy: dict[str, Any]) -> Any:
+        if policy.get("ban"):
+            extra = {**extra, "ban": {"file": args.ban_file, **policy["ban"]}}
         return SamplingParams(
             temperature=sampling.temperature, top_p=sampling.top_p,
             top_k=sampling.top_k, max_tokens=args.max_new_tokens,
@@ -499,8 +591,12 @@ def main() -> None:
             # rollout is audited and journaled as soon as it finishes.
             llm.collective_rpc(
                 "register_steering_units",
-                args=({d: units[d] for d in {p["direction"] for p in policies if p["direction"]}},),
+                args=({d: units[d] for d in {p["direction"] for p in policies if p["direction"]}
+                       if d not in absolute},),
             )
+            if absolute:
+                llm.collective_rpc("register_steering_vectors",
+                                   args=({d: units[d] for d in absolute},))
             llm.collective_rpc("configure_reasoning_steering", args=(None, 0.0, True, 0, 0,
                                                                      REPEAT_MINLEN))
             if probe is not None:
@@ -517,7 +613,8 @@ def main() -> None:
                             continue
                         aid = f"{r['question_id']}|{name}|{seed}"
                         steer = {"dir": policy["direction"], "alpha": policy["alpha"],
-                                 "delay": policy["delay"], "guard": policy["guard"]}
+                                 "delay": policy["delay"], "guard": policy["guard"],
+                                 "abs": bool(policy.get("abs"))}
                         if policy["gate"]:
                             g = policy["gate"]
                             steer["gate"] = (
@@ -527,7 +624,7 @@ def main() -> None:
                                  "seed": request_seed(r["question_id"], seed)})
                         rid = engine.add_request(
                             aid, {"prompt_token_ids": prompts[(r["question_id"], name)]},
-                            params_for(r, seed, {"steering_audit_id": aid, "steer": steer}),
+                            params_for(r, seed, {"steering_audit_id": aid, "steer": steer}, policy),
                         )
                         # Outputs may carry the external id or vLLM's internal one.
                         pending[aid] = (r, policy, seed, aid)
@@ -578,7 +675,7 @@ def main() -> None:
                             {"prompt_token_ids": prompts[(r["question_id"], name)]}
                             for r in chunk
                         ]
-                        params = [params_for(r, seed, {"steering_audit_id": r["question_id"]})
+                        params = [params_for(r, seed, {"steering_audit_id": r["question_id"]}, policy)
                                   for r in chunk]
                         batch_start = time.monotonic()
                         outputs = llm.generate(inputs, params, use_tqdm=False)

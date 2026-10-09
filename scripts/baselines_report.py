@@ -81,6 +81,14 @@ SPECS: dict[tuple[str, str], dict[str, list]] = {
     ("235B", "hard128"): {
         a: [(f"{B}/c235_s*", a, None)] for a in ("base", "NU67@a1.5d256")},
 }
+# Amendment E: E1 (SEALu at SEAL-like strength, 1.7B) and E2 (dev-tuned SEAL strength)
+E1_ARMS = ("SEALu@a0.25d256", "SEALu@a0.34d256", "SEALu@a0.5d256")
+E2SEL = {"1.7B": du("e2_17"), "8B": du("e2_8")}
+for _tag, _set in (("confirm", "confirm400"), ("gate", "gate400")):
+    SPECS[("1.7B", _set)].update({a: [(f"{B}/e1_{_tag}_s*", a, None)] for a in E1_ARMS})
+    for _m, _d in (("1.7B", "17"), ("8B", "8")):
+        if E2SEL[_m] and E2SEL[_m] != "SEAL@a1.0":
+            SPECS[(_m, _set)][E2SEL[_m]] = [(f"{B}/e2_{_d}_{_tag}_s*", E2SEL[_m], None)]
 N_ARM = {"1.7B": N17, "8B": N8, "30B": N30, "235B": "NU67@a1.5d256"}
 
 
@@ -452,6 +460,36 @@ def main() -> None:
                                           if elig else None)
             D[f"{ms[0]} {ms[1]} {X}"] = ent
     rep["readings"]["D"] = D
+    # Amendment E (E3)
+    E: dict = {"E1": {}, "E2": {}, "selected": E2SEL}
+    for sset in ("confirm400", "gate400"):
+        r = S.get(("1.7B", sset), {})
+        if "SEALu@a0.5d256" in r and "N@a0.5d256" in r:
+            nb = beats(r["N@a0.5d256"], r["SEALu@a0.5d256"])
+            dm = diff(r["SEALu@a0.5d256"], r["N@a0.5d256"])
+            match = (-3 <= dm["saving_ci"][0] and dm["saving_ci"][1] <= 3 and dm["dacc_ci"][0] >= -2)
+            E["E1"][sset] = {"N_beats_SEALu": nb, "SEALu_matches_N": match,
+                             "curve": {a: {k: strip(r[a])[k] for k in ("dacc", "dacc_ci", "saving",
+                                                                       "saving_ci", "capped")}
+                                       for a in (*E1_ARMS, "N@a0.5d256", N17) if a in r}}
+        for model in ("1.7B", "8B"):
+            sel = E2SEL[model]
+            rr = S.get((model, sset), {})
+            X = "SEAL" if sel == "SEAL@a1.0" else sel
+            if not sel or X not in rr:
+                E["E2"][f"{model} {sset}"] = {"tuned": sel or "NONE (no dev-eligible alpha)"}
+                continue
+            ns = [a for a in (N17, "N@a0.5d256") if a in rr] if model == "1.7B" else [N8]
+            ent = {"tuned": sel,
+                   "N_beats_tuned": any(beats(rr[n], rr[X])["beats"] for n in ns),
+                   "tuned_beats_N": any(beats(rr[X], rr[n])["beats"] for n in ns),
+                   "N_minus_tuned": {n: beats(rr[n], rr[X]) for n in ns}}
+            pipe = rep["sets"][f"{model} {sset}"]["pipeline"]
+            cov0 = pipe["base"]["coverage"]
+            elig = {a: pipe[a] for a in [*ns, X] if abs(pipe[a]["coverage"] - cov0) <= 1}
+            ent["tiebreak_winner"] = min(elig, key=lambda a: elig[a]["tok_per_accepted"]) if elig else None
+            E["E2"][f"{model} {sset}"] = ent
+    rep["readings"]["E"] = E
 
     md += ["## Readings (§B8)", "", "### Part A — N vs the matched ban (B2)", ""]
     if reach:
@@ -497,6 +535,31 @@ def main() -> None:
         md.append(f"- **{k}**: " + "; ".join(parts) + f" → N beats: {v['N_beats_X']}, X beats N: "
                   f"{v['X_beats_N']}" + (f"; tiebreak winner {v['tiebreak_winner']}"
                                          if "tiebreak_winner" in v else ""))
+    md += ["", "### Amendment E — SEAL fairness fix", "",
+           "`SEALu@a1.0d256` (§B4b) is mis-specified (≈3× SEAL's strength) and is not used in any "
+           "claim. E1 'match' uses §B8's matches rule (saving difference CI within ±3 points, "
+           "non-inferior at −2pp).", "",
+           f"E2 dev selection: 1.7B {E2SEL['1.7B']}, 8B {E2SEL['8B']}.", ""]
+    for sset, v in E["E1"].items():
+        x = v["N_beats_SEALu"]
+        md.append(f"- **E1 1.7B {sset}** N@a0.5 − SEALu@a0.5: Δsaving {x['saving']:+.1f} "
+                  f"[{x['saving_ci'][0]:+.1f}, {x['saving_ci'][1]:+.1f}], Δacc {x['dacc']:+.2f} "
+                  f"[{x['dacc_ci'][0]:+.2f}, {x['dacc_ci'][1]:+.2f}] → N beats: {x['beats']}; "
+                  f"SEALu matches N: {v['SEALu_matches_N']}")
+        for a, c in v["curve"].items():
+            md.append(f"  - {a}: Δacc {c['dacc']:+.2f} [{c['dacc_ci'][0]:+.2f}, {c['dacc_ci'][1]:+.2f}], "
+                      f"saving {c['saving']:.1f}% [{c['saving_ci'][0]:.1f}, {c['saving_ci'][1]:.1f}], "
+                      f"capped {c['capped']:.2f}%")
+    for k, v in E["E2"].items():
+        if "N_minus_tuned" not in v:
+            md.append(f"- **E2 {k}**: tuned SEAL = {v['tuned']}")
+            continue
+        parts = [f"{n}: Δsaving {x['saving']:+.1f} [{x['saving_ci'][0]:+.1f}, {x['saving_ci'][1]:+.1f}], "
+                 f"Δacc {x['dacc']:+.2f} [{x['dacc_ci'][0]:+.2f}, {x['dacc_ci'][1]:+.2f}]"
+                 for n, x in v["N_minus_tuned"].items()]
+        md.append(f"- **E2 {k}** (tuned {v['tuned']}): " + "; ".join(parts) +
+                  f" → N beats: {v['N_beats_tuned']}, tuned beats N: {v['tuned_beats_N']}; "
+                  f"tiebreak winner {v['tiebreak_winner']}")
     (ROOT / B / "report.json").write_text(json.dumps(rep, indent=2, default=float) + "\n")
     (ROOT / B / "report.md").write_text("\n".join(md) + "\n")
     print("\n".join(md))

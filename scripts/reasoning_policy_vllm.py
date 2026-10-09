@@ -125,6 +125,9 @@ def parse_policy(spec: str) -> dict[str, Any]:
     """
     if spec == "SEAL":
         return dict(SEAL_POLICY)
+    if (sm := re.match(r"^SEAL@a(?P<alpha>[0-9.]+)$", spec)):
+        # Amendment E2: SEAL's absolute push at strength alpha; SEAL@a1.0 == SEAL.
+        return {**SEAL_POLICY, "name": spec, "alpha": float(sm.group("alpha"))}
     if spec == "base":
         return {"name": spec, "direction": None, "alpha": 0.0, "delay": 0, "brevity": None,
                 "guard": 0, "gate": None}

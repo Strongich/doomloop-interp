@@ -257,3 +257,10 @@ kubeconfig.yaml
 
 # Cluster pod spec: node names, PVC, ssh key — kept local.
 pod.yaml
+
+# Paper LaTeX project stays local; only the scripts that rebuild its tables are shared.
+/paper/*
+!/paper/scripts/
+/paper/scripts/__pycache__/
+/*.bbl
+/*.blg

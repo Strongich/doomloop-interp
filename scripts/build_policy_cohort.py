@@ -36,6 +36,7 @@ evaluation set and its use is disclosed.
     uv run python scripts/build_policy_cohort.py
     uv run python scripts/build_policy_cohort.py --fresh 300 --seed 20260922
     uv run python scripts/build_policy_cohort.py --math500
+    uv run python scripts/build_policy_cohort.py --full-test
 """
 
 from __future__ import annotations
@@ -122,6 +123,35 @@ def fresh(out: Path, n: int, seed: int) -> None:
     print(f"  drawn from {len(eligible)} selection-free test ids with seed {seed}")
 
 
+def full_test(out: Path) -> None:
+    """All 1,319 official GSM8K test questions, each tagged with its D62 group:
+    `fresh997` (the Finding 12 set) or `touched322` (selected by earlier work)."""
+    import sys
+
+    sys.path.insert(0, "src")
+    from reasoning_attention.data.math_datasets import load_one
+
+    eligible = set(json.loads(Path("data/exposure_audit.json").read_text())["eligible_test"])
+    ds = load_one("gsm8k")
+    rows = [
+        {
+            "question_id": f"gsm8k:{i}",
+            "dataset": "gsm8k",
+            "question": ds[i]["question"],
+            "gold": str(ds[i]["answer"]),
+            "split": "test",
+            "group": "fresh997" if i in eligible else "touched322",
+        }
+        for i in range(len(ds))
+        if ds[i]["split"] == "test"
+    ]
+    groups = collections.Counter(r["group"] for r in rows)
+    if len(rows) != 1319 or groups != {"fresh997": 997, "touched322": 322}:
+        raise ValueError(f"expected 1,319 test rows split 997/322, got {len(rows)} {groups}")
+    write(out / "gsm8k_test_1319.jsonl", rows)
+    print(f"  groups: {dict(groups)}")
+
+
 def math500(out: Path, seed: int, per_level: int = 10) -> None:
     from datasets import load_dataset
 
@@ -159,8 +189,12 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=20260922)
     ap.add_argument("--fresh", type=int, default=0, help="draw the confirmatory cohort instead")
     ap.add_argument("--math500", action="store_true", help="write the MATH-500 evaluation set")
+    ap.add_argument("--full-test", action="store_true",
+                    help="write all 1,319 GSM8K test questions, tagged fresh997/touched322")
     args = ap.parse_args()
-    if args.math500:
+    if args.full_test:
+        full_test(args.out)
+    elif args.math500:
         math500(args.out, args.seed)
     elif args.fresh:
         fresh(args.out, args.fresh, args.seed)

@@ -2,10 +2,13 @@
 # Usage:
 #   make format   # auto-fix import order, dead code, and style
 #   make lint     # type-check + verify formatting/style (no writes)
+#   make repro-help  # targets that rebuild the paper results (reproduce.mk)
 #
 # All tools run through `uv run` so they use the project's .venv.
 
 LINT_DIRS := src
+
+include reproduce.mk
 
 # --- Kubernetes dev pod (namespace vitenko-thesis, PVC doomloops-interp) ---
 NAMESPACE  := vitenko-thesis

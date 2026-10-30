@@ -83,7 +83,7 @@ src/reasoning_attention/
   datagen/            # datasets: extract -> split -> explain -> build (+ merge for RL)
     extract.py        #   stage 0: Ultra-FineWeb (streaming) -> raw h_l parquet
     split.py          #   stage 1: document-level 50/50 -> disjoint AV/AR halves
-    explain.py        #   stage 2: gpt-5.6-luna writes each row's summary
+    explain.py        #   stage 2: the explainer LLM writes each row's summary
     build.py          #   stage 3: AV/AR training parquets
     providers.py      #   OpenAIProvider (Responses API, reasoning effort)
     prompts.py        #   explainer instruction prompt (verbatim from the ref repo)
@@ -139,9 +139,11 @@ These were deliberate and are recorded with rationale in `implementation-notes.m
   repo, even though the blog writes `A@x + b`. It's a knob, not an accident.
 - **Eval datasets carry a single USER turn** — the gold answer is kept in the
   `answer` column and never appended as an assistant turn.
-- **Explanations come from `gpt-5.6-luna` at `reasoning_effort="high"`**, not a
-  local model. Key in `.env` (gitignored). Reasoning models reject
-  `temperature`/`top_p` — don't add them back.
+- **Warm-start summaries were written by a local `Qwen/Qwen3.8-27B`** served with
+  vLLM in non-thinking mode (D28), using the reference repo's labelling prompt.
+  `explain.py` also supports the hosted `gpt-5.6-luna` path (Responses API, key in
+  `.env`, gitignored); that path was not used for the training data. Hosted
+  reasoning models reject `temperature`/`top_p` — don't add them back.
 - **Warm-start corpus** is `openbmb/Ultra-FineWeb`, config `default`, split `en`,
   text in the **`content`** column. **Always stream it**: a non-streaming
   `load_dataset` pulls the whole ~1 TB split before yielding document 1.

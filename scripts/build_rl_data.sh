@@ -5,9 +5,9 @@
 #   N_DOCS=200 scripts/build_rl_data.sh            # quick shakeout
 #   DATA_DIR=/mnt/data/rl scripts/build_rl_data.sh
 #
-# 40k documents x 5 random positions = 200k activations per source, 400k total —
-# a quarter of the paper's 500k-per-source, deliberately, since this run is
-# smaller. No API spend: RL needs no summaries, because the AV generates the
+# 40k documents x 5 random positions = 200k activations per source, 400k total.
+# The reference Qwen2.5-7B run used 500k web positions (one source), so this set
+# is about 80% of its size. No API spend: RL needs no summaries, because the AV generates the
 # explanation during rollout and the AR scores it.
 #
 # The web slice starts at document 100000 so RL activations come from documents

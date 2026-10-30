@@ -46,7 +46,8 @@ uv sync --group dev        # + ruff / mypy
   [`kitft/natural_language_autoencoders`](https://github.com/kitft/natural_language_autoencoders)
   at the repo root. Never install SGLang into the main venv: it replaces torch with a build
   that breaks vLLM.
-- **LLM judge steps** (`trace-audit`, `transfer-reading`): put `OPENAI_API_KEY` in `.env`.
+- **Credentials:** `cp .env.example .env`, then fill in `HF_TOKEN`, and `OPENAI_API_KEY`
+  for the LLM judge steps (`trace-audit`, `transfer-reading`).
 
 ## Reproducing the paper
 

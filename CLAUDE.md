@@ -1,222 +1,243 @@
-# reasoning-attention — instructions for Claude / AI assistants
+# doomloop-interp — instructions for Claude / AI assistants
 
-## What this project is investigating
+## What this project is
 
-**Research question: what actually happens inside a reasoning model once it hits
-the "doom loop" tokens in its own chain of thought?**
+This repo holds the code for the paper **VERS: Steering Reasoning Models by Editing Their
+Activation Explanations** (Ihor Vitenko). The paper sources live in `paper/`, which is kept
+local and is not in git.
 
-Small reasoning models (here `Qwen/Qwen3-1.7B` in thinking mode) frequently
-derail mid-`<think>` into self-doubt boilerplate — *"Wait, let me verify"*,
-*"But wait, that's not right"*, *"Hmm, let me reconsider"* — and then loop,
-sometimes verbatim, until the token budget runs out. The interesting object is
-not the text but the **residual stream at those positions**: what representation
-is the model actually carrying when it emits "Wait, let me verify", and how does
-it change as the loop tightens?
+The project started as an interpretability study. The question was what a reasoning model
+(`Qwen/Qwen3-1.7B`, thinking mode) carries in its residual stream when its chain of thought
+falls into self-doubt ("Wait, let me verify", "Hmm") and loops. To read those states, we
+trained a **Natural Language Autoencoder (NLA)** on the model. The study then became a
+steering method:
 
-The plan is to make those activations *readable* by training a **Natural
-Language Autoencoder (NLA)** on the target model, then verbalizing `h_l` at
-self-doubt token positions along real reasoning traces (math problems from
-GSM8K / AIME2025 / AMC23).
+1. **Verbalize.** The AV writes a text explanation of the layer-20 state at each doubt
+   paragraph break of one correct trace (35 donor sites).
+2. **Edit.** The explanation is edited to remove the doubt.
+3. **Reconstruct.** The AR turns the original and the edited text back into states.
+4. **Steer.** The mean of the AR differences, normalized, is the direction **N**.
 
-**The contrast is recovered-vs-failed, NOT doubt-phrase-vs-healthy-phrase.**
-Measured on 5 traces (D33): self-doubt markers are ordinary reasoning behaviour
-at every difficulty — even a 260-token GSM8K trace that answers correctly carries
-3 of them, at a *higher* density (11.5/1k tokens) than the AIME trace that
-derailed (6.3/1k). Phrase-matching would therefore file the same `Hmm` under both
-labels. So the case study reads `h_l` at the same marker phrases in traces that
-**reach a correct `\boxed{}` answer** versus traces that **produce no answer at
-all** (budget exhausted inside `<think>`), and asks the NLA what differs.
+At generation time we add `α·‖h‖·N` to the layer-20 output at every paragraph break inside
+`<think>`, starting after a delay of 256 generated tokens.
 
-So the pipeline has two halves, and they are at very different maturity:
-1. **NLA machinery** (the instrument) — mostly scaffolded, not yet trained.
-2. **The doom-loop study** (the actual experiment) — not started; only the
-   detectors in `metrics.py` and the eval datasets exist so far.
+Main results (all in the paper):
+
+- **Qwen3-1.7B.** On the full GSM8K test, VERS saves 45.8% of tokens at −0.82 pp. On
+  MATH-500, it saves 31.3% at −3.05 pp.
+- **Comparators.** At half strength, the trade-off lies between those of SEAL and DEER.
+- **Transfer.** With fitted affine maps and a strength tuned per model, N transfers to
+  Qwen3-8B, 30B-A3B and 235B-A22B and saves 30–35% there.
+- **Limits.**
+  - On competition problems (hard128), VERS loses 3–7 pp at every size.
+  - A fixed direction does not separate needed checks from unneeded ones.
+  - Neither the redundant-only direction nor probe-gated steering fixed that.
+  - Reversing N (−N) adds doubt. The doubt-edit direction P does not add doubt.
+- **Students.**
+  - Fine-tuning on steered traces (Steered-SFT) teaches the shorter style without the hook,
+    but it loses accuracy on hard questions.
+  - DPO students keep accuracy but save less.
 
 ## Where the method comes from
 
-**All training ideas are taken from
-<https://transformer-circuits.pub/2026/nla/index.html>** ("Natural Language
-Autoencoders"). Do not invent a different training scheme — when a design
-question comes up, the paper (and the reference repo below) is the authority.
+The NLA training follows **<https://transformer-circuits.pub/2026/nla/index.html>**
+("Natural Language Autoencoders"). Do not invent a different training scheme. For design
+questions, that paper and its reference repo are the authority.
 
-The paper's method, in the terminology this codebase uses:
+- **AV, Activation Verbalizer** (the paper's *actor*). A copy of the target model. Its fixed
+  prompt contains one placeholder token, and the **embedding of that token is overwritten**
+  by the layer-`l` activation. It writes an explanation inside `<explanation>` tags.
+- **AR, Activation Reconstructor** (the paper's *critic*). The same model **cut to its first
+  `l+1` blocks**, with the final norm and `lm_head` removed, plus a learned affine map. It
+  reads an explanation and predicts `h_l` at the final token.
+- **Stage 1, SFT warm start.**
+  - The data is 100k Ultra-FineWeb documents × 5 positions, about 500k pairs.
+  - The pairs are **split by document** into disjoint AV and AR halves.
+  - A local Qwen3.8-27B wrote the summaries.
+- **Stage 2, joint RL.**
+  - The AR trains on MSE between normalized vectors.
+  - The AV trains with GRPO. Its reward is `-log‖h_l - AR(z)‖²`, with a KL penalty toward
+    the warm-start AV.
+  - One epoch is 6,147 steps on 2× A100.
 
-- **AV — Activation Verbalizer** (the paper's *actor*): a copy of the target
-  model. Fixed prompt containing one placeholder token whose **embedding is
-  overwritten** by the layer-`l` activation; it emits a natural-language
-  explanation inside `<explanation>` tags.
-- **AR — Activation Reconstructor** (the paper's *critic*): the same model
-  **truncated to its first `l+1` blocks**, final norm and `lm_head` stripped,
-  plus a learned affine map. It reads the explanation and predicts `h_l` at the
-  final token.
-- **Stage 1 — SFT warm-start** on a text-summarization proxy task: extract
-  `h_l` from truncated snippets, have a strong model write the summary, then SFT
-  the AV on (activation → summary) and the AR on (summary → activation). Paper
-  reports ~0.3–0.4 FVE at this point. Our recipe (implemented in `datagen/`):
-  100k Ultra-FineWeb documents × 5 random positions ≈ 500k pairs, **split evenly
-  by document** into disjoint halves — `D_AV` ≈ 250k, `D_AR` ≈ 250k. A pair is
-  never seen by both models.
-- **Stage 2 — joint RL**: AR trains by **MSE** against the true `h_l`; AV trains
-  by **GRPO** with reconstruction as the reward, `r = -log‖h_l - AR(z)‖²`, plus a
-  **KL penalty toward the AV init** to keep it fluent. Sampling at `T=1`. Paper
-  reaches 0.6–0.8 FVE.
+`natural_language_autoencoders/` is a clone of the reference implementation
+(`kitft/natural_language_autoencoders`). It is not in git. **Treat it as read-only.** Its
+own `CLAUDE.md` applies to that tree only. Our code lives in `src/reasoning_attention/`.
 
-`natural_language_autoencoders/` is Anthropic's **reference implementation**,
-cloned into the repo for guidance. **Treat it as read-only reference** — our code
-lives in `src/reasoning_attention/`. It has its own `CLAUDE.md` describing *its*
-invariants; those apply to that tree, not automatically to ours (it is
-FSDP/Megatron/SGLang multi-GPU; we are single-GPU transformers).
+## Names used everywhere
+
+- **Directions** (unit vectors, `{"unit": float32[d], ...}`):
+  - `N` = `data/pool/dir_A_1trace.pt`, the deployed VERS direction. Its sha256 is
+    `6efc8476…ad44`, locked in the protocol manifests.
+  - `D` = `data/dom/dir_D_diffmeans.pt`, the difference of means between doubt and plain
+    boundaries.
+  - `P` = `data/vers/dir_P_doubt.pt`, the doubt-edit direction.
+  - `negN` = `data/vers/dir_negN.pt`, which is exactly −N.
+  - `R101/R202/R303` are random controls.
+  - Mapped target directions are `NU<layer>`, `RU`, `DU`, `D8`, … in `data/xfer*/dirs*/`.
+- **Policy names** (`reasoning_policy_vllm.py --policies`):
+  - `N@a1.0d256` means direction N, α 1.0, delay 256.
+  - A `g3` suffix adds the loop guard.
+  - `base` means no steering. `brevityA` is the concision prompt.
+  - `ban_all` and `ban_para_d256` are the doubt-word bans. `SEAL` is the SEAL baseline.
+- **Cohorts:**
+  - dev200 and dev400: policy selection and α tuning. dev400 includes 86 GSM8K test
+    questions.
+  - gsm997: GSM8K test questions that no selection touched.
+  - gsm1319: the full GSM8K test, made of gsm997 plus touched322.
+  - MATH-500, confirm400 (MATH test), hard128 (AIME/AMC/HMMT).
+  - gate400 and sel400 (MATH L4–5), fresh1000.
+  - `paper/FACTS.md` has the full registry.
+- **Statistics:**
+  - Question-clustered bootstrap.
+  - Non-inferiority rule: the lower CI end of Δaccuracy must be ≥ −2 pp.
+  - Tokens saved = −(steered tokens / base tokens − 1).
+  - Doubt is counted by `doubt_blocks`: the 13 markers in the first sentence of a paragraph.
 
 ## Layout
 
 ```
 src/reasoning_attention/
   config.py           # ModelConfig / NLAConfig / DataGenConfig / VLLMConfig / SamplingDefaults
-  metrics.py          # doom-loop + repetition detectors (the study's entry point)
-  model/
-    download.py       #   snapshot download via the `hf` CLI
-    loader.py         #   plain-transformers init + thinking-mode prompts
+  grading.py          # correct / wrong / no answer; gold canonicalization (D69)
+  loops.py            # loop-onset detector (ported from Antidoom)
+  metrics.py          # n-gram repetition
+  tokenview.py        # per-token layer-20 states of one trace (token explorer)
+  model/              # download (hf CLI), loader (transformers + thinking prompts)
   serving/
     vllm_server.py    #   build_llm(): throughput-tuned vLLM engine
-  data/
-    math_datasets.py  #   gsm8k / aime2025 / amc23, one unified schema
-  datagen/            # datasets: extract -> split -> explain -> build (+ merge for RL)
-    extract.py        #   stage 0: Ultra-FineWeb (streaming) -> raw h_l parquet
-    split.py          #   stage 1: document-level 50/50 -> disjoint AV/AR halves
-    explain.py        #   stage 2: the explainer LLM writes each row's summary
-    build.py          #   stage 3: AV/AR training parquets
-    providers.py      #   OpenAIProvider (Responses API, reasoning effort)
-    prompts.py        #   explainer instruction prompt (verbatim from the ref repo)
-    merge.py          #   concat + shuffle the two RL corpora
-    sidecar.py        #   the datagen <-> training metadata contract
-  training/            # stage-1 SFT warm-start
-    data.py           #   AV/AR parquet datasets + collators (normalization lives here)
-    sft.py            #   the loop: AV cross-entropy, AR MSE + FVE
-  nla/
-    arch.py           #   truncate_config_layers / strip_lm_head / strip_final_norm
-    injection.py      #   inject_at_placeholder + normalize_activation
-    prompts.py        #   AV_TEMPLATE / AR_TEMPLATE (verbatim from the reference repo)
-    model.py          #   NLA (AV + AR), ARModel, NLA.verbalize()
-scripts/              # smoke tests + the forward-pass tracer (NOT linted, NOT type-checked)
-  smoke_gpt_endpoint.py          #   verifies the explainer endpoint end to end
-  dump_explanations.py           #   writes the labeler's output to jsonl/md/stats
-  train_sft.sh                   #   launcher for the AV/AR warm-start
-  build_rl_data.sh               #   200k web + 200k chat RL prompt set
-  setup_rl_stack.sh              #   Miles + patched SGLang into .venv-rl (NOT the main venv)
-  train_grpo.sh                  #   stage-2 GRPO, 2xA100
-natural_language_autoencoders/   # reference implementation — read-only
-implementation-notes.md          # running decision log (D1…D22) — APPEND to this
+    vllm_steering.py  #   the steering hook: norm-relative add at the decoder output, TP/PP/MoE
+    vllm_ban.py       #   decode-time doubt-word ban (V1 logits processor)
+  data/math_datasets.py  # gsm8k / aime2025 / amc23 / math, one schema
+  datagen/            # extract -> split -> explain -> build (+ merge for RL)
+  training/           # stage-1 SFT: AV cross-entropy, AR MSE + FVE
+  nla/                # arch (truncation), injection, prompts (verbatim), model, sidecar_export
+scripts/              # one script per experiment step, queues, reports (not linted)
+  reasoning_policy_vllm.py   # every steered / baseline rollout goes through this
+  gpu_queue.py               # job queue for multi-GPU pods; *_queue*.py write its jobs
+  xfer_* / sel_* / gate_* / distill* / baselines_* / vers_*   # one family per experiment
+paper/scripts/        # rebuild paper tables and figures from saved results (in git)
+reproduce.mk          # `make <target>` for every paper result; `make repro-help`
+EXPERIMENT-*.md       # locked protocols + execution logs, one per experiment
+implementation-notes.md   # decision log D1…D82 — APPEND to it
+FINDINGS.md, CLAIMS.md    # research findings and the paper's claims
+data/, checkpoints/   # not in git (GBs); rebuilt by the pipeline
 ```
 
-## Locked-in decisions (don't silently change these)
+## Locked-in decisions (do not change these silently)
 
-These were deliberate and are recorded with rationale in `implementation-notes.md`:
+Each one has its reason in `implementation-notes.md`.
 
-- **Target model** `Qwen/Qwen3-1.7B`, 28 layers, `d_model=2048`, thinking mode on.
-- **Activation = residual stream at the output of decoder layer `l=20`**
-  (0-indexed, ~71% depth), read at the **final token**. Not post-LayerNorm, not
-  an attention/MLP sub-output.
-- **HF indexing**: `hidden_states` has length `num_layers+1`; index 0 is the
-  embedding. So layer-`l` residual == `hidden_states[l+1]` == `hidden_states[21]`.
-  Use `NLAConfig.hidden_states_index` / `ar_num_layers` instead of open-coding
-  the ±1.
-- **No vocabulary change.** The placeholder is an existing token the text-only
-  model never emits — `<|image_pad|>` (id **151655**) — because embedding-level
-  injection makes the token's lexical identity irrelevant. Never resize the
-  embedding matrix for this.
-- **Injection scale** = **1000** by default. The reference's rule is empirical,
-  not a function of `d_model`: *"picked as a round number a bit above the mean
-  norm of the dataset's vectors"* (`docs/inference.md`). Their own values follow
-  only that — 150 for Qwen2.5-7B (mean ~125), 80000 for Gemma-3-12B (its scaled
-  embedding inflates norms ~500x), 30 for Llama-3.3-70B (below `sqrt(8192)`).
-  Our `h_l` norms are 782-1004, mean ~900. `sqrt_d_model` (≈45.3) is the repo's
-  *fallback* default, not its recipe, and would inject ~20x below distribution.
-- **AR truncation happens in the config, before `from_pretrained`** — set
-  `num_hidden_layers` and slice the per-layer arrays (`layer_types`, …). Never
-  slice the `nn.ModuleList` post-hoc. The transformers "unexpected weights"
-  report for blocks 21–27 is the *expected* confirmation it worked.
-- **AR affine map is bias-free** (`ar_affine_bias=False`) to match the reference
-  repo, even though the blog writes `A@x + b`. It's a knob, not an accident.
-- **Eval datasets carry a single USER turn** — the gold answer is kept in the
-  `answer` column and never appended as an assistant turn.
-- **Warm-start summaries were written by a local `Qwen/Qwen3.8-27B`** served with
-  vLLM in non-thinking mode (D28), using the reference repo's labelling prompt.
-  `explain.py` also supports the hosted `gpt-5.6-luna` path (Responses API, key in
-  `.env`, gitignored); that path was not used for the training data. Hosted
-  reasoning models reject `temperature`/`top_p` — don't add them back.
-- **Warm-start corpus** is `openbmb/Ultra-FineWeb`, config `default`, split `en`,
-  text in the **`content`** column. **Always stream it**: a non-streaming
-  `load_dataset` pulls the whole ~1 TB split before yielding document 1.
-- **Datagen never normalizes.** Vectors are stored raw with `norm="none"` in the
-  sidecar; scaling happens at injection and loss time.
-- **The AV/AR split is by document, never by row.** 5 positions from one document
-  share a prefix, so a row-level split leaks context across the halves and they
-  stop being disjoint.
-- **The AR's MSE normalizes BOTH prediction and target** to the injection scale —
-  it is a direction-only loss, matching the reference's `mse_scale`. Comparing a
-  free-magnitude prediction against a fixed-norm target measures the wrong thing.
-- **AR prompts tokenize with `add_special_tokens=True`** to match the extractor
-  that produced the gold activations; **AV prompts go through the chat template**
-  so training matches `NLA.verbalize()` at inference.
-- **FVE uses a fixed dataset-level denominator** (`data.baseline_variance`), never
-  a per-batch variance — otherwise the metric is not comparable across steps.
-- **Full fine-tuning is the training default**, matching the reference (their
-  actor SFT is the full 28-layer model under FSDP). It needs ~21 GB of optimizer
-  state: fine on the A100-80GB training box, impossible on the 16 GB local card,
-  where `--lora` is the fallback. Prefer full FT for the AR especially — it is the
-  Stage-2 reward model, and a rank-limited reward model is one the AV can game.
-  The AR's affine map is always trained in full, in fp32.
-- **Python is pinned to 3.11** (`.python-version`, `uv.lock`, mypy,
-  `requires-python`). Keep all four in sync.
-- **torch is intentionally unpinned** — vLLM drives it, because the box is a
-  Blackwell RTX 5070 Ti (sm_120) needing cu12.8+ wheels.
+**NLA**
 
-## Known state / caveats
+- **Target model:** `Qwen/Qwen3-1.7B`, 28 layers, `d_model=2048`, thinking mode on.
+- **Activation:** the residual stream at the output of decoder layer `l=20` (0-indexed,
+  about 71% depth), read at the final token. It is not post-LayerNorm, and it is not an
+  attention or MLP sub-output.
+- **HF indexing:** layer-`l` residual == `hidden_states[l+1]` == `hidden_states[21]`. Use
+  `NLAConfig.hidden_states_index` / `ar_num_layers`. Do not write the ±1 by hand.
+- **No vocabulary change.**
+  - The placeholder is `<|image_pad|>` (id **151655**), a token the text model never emits.
+  - Never resize the embedding matrix.
+- **Injection scale = 1000.**
+  - The reference picks "a round number a bit above the mean norm". Our `h_l` norms are
+    782–1004.
+  - `sqrt_d_model` (≈45) is only the reference's fallback default.
+  - This scale is separate from the steering strength α.
+- **AR truncation happens in the config, before `from_pretrained`.**
+  - Never slice the `nn.ModuleList` afterwards.
+  - The "unexpected weights" report for blocks 21–27 is the expected sign that it worked.
+- **AR affine map is bias-free** (`ar_affine_bias=False`), as in the reference.
+- **Datagen never normalizes.** Vectors are stored raw (`norm="none"`).
+- **The AV/AR split is by document, never by row.**
+- **The AR's MSE normalizes both prediction and target** (a direction-only loss).
+- **AR prompts use `add_special_tokens=True`; AV prompts go through the chat template.**
+- **FVE uses a fixed dataset-level denominator.** The paper reports `fve_nrm`: states and
+  reconstructions are scaled to unit length, but the mean is not.
+- **Full fine-tuning is the default** (A100). `--lora` is only for the 16 GB local card.
+- **Warm-start corpus:** `openbmb/Ultra-FineWeb` (`default`, split `en`, column `content`).
+  **Always stream it.**
 
-- **The AV is untrained.** `NLA.verbalize()` produces well-formed
-  `<explanation>` output that echoes the prompt framing rather than decoding the
-  vector. The *mechanism* is verified end-to-end; quality needs the SFT
-  warm-start. Don't report untrained verbalizations as findings.
-- **Datagen and the Stage-1 SFT loops exist and run; Stage-2 RL does not.** No
-  GRPO loop yet. The SFT loops are verified mechanically on a 6-row smoke set,
-  *not* trained to convergence — no checkpoint here is worth drawing conclusions
-  from.
-- **SFT hyperparameters now come from their Qwen2.5-7B case study** (D19): LR
-  2e-5 -> 2e-6 cosine, warmup 5%, identity-init AR affine, save every 500 steps.
-  Batch size is ours. `injection_scale` was deliberately NOT copied and wants a
-  sweep — theirs is 150 at d_model 3584, which is an absolute value (~2.5x
-  sqrt(d)), not a ratio.
-- **Never install SGLang into the project venv** (D21). It downgrades torch to a
-  cu12 build with no sm_120 kernels, killing Blackwell support locally, and breaks
-  vLLM. The RL stack lives in `.venv-rl` via `scripts/setup_rl_stack.sh`.
-- `datagen.extract` prints a `PyGILState_Release` fatal-error trace at
-  interpreter shutdown, *after* the parquet and sidecar are written. The output
-  is intact — it's the streaming dataset's aiohttp threads at teardown, not the
-  extraction path. Don't chase it as data corruption.
-- **Correctness check worth preserving**: the AR's raw layer-`l` residual is
-  bit-identical (max abs diff 0.0) to the full AV model's `hidden_states[21]` on
-  the same input. If a refactor breaks that equality, the refactor is wrong.
-- The reference repo's loudest smoke test carries over conceptually: if
-  injection silently fails, the model free-associates off the *literal*
-  placeholder token instead of the activation. Well-formed output is not proof
-  that injection happened — assert the site count.
+**Steering and evaluation**
+
+- **All rollouts run in vLLM 0.22 through `serving/vllm_steering.py`.**
+  - It runs eagerly with synchronous scheduling, and prefix caching is off.
+  - The hook stores only the vector and the schedule. It never calls the AV or the AR.
+- **Steering is added at paragraph-break tokens:** any token with ≥ 2 newlines, after the
+  prompt and before the first `</think>`, from generated token `d` on.
+- **The 235B uses tensor parallelism only, never `--pp` ≥ 3.** Pipeline parallelism
+  corrupts prefills in the V1 runner (D70).
+- **Grading uses the corrected grader (D69).**
+  - Old runs are regraded into `data/regraded/`. The original journals are never changed.
+  - Report numbers from regraded data.
+- **Steered runs repeat statistics, not exact tokens (D63).** Compare a rerun by its CI,
+  not by diffing outputs.
+- **Lock before running.**
+  - Each experiment writes its protocol to `EXPERIMENT-*.md`, and a lock file hashes the
+    cohorts and directions before the first rollout.
+  - Do not change a locked protocol after results come in. Add a dated amendment instead.
+- **Eval datasets carry a single USER turn.** The gold answer stays in the `answer`
+  column.
+
+**Environment**
+
+- **Python is pinned to 3.11** (`.python-version`, `uv.lock`, mypy, `requires-python`).
+  Keep all four in sync.
+- **torch is not pinned.** vLLM drives it, because the local card is a Blackwell
+  RTX 5070 Ti (sm_120) that needs cu12.8+ wheels.
+- **Never install SGLang into the project venv** (D21).
+  - It replaces torch with a cu12 build that has no sm_120 kernels, and it breaks vLLM.
+  - The RL stack lives in `.venv-rl` (`make rl-setup`).
+  - The sglang tag picks the transformers version of the RL stack. Use `SGLANG_PIN` ≥
+    v0.5.15: v0.5.8 pins transformers 4.57.1, which breaks Qwen3 injection (D44).
+
+## Known state and caveats
+
+- **The work is complete and the paper is drafted.**
+  - The NLA checkpoints are `checkpoints/{av,ar}_rl_ep1`, released as
+    `Strongich/nla-qwen3-1.7b-L20-{av,ar}`.
+  - New experiments need a new `EXPERIMENT-*.md` protocol.
+- **The paper is local-only.**
+  - `paper/` is gitignored except `paper/scripts/`.
+  - The build is pdfLaTeX + BibTeX (natbib), run with `cd paper && latexmk paper.tex`.
+  - The arXiv package is made with arxiv-latex-cleaner (`paper/README.md`).
+  - When a number changes, update the section `.tex`, rebuild `paper.bbl`, then re-run the
+    cleaner.
+- **Do not commit changes to `FINDINGS.md` or `CLAIMS.md`** unless the user asks.
+- **Pod paths.** The multi-GPU runs used a pod with `/workspace` mounted. The queue
+  scripts write jobs that source `/workspace/env.sh` and log to `/workspace/*_logs`.
+- **Long runs belong to the user.**
+  - Give the user the command (tmux or `run_in_background`) and launch it only when asked.
+  - Runs resume from `rollouts.jsonl`, but only with the same arguments, because a manifest
+    check enforces that.
+- **The LLM judge** (`gpt-5.6-luna`, key in `.env`) was used for the trace audit and the
+  reading test. That account is suspended, so a rerun needs a different judge.
+- `datagen.extract` prints a `PyGILState_Release` fatal-error trace at shutdown, after its
+  outputs are written. It comes from aiohttp threads, not data corruption.
+- **Correctness check worth keeping.** The AR's raw layer-`l` residual is bit-identical to
+  the full model's `hidden_states[21]` on the same input. If a refactor breaks this, the
+  refactor is wrong.
+- **Injection smoke test.** If injection fails silently, the AV free-associates off the
+  literal placeholder token. Well-formed output is no proof of injection, so assert the
+  site count.
 
 ## Workflow
 
 ```bash
-uv sync                 # runtime deps
+uv sync                  # runtime deps
 uv sync --group dev      # + ruff / mypy
 make format              # ruff check --fix + ruff format
 make lint                # mypy + ruff check + ruff format --check
+make repro-help          # paper reproduction targets (reproduce.mk)
 ```
 
-- Lint/format/type-check scope is **`src/` only** (`LINT_DIRS`); `scripts/` is
-  deliberately excluded.
-- Tooling is **ruff** (format + lint + import sorting) and **mypy**. There is no
-  black/isort/flake8/autoflake — don't reintroduce them or their config files.
-- Line length 100. `nla/prompts.py` has an `E501` exemption because the AV/AR
-  templates are verbatim and must not be re-wrapped.
-- Run everything through `uv run` so it uses the project venv.
+- Lint, format and type-check cover **`src/` only** (`LINT_DIRS`). `scripts/` is excluded on
+  purpose.
+- The tools are **ruff** and **mypy**. Do not add black, isort, flake8 or their configs.
+- Line length is 100. `nla/prompts.py` has an `E501` exemption because the templates are
+  verbatim.
+- Run everything through `uv run`.
 - **After a non-obvious decision or deviation, append a `D<n>` entry to
-  `implementation-notes.md`** — that file is the project's memory of *why*, and
-  it is how this work stays reconstructable.
+  `implementation-notes.md`.** That file records *why*.
+- Write findings in simple English. Open each finding with a plain-words summary and one
+  real worked example.

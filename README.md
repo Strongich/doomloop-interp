@@ -91,18 +91,16 @@ Some steps need outputs from earlier steps:
 ### Things to know
 
 - **Same statistics, not the same tokens.** Steered generation in vLLM batches is not
-  bit-exact (D63 in `implementation-notes.md`). A rerun repeats the statistics within their
+  bit-exact. A rerun repeats the statistics within their
   confidence intervals, not the exact outputs.
 - **Pod paths.** The multi-GPU steps ran on a pod with `/workspace` mounted. The queue
   scripts (`scripts/*_queue*.py`, run by `scripts/gpu_queue.py`) write job commands that
   source `/workspace/env.sh` and log to `/workspace/*_logs`. Set `WS=` to change the log
   root, and provide an `env.sh` that sets `HF_HOME` and activates the venv.
 - **Corrected grader.** Early runs were graded with an older answer parser. Every table uses
-  the corrected grader (D69). `policy-regrade` and `transfer-regrade` regrade saved journals.
+  the corrected grader. `policy-regrade` and `transfer-regrade` regrade saved journals.
 - **Judge.** The trace audit and the reading test used `gpt-5.6-luna` through the OpenAI API.
   That account is now suspended, so a rerun needs a different judge account.
-- **Protocols.** `EXPERIMENT-*.md` files hold each locked protocol and its execution log.
-  `implementation-notes.md` records why each choice was made (D-entries).
 
 ### Steps without a full script
 
@@ -117,11 +115,11 @@ The table gives the source to rebuild each one.
 | gsm997 values to two decimals | a manual call of `report_reasoning_policy.collapse/paired` | `data/eval_gsm8k_fresh` from `policy-eval` |
 | Continuation table, commit-row CI | `prefix_report.py` prints the rate without a CI | `data/prefix_online_vllm/branches.csv` |
 | Long-trace test (App. B) | the older 297-site direction `data/delta_suppress_mean.pt` has no builder | `steer_sweep.py --delta mean` computes this vector but does not save it |
-| Lock files | `data/vers/lock.json` and `data/negn_gsm8k_lock.json` were written inline | `EXPERIMENT-vers-doubt.md`, `EXPERIMENT-negN-and-gsm8k-full.md` §6 |
-| 1.7B DPO round (v3) cohorts | `data/distill_v3/{mathtest_fresh1000,easy,hard}.jsonl` have no builder | `EXPERIMENT-offline-distillation.md` (v3 sections) |
-| 1.7B Gated-SFT training | jobs were added to the queue by hand | `distill_train.py --method sft --arm gated`, then `distill_eval.py --sets mathpipe`; see `EXPERIMENT-pipeline-sft.md` |
-| 8B DPO-steered student, GSM8K | the re-evaluation was run by hand | `distill_eval.py` on `gsm8k_test`; see `EXPERIMENT-offline-distillation.md` |
-| web3000 cohort for the maps | the builder is not in `scripts/` | `EXPERIMENT-transfer-claim4.md` |
+| Lock files | `data/vers/lock.json` and `data/negn_gsm8k_lock.json` were written inline | they hash the cohorts and directions before the first rollout; a rerun does not need them |
+| 1.7B DPO round (v3) cohorts | `data/distill_v3/{mathtest_fresh1000,easy,hard}.jsonl` have no builder | fresh1000 is 1,000 MATH test questions (200 per level) that no 8B run had seen |
+| 1.7B Gated-SFT training | jobs were added to the queue by hand | `distill_train.py --method sft --arm gated`, then `distill_eval.py --sets mathpipe` |
+| 8B DPO-steered student, GSM8K | the re-evaluation was run by hand | `distill_eval.py` on `gsm8k_test` |
+| web3000 cohort for the maps | the builder is not in `scripts/` | 3,000 Ultra-FineWeb documents (ids `web:0`…`web:2999`), most likely the first 3,000 of the stream |
 
 Some commands in `transfer-fit`, `transfer-screen` and `transfer-fidelity` were rebuilt from
 the saved run manifests, not from a logged command line:
@@ -141,8 +139,7 @@ src/reasoning_attention/   NLA (AV, AR), datagen, SFT, grading, vLLM serving
 scripts/                   experiments, queues, reports (one script per step)
 paper/scripts/             rebuild the paper tables and figures from saved results
 reproduce.mk               paper reproduction targets
-EXPERIMENT-*.md            locked protocols and execution logs
-implementation-notes.md    decision log (D1 ...)
+VLLM-STEERING.md           how the steering hook runs in vLLM
 ```
 
 The LaTeX sources of the paper are not in this repository.

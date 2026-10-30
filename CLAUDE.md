@@ -118,8 +118,9 @@ scripts/              # one script per experiment step, queues, reports (not lin
   xfer_* / sel_* / gate_* / distill* / baselines_* / vers_*   # one family per experiment
 paper/scripts/        # rebuild paper tables and figures from saved results (in git)
 reproduce.mk          # `make <target>` for every paper result; `make repro-help`
-EXPERIMENT-*.md       # locked protocols + execution logs, one per experiment
-implementation-notes.md   # decision log D1…D82 — APPEND to it
+EXPERIMENT-*.md       # locked protocols + execution logs, one per experiment (local)
+implementation-notes.md   # decision log D1…D83 — APPEND to it (local)
+VLLM-STEERING.md      # how the steering hook runs in vLLM
 data/, checkpoints/   # not in git (GBs); rebuilt by the pipeline
 ```
 
@@ -202,7 +203,9 @@ Each one has its reason in `implementation-notes.md`.
   - The arXiv package is made with arxiv-latex-cleaner (`paper/README.md`).
   - When a number changes, update the section `.tex`, rebuild `paper.bbl`, then re-run the
     cleaner.
-- **`FINDINGS.md` and `CLAIMS.md` are local notes and gitignored.** Never commit them.
+- **Research notes are local and gitignored:** `FINDINGS.md`, `CLAIMS.md`, `EXPERIMENT-*.md`,
+  `implementation-notes.md`, `TIER3-PREREG.md`. Never commit them. Only `README.md`,
+  `CLAUDE.md`, `AGENTS.md` and `VLLM-STEERING.md` are in git.
 - **Pod paths.** The multi-GPU runs used a pod with `/workspace` mounted. The queue
   scripts write jobs that source `/workspace/env.sh` and log to `/workspace/*_logs`.
 - **Long runs belong to the user.**

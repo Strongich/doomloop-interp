@@ -2,7 +2,7 @@
 """When does the model first HAVE an answer? Ask it, don't pattern-match.
 
 Finding 9 triggered on the gold value appearing in the text. That is an oracle,
-and RESEARCH-DIRECTION.md's audit showed the heuristic also fires on premises,
+and an audit showed the heuristic also fires on premises,
 on intermediate quantities and (before the completeness guard) on half-written
 numbers. Every one of those failure modes comes from the same mistake: guessing
 the model's candidate answer from its prose.

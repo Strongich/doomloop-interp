@@ -120,7 +120,6 @@ paper/scripts/        # rebuild paper tables and figures from saved results (in 
 reproduce.mk          # `make <target>` for every paper result; `make repro-help`
 EXPERIMENT-*.md       # locked protocols + execution logs, one per experiment
 implementation-notes.md   # decision log D1…D82 — APPEND to it
-FINDINGS.md, CLAIMS.md    # research findings and the paper's claims
 data/, checkpoints/   # not in git (GBs); rebuilt by the pipeline
 ```
 
@@ -203,7 +202,7 @@ Each one has its reason in `implementation-notes.md`.
   - The arXiv package is made with arxiv-latex-cleaner (`paper/README.md`).
   - When a number changes, update the section `.tex`, rebuild `paper.bbl`, then re-run the
     cleaner.
-- **Do not commit changes to `FINDINGS.md` or `CLAIMS.md`** unless the user asks.
+- **`FINDINGS.md` and `CLAIMS.md` are local notes and gitignored.** Never commit them.
 - **Pod paths.** The multi-GPU runs used a pod with `/workspace` mounted. The queue
   scripts write jobs that source `/workspace/env.sh` and log to `/workspace/*_logs`.
 - **Long runs belong to the user.**

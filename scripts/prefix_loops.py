@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Is a shorter continuation a less repetitive one? Measure it; don't assume it.
 
-RESEARCH-DIRECTION.md's caution applies directly: fewer tokens alone do not
+Fewer tokens alone do not
 establish greater coherence. These are the behaviour-based measures from
 `loop_metrics.py`, applied to the CONTINUATION only -- the prefix is shared by
 every arm, so including it would dilute every difference identically.

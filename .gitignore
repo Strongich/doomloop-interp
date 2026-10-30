@@ -264,3 +264,11 @@ pod.yaml
 /paper/scripts/__pycache__/
 /*.bbl
 /*.blg
+
+# Local research notes, not shared.
+/FINDINGS.md
+/CLAIMS.md
+/NEXT-STEPS.md
+/RESEARCH-DIRECTION.md
+/RESEARCH-PLAN.md
+/VM-HANDOFF.md

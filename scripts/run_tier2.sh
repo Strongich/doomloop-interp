@@ -13,7 +13,7 @@
 # Findings 5 and 5a-5d are all measured on traces the model ALREADY answers
 # correctly (92.5% accuracy, 93% GSM8K). They therefore cannot see the one case
 # that would overturn them: a question where the model's first pass is wrong and
-# the self-doubt is what RESCUES it. FINDINGS.md names this as the single biggest
+# the self-doubt is what RESCUES it. This is the single biggest
 # hole in Finding 5. This run fills it.
 #
 # The test set is deliberately built so accuracy can move in BOTH directions.
@@ -116,7 +116,7 @@ MAX_NEW=${MAX_NEW:-12288}
 BATCH=${BATCH:-4}          # lower than Finding 5's 6: traces here run much longer
 
 if [[ ! -f "$TRACES" ]]; then
-  echo "ERROR: $TRACES missing. Rebuild it with the snippet in FINDINGS 'Reproducing'." >&2
+  echo "ERROR: $TRACES missing. It is the 235-question held-out hard set described above." >&2
   exit 1
 fi
 

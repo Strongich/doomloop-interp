@@ -116,7 +116,7 @@ def parse_args() -> argparse.Namespace:
                    help="run4 = freeze at the 4th agreeing probe (online); "
                         "run4@first = at the 1st (what Finding 10 used)")
     p.add_argument("--audit-n", type=int, default=60)
-    # The matched non-answer control RESEARCH-DIRECTION asks for: without it,
+    # A matched non-answer control: without it,
     # "steering after the answer works" cannot be told apart from "steering late
     # in a trace works".
     p.add_argument("--shuffle-freeze", action="store_true",
